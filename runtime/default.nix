@@ -9,7 +9,7 @@ pythonPkgs.buildPythonApplication {
   version = "0.1.0";
   format = "pyproject";
 
-  src = ./..;  # project root (pyproject.toml is there)
+  src = ./..;
 
   nativeBuildInputs = [ pythonPkgs.hatchling ];
 
