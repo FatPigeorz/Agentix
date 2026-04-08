@@ -123,87 +123,91 @@ nix build .#claude-code       # agent closure
 
 ## Debugging
 
-### Local (no Docker)
+hnix-server 内置 debugpy 支持，与部署方式无关（Docker、K8s、Daytona、Modal 都一样）。
 
-Standard Python debugging — works with any IDE.
+### 原理
 
-**VSCode**: create `.vscode/launch.json`:
+```
+IDE (VSCode/PyCharm/...)
+  │
+  │  DAP protocol over TCP
+  │
+  ▼
+sandbox:5678  ← debugpy (hnix-server 内置)
+sandbox:8000  ← hnix-server HTTP API
+```
+
+hnix-server 启动时加 `--debug` 就会启动 debugpy 监听。Deployment 层只需要多暴露 5678 端口。
+
+### 启动 debug 模式
+
+```bash
+# 沙箱内 (不管是什么 deployment)
+hnix-server --debug                    # debugpy 在 5678 监听
+hnix-server --debug --debug-wait       # 等 IDE attach 后才启动
+hnix-server --debug --debug-port 9229  # 自定义端口
+```
+
+### 端口暴露 (Deployment 层的事)
+
+| Deployment | 暴露 debug 端口的方式 |
+|------------|----------------------|
+| Docker | `-p 5678:5678` |
+| K8s | `kubectl port-forward pod/xxx 5678:5678` |
+| Daytona | sandbox port mapping 配置 |
+| Modal | sandbox network 配置 |
+
+### IDE 配置
+
+**VSCode** `.vscode/launch.json`:
 ```json
 {
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "hnix-server",
+      "name": "hnix-server (local)",
       "type": "debugpy",
       "request": "launch",
       "module": "hnix",
       "cwd": "${workspaceFolder}/runtime",
       "args": ["--port", "8000"]
+    },
+    {
+      "name": "Attach to sandbox",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": { "host": "localhost", "port": 5678 },
+      "pathMappings": [
+        { "localRoot": "${workspaceFolder}/runtime/hnix", "remoteRoot": "/debug-src/hnix" }
+      ]
     }
   ]
 }
 ```
 
-**pdb:**
+**PyCharm**: Run → Edit Configurations → Python Debug Server → host `localhost`, port `5678`
+
+**pdb** (terminal):
 ```bash
 python -m pdb -m hnix
 ```
 
-### In Docker (remote debug)
-
-For debugging the runtime server running inside a container.
-
-**1. Start server with debugpy:**
-
-```bash
-RUNTIME=$(nix-build runtime/default.nix --no-out-link)
-AGENT=$(nix-build agents/claude-code/default.nix --no-out-link)
-
-# Mount source for live editing, expose debug port
-docker run -d --name hnix-debug \
-  -v /nix/store:/nix/store:ro \
-  -v $(pwd)/runtime/hnix:/debug-src/hnix:ro \
-  -e "PATH=${AGENT}/bin:/usr/bin:/bin" \
-  -e "PYTHONPATH=/debug-src" \
-  -p 8000:8000 \
-  -p 5678:5678 \
-  ubuntu:24.04 \
-  ${RUNTIME}/bin/python -m debugpy --listen 0.0.0.0:5678 --wait-for-client -m hnix
-```
-
-Server waits for debugger to attach before starting.
-
-**2. VSCode attach** — add to `.vscode/launch.json`:
-```json
-{
-  "name": "Attach to Docker",
-  "type": "debugpy",
-  "request": "attach",
-  "connect": { "host": "localhost", "port": 5678 },
-  "pathMappings": [
-    { "localRoot": "${workspaceFolder}/runtime/hnix", "remoteRoot": "/debug-src/hnix" }
-  ]
-}
-```
-
-Source is volume-mounted — edit locally, changes reflect in container immediately. No rebuild needed.
-
 ### Whitebox agent debugging
 
-Same pattern — deps from Nix closure, source from volume mount:
+同样的模式 — deps 从 Nix closure 来 (不变), source volume mount (实时编辑):
 
-```bash
-docker run -d --name agent-debug \
-  -v /nix/store:/nix/store:ro \
-  -v $(pwd)/my-agent/src:/app/src:ro \
-  -p 5678:5678 \
-  ubuntu:24.04 \
-  python -m debugpy --listen 0.0.0.0:5678 --wait-for-client /app/src/main.py
+```
+IDE attach → sandbox:5678
+              │
+              ├── agent source: volume mount (编辑即生效)
+              ├── agent deps: Nix closure (稳定, 不用重建)
+              └── debugpy: 断点、单步、inspect 变量
 ```
 
-- **Deps**: Nix closure (stable, no rebuild)
-- **Source**: volume mount (edit -> immediate effect)
-- **Debug**: IDE attach via port 5678
+Deployment 层在创建沙箱时：
+1. 挂载 agent source 到沙箱内 (如 `/app/src`)
+2. 启动 agent 时加 debugpy: `python -m debugpy --listen 0.0.0.0:5678 /app/src/main.py`
+3. 暴露 5678 端口
 
 ## Adding a New Agent
 
