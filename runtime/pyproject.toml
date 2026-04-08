@@ -1,0 +1,18 @@
+[project]
+name = "hnix"
+version = "0.1.0"
+description = "harbor-nix runtime server: agent closure loader for sandboxes"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.0",
+    "python-multipart>=0.0.9",
+]
+
+[project.scripts]
+hnix-server = "hnix.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
