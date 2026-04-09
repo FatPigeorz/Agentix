@@ -2,7 +2,7 @@
 
 # Agentix
 
-**Run Any Agent on Any Dataset. Ready for Agentic Reinforcement.**
+**Run Any Agent on Any Environment. Ready for Agentic Reinforcement.**
 
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/Agentiix/Agentix)](https://github.com/Agentiix/Agentix)
@@ -13,7 +13,7 @@
 ## Core Features
 
 - **Any Agent** — Claude Code, Codex, Aider, SWE-agent, OpenHands. Each agent is packaged as a self-contained Nix closure.
-- **Any Dataset** — SWE-bench, SWE-bench Pro, OpenSWE, OS-World, HumanEval. Inject agent closures into any dataset's Docker image.
+- **Any Dataset** — SWE-bench, SWE-bench Pro, OpenSWE, OS-World, HumanEval. Inject agent closures into any dataset environment.
 - **Reproducible** — Same git commit = same binaries, forever. Nix guarantees bit-for-bit reproducibility.
 - **Deployment Agnostic** — Docker, Kubernetes, Modal, E2B. The runtime server doesn't care where it runs.
 
@@ -36,7 +36,7 @@ nix build .#claude-code
 RUNTIME=$(nix build .#runtime --no-link --print-out-paths)
 AGENT=$(nix build .#claude-code --no-link --print-out-paths)
 
-# Inject into any dataset Docker image
+# Inject into any dataset environment
 docker run -d --name sandbox \
   -v /nix/store:/nix/store:ro \
   -e PATH=$AGENT/bin:$RUNTIME/bin:/usr/bin:/bin \
