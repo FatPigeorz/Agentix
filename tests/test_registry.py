@@ -17,7 +17,6 @@ def test_discover_with_manifest(tmp_path):
     (plugin_dir / "runner.py").write_text("async def run(ctx): return {}\n")
     (plugin_dir / "manifest.json").write_text(json.dumps({
         "name": "my-agent",
-        "kind": "agent",
         "version": "1.0.0",
         "description": "A test agent",
     }))
@@ -25,7 +24,6 @@ def test_discover_with_manifest(tmp_path):
     assert len(plugins) == 1
     p = plugins[0]
     assert p.name == "my-agent"
-    assert p.kind == "agent"
     assert p.version == "1.0.0"
     assert p.description == "A test agent"
 
@@ -39,33 +37,20 @@ def test_discover_without_manifest(tmp_path):
     assert len(plugins) == 1
     p = plugins[0]
     assert p.name == "simple-agent"
-    assert p.kind == "agent"
     assert p.entry == "runner.py"
     assert p.version is None
 
 
-def test_discover_dataset(tmp_path):
-    """Finds dataset.py plugin."""
-    ds_dir = tmp_path / "plugins" / "my-dataset"
-    ds_dir.mkdir(parents=True)
-    (ds_dir / "dataset.py").write_text("async def setup(ctx): return {}\n")
-    plugins = discover([tmp_path / "plugins"])
-    assert len(plugins) == 1
-    assert plugins[0].kind == "dataset"
-    assert plugins[0].entry == "dataset.py"
-
-
 def test_find_by_name(tmp_path):
-    """Find specific plugin by name and kind."""
+    """Find specific plugin by name."""
     plugin_dir = tmp_path / "plugins" / "target-agent"
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "runner.py").write_text("async def run(ctx): return {}\n")
-    # Add another plugin so we're actually filtering
     other_dir = tmp_path / "plugins" / "other-agent"
     other_dir.mkdir(parents=True)
     (other_dir / "runner.py").write_text("async def run(ctx): return {}\n")
 
-    result = find("target-agent", "agent", [tmp_path / "plugins"])
+    result = find("target-agent", [tmp_path / "plugins"])
     assert result.name == "target-agent"
 
 
@@ -75,4 +60,4 @@ def test_find_not_found(tmp_path):
     plugin_dir.mkdir(parents=True)
     (plugin_dir / "runner.py").write_text("async def run(ctx): return {}\n")
     with pytest.raises(KeyError, match="ghost"):
-        find("ghost", "agent", [tmp_path / "plugins"])
+        find("ghost", [tmp_path / "plugins"])

@@ -1,10 +1,10 @@
 """Plugin discovery and registry.
 
-Scans directories for agent and dataset plugins. Reads manifest.json if
-present, otherwise detects runner.py (agent) or dataset.py (dataset).
+Scans directories for agent plugins. Reads manifest.json if present,
+otherwise detects runner.py.
 
 CLI usage:
-    python -m agentix.registry list --search-dir ./agents --search-dir ./examples
+    python -m agentix.registry list --search-dir ./agents
 """
 
 from __future__ import annotations
@@ -19,18 +19,17 @@ from pathlib import Path
 @dataclass
 class PluginInfo:
     name: str
-    kind: str  # "agent" | "dataset"
     path: Path  # directory containing the plugin
-    entry: str  # filename: "runner.py" or "dataset.py"
+    entry: str = "runner.py"
     version: str | None = None
     description: str | None = None
 
 
 def discover(search_dirs: list[Path]) -> list[PluginInfo]:
-    """Scan directories for plugins.
+    """Scan directories for agent plugins.
 
     For each subdirectory, reads manifest.json if present. Otherwise falls back
-    to detecting runner.py (agent) or dataset.py (dataset).
+    to detecting runner.py.
     """
     plugins: list[PluginInfo] = []
     for d in search_dirs:
@@ -45,7 +44,6 @@ def discover(search_dirs: list[Path]) -> list[PluginInfo]:
                 m = json.loads(manifest_path.read_text())
                 plugins.append(PluginInfo(
                     name=m["name"],
-                    kind=m["kind"],
                     path=child,
                     entry=m.get("entry", "runner.py"),
                     version=m.get("version"),
@@ -53,21 +51,17 @@ def discover(search_dirs: list[Path]) -> list[PluginInfo]:
                 ))
             elif (child / "runner.py").exists():
                 plugins.append(PluginInfo(
-                    name=child.name, kind="agent", path=child, entry="runner.py",
-                ))
-            elif (child / "dataset.py").exists():
-                plugins.append(PluginInfo(
-                    name=child.name, kind="dataset", path=child, entry="dataset.py",
+                    name=child.name, path=child,
                 ))
     return plugins
 
 
-def find(name: str, kind: str, search_dirs: list[Path]) -> PluginInfo:
-    """Find a specific plugin by name and kind. Raises KeyError if not found."""
+def find(name: str, search_dirs: list[Path]) -> PluginInfo:
+    """Find a specific plugin by name. Raises KeyError if not found."""
     for p in discover(search_dirs):
-        if p.name == name and p.kind == kind:
+        if p.name == name:
             return p
-    raise KeyError(f"{kind} plugin '{name}' not found in {search_dirs}")
+    raise KeyError(f"Agent plugin '{name}' not found in {search_dirs}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -86,13 +80,6 @@ def main(argv: list[str] | None = None) -> None:
         required=True,
         help="Directory to scan for plugins (can be repeated)",
     )
-    list_cmd.add_argument(
-        "--kind",
-        choices=("agent", "dataset"),
-        default=None,
-        help="Filter by plugin kind",
-    )
-
     args = parser.parse_args(argv)
     if args.command is None:
         parser.print_help()
@@ -100,12 +87,10 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "list":
         plugins = discover(args.search_dirs)
-        if args.kind:
-            plugins = [p for p in plugins if p.kind == args.kind]
         for p in plugins:
             version = p.version or "-"
             desc = p.description or ""
-            print(f"{p.kind:<8} {p.name:<20} {version:<8} {desc}")
+            print(f"{p.name:<20} {version:<8} {desc}")
 
 
 if __name__ == "__main__":

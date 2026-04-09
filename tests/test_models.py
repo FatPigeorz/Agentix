@@ -23,7 +23,7 @@ def test_sandbox_config():
         agent_closure="/nix/store/def-agent",
     )
     assert cfg.task_image == "ubuntu:22.04"
-    assert cfg.dataset_closure is None
+    assert cfg.agent_closure == "/nix/store/def-agent"
 
 
 def test_round_trip():

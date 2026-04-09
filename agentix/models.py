@@ -39,7 +39,6 @@ class SandboxConfig(BaseModel):
     task_image: str = Field(description="Docker image for the task environment")
     runtime_closure: str = Field(description="Nix store path for agentix runtime")
     agent_closure: str = Field(description="Nix store path for agent plugin")
-    dataset_closure: str | None = Field(default=None, description="Nix store path for dataset plugin")
 
 
 class SandboxInfo(BaseModel):

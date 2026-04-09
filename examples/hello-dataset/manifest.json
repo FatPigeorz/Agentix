@@ -1,7 +1,0 @@
-{
-    "name": "hello-dataset",
-    "version": "0.1.0",
-    "kind": "dataset",
-    "description": "Trivial dataset for testing the eval pipeline",
-    "entry": "dataset.py"
-}
