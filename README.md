@@ -1,79 +1,92 @@
 # Agentix
 
-Coding Agent SDK: run ANY agent on ANY environment, collect trajectories for training.
+**Run Any Agent in Any Environment.**
 
-## Architecture
+Agentix is the middleware layer between coding agents and sandboxed environments. It packages agents as reproducible Nix closures, injects them into any container, and provides a universal HTTP interface for execution and file transfer.
 
 ```
-Host (Slime / Verl)                 Sandbox
- │                                   │
- │  client.exec(                     │  agentix-server (:8000)
- │    "python -m agentix.eval        │  ├── POST /exec
- │     --agent /opt/agent            │  ├── POST /upload
- │     --dataset /opt/dataset"       │  ├── GET  /download
- │  )                                │  └── GET  /health
- │                                   │
- │  client.download(                 │  agentix.eval CLI
- │    "/output/result.json"          │  └── setup → run → verify
- │  )                                │      → /output/result.json
- │                                   │
- │  Agent plugin    (Nix closure)    │  Dataset plugin  (Nix closure)
- │  ├── bin/claude  (llm-agents.nix) │  └── dataset.py
- │  └── runner.py   (trajectory)     │      setup() → agent_input
- │                                   │      verify() → metrics
+                     ┌─────────────────────────────────┐
+                     │          Sandbox                 │
+   Orchestrator      │                                  │
+   ───HTTP──────►    │   agentix-server (:8000)         │
+                     │   ├── POST /exec                 │
+                     │   ├── POST /upload                │
+                     │   ├── GET  /download              │
+                     │   └── GET  /health                │
+                     │                                  │
+                     │   Agent closure (Nix)             │
+                     │   ├── bin/claude (binary)         │
+                     │   └── runner.py  (adapter)        │
+                     │       async def run(AgentInput)   │
+                     │           → AgentOutput           │
+                     └─────────────────────────────────┘
 ```
+
+## Why
+
+- **Any Agent** — Claude Code, Codex, Aider, SWE-agent, OpenHands... each agent is a Nix closure with a thin Python adapter.
+- **Any Environment** — Docker, Kubernetes, Daytona, Modal, E2B. The runtime server is environment-agnostic.
+- **Reproducible** — Same git commit = same binaries, forever. Nix guarantees bit-for-bit reproducibility.
+- **Zero coupling** — The runtime server knows nothing about agents. Agents know nothing about infrastructure. Clean separation.
 
 ## Quick Start
 
 ```bash
-nix develop
-
 # Build
-nix build .#runtime
-nix build .#claude-code
-
-# Run in Docker
 RUNTIME=$(nix build .#runtime --no-link --print-out-paths)
 AGENT=$(nix build .#claude-code --no-link --print-out-paths)
 
+# Launch sandbox
 docker run -d --name sandbox \
   -v /nix/store:/nix/store:ro \
-  -p 8000:8000 ubuntu:24.04 \
+  -e PATH=$AGENT/bin:$RUNTIME/bin:/usr/bin:/bin \
+  -p 8000:8000 \
+  ubuntu:24.04 \
   $RUNTIME/bin/agentix-server
 
-# Eval
+# Execute
 curl -X POST localhost:8000/exec \
   -H "Content-Type: application/json" \
-  -d "{\"command\": \"python -m agentix.eval --agent $AGENT\"}"
+  -d '{"command": "claude -p \"Fix the bug in main.py\" --output-format text"}'
+
+# Retrieve files
+curl "localhost:8000/download?path=/workspace/main.py"
 ```
 
-## Plugins
+## Agent Adapter
 
-**Agent plugin** — how to run an agent + collect trajectory:
-```
-agents/{name}/
-├── default.nix    # wraps llm-agents.nix binary + runner.py
-└── runner.py      # async def run(agent_input: dict) -> RunResult
-```
+Each agent has a `runner.py` — a thin adapter that calls the CLI binary and returns structured output:
 
-**Dataset plugin** — environment setup + verification:
-```
-datasets/{name}/
-├── default.nix
-└── dataset.py     # async def setup() -> dict
-                   # async def verify() -> dict
+```python
+async def run(agent_input: AgentInput) -> AgentOutput:
+    # AgentInput:  instruction, workdir, env
+    # AgentOutput: exit_code, stdout, stderr, trajectory
 ```
 
-## Structure
+Agent-specific config (model, max_turns, timeout) goes through environment variables, not function parameters.
+
+## Repositories
+
+| Repo | Purpose |
+|------|---------|
+| [Agentix](https://github.com/Agentiix/Agentix) | Core: runtime server, client, deployment |
+| [Agentix-Agents-Hub](https://github.com/Agentiix/Agentix-Agents-Hub) | Agent adapters: claude-code, aider, ... |
+| [Agentix-Datasets](https://github.com/Agentiix/Agentix-Datasets) | Benchmark runners: SWE-bench, ... |
+
+## Project Structure
 
 ```
 agentix/
-├── runtime/          server + client (sandbox interface)
-├── datasets/         dataset plugin protocol
-├── agents/           agent plugin protocol
-├── trajectory.py     ATIF v1.4 format
-├── eval.py           eval CLI (setup → run → verify)
-└── models.py
+├── runtime/       # FastAPI server + async client
+│   ├── server.py  # /exec, /upload, /download, /health
+│   ├── client.py  # RuntimeClient with retries
+│   └── executor.py
+├── deployment/    # Sandbox lifecycle management
+│   ├── base.py    # Abstract Deployment interface
+│   └── docker.py  # Docker implementation
+├── agents/        # Agent protocol
+│   └── protocol.py  # AgentInput, AgentOutput, Step
+└── models.py      # Pydantic models
 ```
 
 ## Docs
