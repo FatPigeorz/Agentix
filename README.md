@@ -13,7 +13,7 @@
 ## ✨ Core Features
 
 - **Any Agent** — Claude Code, Codex, Aider, SWE-agent, OpenHands. Each agent is packaged as a self-contained Nix closure.
-- **Any Dataset** — SWE-bench, SWE-bench Pro, OpenSWE, OS-World, HumanEval. Inject agent closures into any dataset environment.
+- **Any Environment** — SWE-bench, SWE-bench Pro, OpenSWE, OS-World, HumanEval. Inject agent closures into any environment.
 - **Reproducible** — Same git commit = same binaries, forever. Nix guarantees bit-for-bit reproducibility.
 - **Deployment Agnostic** — Docker, Kubernetes, Modal, E2B. The runtime server doesn't care where it runs.
 
@@ -36,7 +36,7 @@ nix build .#claude-code
 RUNTIME=$(nix build .#runtime --no-link --print-out-paths)
 AGENT=$(nix build .#claude-code --no-link --print-out-paths)
 
-# Inject into any dataset environment
+# Inject into any environment
 docker run -d --name sandbox \
   -v /nix/store:/nix/store:ro \
   -e PATH=$AGENT/bin:$RUNTIME/bin:/usr/bin:/bin \
