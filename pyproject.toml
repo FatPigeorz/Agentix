@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 agentix-server = "agentix.runtime.__main__:main"
+agentix-run = "agentix.orchestrator.cli:main"
 
 [build-system]
 requires = ["hatchling"]
