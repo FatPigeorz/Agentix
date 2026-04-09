@@ -1,64 +1,61 @@
 {
-  description = "agentix: Coding Agent SDK — Nix-based agent packaging and sandboxed execution";
+  description = "Agentix: Coding Agent SDK — middleware for agent packaging, execution, and trajectory collection";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    llm-agents.url = "github:numtide/llm-agents.nix";
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, llm-agents }:
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
       python = pkgs.python312;
+
+      # All agents from llm-agents.nix
+      agentPkgs = llm-agents.packages.${system};
     in
     {
       # ── Packages ────────────────────────────────────────────────
       packages.${system} = {
-        runtime     = import ./runtime/default.nix { inherit pkgs; };
-        claude-code = import ./agents/claude-code/default.nix { inherit pkgs; };
+        # Agentix runtime
+        runtime = import ./runtime/default.nix { inherit pkgs; };
+
+        # Agents from llm-agents.nix (re-exported)
+        claude-code = agentPkgs.claude-code or (import ./agents/claude-code/default.nix { inherit pkgs; });
+        codex = agentPkgs.codex or null;
+        aider = agentPkgs.aider or null;
+        goose = agentPkgs.goose-cli or null;
+        gemini-cli = agentPkgs.gemini-cli or null;
       };
 
-      # ── Dev shell: nix develop ──────────────────────────────────
-      # Everything you need to develop, lint, test, and build.
+      # ── Dev shell ───────────────────────────────────────────────
       devShells.${system}.default = pkgs.mkShell {
         packages = [
-          # Python
           python
           pkgs.uv
-
-          # Linting & formatting
           pkgs.ruff
-
-          # Testing
           python.pkgs.pytest
           python.pkgs.pytest-asyncio
-
-          # Runtime deps (for local dev without Nix build)
           python.pkgs.fastapi
           python.pkgs.uvicorn
           python.pkgs.pydantic
           python.pkgs.python-multipart
           python.pkgs.httpx
-
-          # Tools
           pkgs.nodejs_22
           pkgs.docker
         ];
 
         shellHook = ''
-          echo "agentix dev shell"
+          echo "Agentix dev shell"
           echo "  python: $(python3 --version)"
-          echo "  uv:     $(uv --version)"
           echo "  ruff:   $(ruff --version)"
           echo ""
           echo "Commands:"
-          echo "  uv sync                    # install deps"
-          echo "  ruff check runtime/        # lint"
-          echo "  ruff format runtime/       # format"
-          echo "  pytest                     # test"
-          echo "  python -m agentix             # run runtime server locally"
-          echo "  nix build .#runtime        # build runtime closure"
-          echo "  nix build .#claude-code    # build agent closure"
+          echo "  python -m agentix.runtime    # run runtime server"
+          echo "  ruff check agentix/          # lint"
+          echo "  nix build .#runtime          # build runtime"
+          echo "  nix build .#claude-code      # build agent (via llm-agents.nix)"
         '';
       };
     };
