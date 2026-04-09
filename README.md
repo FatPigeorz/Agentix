@@ -1,15 +1,15 @@
 # Agentix
 
-**Run Any Agent in Any Environment.**
+**Run Any Agent on Any Benchmark.**
 
-Agentix is the middleware layer between coding agents and sandboxed environments. It packages agents as reproducible Nix closures, injects them into any container, and provides a universal HTTP interface for execution and file transfer.
+Agentix is the middleware layer between coding agents and benchmark environments. It packages agents as reproducible Nix closures and injects them into any benchmark's Docker image — SWE-bench, SWE-bench Pro, OpenSWE, OS-World, and more.
 
 ## Why
 
 - **Any Agent** — Claude Code, Codex, Aider, SWE-agent, OpenHands... each agent is a Nix closure with a thin Python adapter.
-- **Any Environment** — Docker, Kubernetes, Daytona, Modal, E2B. The runtime server is environment-agnostic.
+- **Any Benchmark** — SWE-bench, SWE-bench Pro, OpenSWE, OS-World, HumanEval... inject the same agent closure into any benchmark's Docker image.
+- **Deployment Agnostic** — Docker, Kubernetes, Daytona, Modal, E2B. The runtime server doesn't care where it runs.
 - **Reproducible** — Same git commit = same binaries, forever. Nix guarantees bit-for-bit reproducibility.
-- **Zero coupling** — The runtime server knows nothing about agents. Agents know nothing about infrastructure. Clean separation.
 
 ## Quick Start
 
