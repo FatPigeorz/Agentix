@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 agentix-server = "agentix.runtime.__main__:main"
+agentix-run = "agentix.orchestrator.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -31,3 +32,10 @@ select = ["E", "F", "I", "W", "UP"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "ruff>=0.15.9",
+]
