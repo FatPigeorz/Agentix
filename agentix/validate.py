@@ -12,7 +12,6 @@ import json
 import sys
 from pathlib import Path
 
-from agentix.ctx import extract_schema
 from agentix.eval import PluginLoadError, _load_module, _validate_agent, _validate_dataset
 
 
@@ -44,16 +43,6 @@ def validate_plugin(path: Path, kind: str) -> list[str]:
     except PluginLoadError as e:
         issues.append(str(e))
 
-    # Check CTX_SCHEMA structure if present
-    schema = extract_schema(module)
-    if schema is not None:
-        if not isinstance(schema, dict):
-            issues.append("CTX_SCHEMA must be a dict")
-        else:
-            for section in ("requires", "optional", "provides"):
-                if section in schema and not isinstance(schema[section], dict):
-                    issues.append(f"CTX_SCHEMA['{section}'] must be a dict")
-
     # Check manifest.json if present
     manifest_path = path / "manifest.json"
     if manifest_path.exists():
@@ -69,40 +58,11 @@ def validate_plugin(path: Path, kind: str) -> list[str]:
     return issues
 
 
-def _schema_summary(path: Path, kind: str) -> str:
-    """Return a short schema summary string, or empty if no schema."""
-    entry = "runner.py" if kind == "agent" else "dataset.py"
-    entry_path = path / entry
-    if not entry_path.exists():
-        return ""
-    try:
-        module = _load_module(entry_path, kind)
-    except PluginLoadError:
-        return ""
-
-    schema = extract_schema(module)
-    if not schema or not isinstance(schema, dict):
-        return ""
-
-    parts = []
-    for section in ("requires", "optional", "provides"):
-        count = len(schema.get(section, {}))
-        if count:
-            parts.append(f"{count} {section}")
-    if not parts:
-        return ""
-    return f"(schema: {', '.join(parts)})"
-
-
 def _print_result(kind: str, path: Path, issues: list[str]) -> None:
     """Print OK or ERR line for a plugin."""
     name = path.resolve().name
     if not issues:
-        summary = _schema_summary(path, kind)
-        line = f"OK  {kind}  {name}"
-        if summary:
-            line += f"  {summary}"
-        print(line)
+        print(f"OK  {kind}  {name}")
     else:
         for issue in issues:
             print(f"ERR {kind}  {name}  {issue}")

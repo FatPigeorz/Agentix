@@ -2,17 +2,6 @@
 
 from pathlib import Path
 
-CTX_SCHEMA = {
-    "requires": {},
-    "optional": {
-        "api_key": {"type": "str", "default": "test-key"},
-    },
-    "provides": {
-        "instruction": {"type": "str"},
-    },
-}
-
-
 async def setup(ctx: dict) -> dict:
     task_file = Path(ctx["workdir"]) / "task.txt"
     task_file.write_text("Say hello world")

@@ -6,24 +6,6 @@ import asyncio
 import os
 import shlex
 
-CTX_SCHEMA = {
-    "requires": {
-        "instruction": {"type": "str", "description": "Task instruction"},
-        "api_key": {"type": "str", "description": "Anthropic API key"},
-    },
-    "optional": {
-        "model": {"type": "str", "default": "claude-sonnet-4-20250514"},
-        "max_turns": {"type": "int"},
-        "timeout": {"type": "float"},
-    },
-    "provides": {
-        "exit_code": {"type": "int"},
-        "stdout": {"type": "str"},
-        "stderr": {"type": "str"},
-    },
-}
-
-
 async def run(ctx: dict) -> dict:
     """Run Claude Code.
 

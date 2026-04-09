@@ -20,8 +20,6 @@ import time
 import uuid
 from pathlib import Path
 
-from agentix.ctx import apply_defaults, extract_schema, validate_provides, validate_requires
-
 logger = logging.getLogger("agentix.eval")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 
@@ -97,36 +95,22 @@ async def _run_eval_inner(agent_dir: str, dataset_dir: str | None, output_path: 
         "workdir": os.getcwd(),
     }
 
-    # Extract schemas (optional — plugins without CTX_SCHEMA are unaffected)
-    runner_schema = extract_schema(runner)
-    dataset_schema = extract_schema(dataset) if dataset else None
-
     # Pipeline with lifecycle hooks
     metrics = {}
     try:
         # 1. Setup — dataset prepares environment, returns agent input
         if dataset and hasattr(dataset, "setup"):
-            if dataset_schema:
-                validate_requires(ctx, dataset_schema, "dataset")
-                apply_defaults(ctx, dataset_schema)
             t_phase = time.monotonic()
             logger.info("[%s] dataset.setup()", run_id)
             setup_result = await dataset.setup(ctx)
             ctx.update(setup_result)
-            if dataset_schema:
-                validate_provides(setup_result, dataset_schema, "dataset")
             logger.info("[%s] dataset.setup() done in %.1fs", run_id, time.monotonic() - t_phase)
 
-        # 2. Run — agent executes (validate after setup merges into ctx)
-        if runner_schema:
-            validate_requires(ctx, runner_schema, "agent")
-            apply_defaults(ctx, runner_schema)
+        # 2. Run — agent executes
         t_phase = time.monotonic()
         logger.info("[%s] runner.run()", run_id)
         run_result = await runner.run(ctx)
         ctx["run_result"] = run_result
-        if runner_schema:
-            validate_provides(run_result, runner_schema, "agent")
         logger.info("[%s] runner.run() done in %.1fs", run_id, time.monotonic() - t_phase)
 
         # 3. Verify — dataset collects metrics
