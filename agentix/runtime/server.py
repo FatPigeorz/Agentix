@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
 from agentix import __version__

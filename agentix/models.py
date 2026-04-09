@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-
 # ── Runtime server API ────────────────────────────────────────────
 
 
@@ -39,7 +38,9 @@ class SandboxConfig(BaseModel):
     task_image: str = Field(description="Docker image for the task environment")
     runtime_closure: str = Field(description="Nix store path for agentix runtime")
     agent_closure: str = Field(description="Nix store path for agent binary")
-    dataset_closure: str | None = Field(default=None, description="Nix store path for dataset eval code")
+    dataset_closure: str | None = Field(
+        default=None, description="Nix store path for dataset eval code",
+    )
 
 
 class SandboxInfo(BaseModel):

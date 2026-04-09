@@ -42,10 +42,17 @@ class DockerDeployment(Deployment):
             "docker", "run", "-d",
             "--name", sandbox_id,
             "-v", "/nix/store:/nix/store:ro",
-            "-e", f"PATH={config.agent_closure}/bin:{config.runtime_closure}/bin:/usr/local/bin:/usr/bin:/bin",
+            "-e", (
+                f"PATH={config.agent_closure}/bin:"
+                f"{config.runtime_closure}/bin:"
+                "/usr/local/bin:/usr/bin:/bin"
+            ),
         ]
         if config.dataset_closure:
-            cmd.extend(["-e", f"PYTHONPATH={config.dataset_closure}/lib/python3.12/site-packages"])
+            cmd.extend([
+                "-e",
+                f"PYTHONPATH={config.dataset_closure}/lib/python3.12/site-packages",
+            ])
         cmd.extend([
             "-p", f"{port}:8000",
             config.task_image,
@@ -117,7 +124,11 @@ class DockerDeployment(Deployment):
         if agent_changed:
             # In-place: update PATH to point to new agent closure, restart server
             logger.info("In-place agent update for sandbox %s", sandbox_id)
-            new_path = f"{config.agent_closure}/bin:{config.runtime_closure}/bin:/usr/local/bin:/usr/bin:/bin"
+            new_path = (
+                f"{config.agent_closure}/bin:"
+                f"{config.runtime_closure}/bin:"
+                "/usr/local/bin:/usr/bin:/bin"
+            )
             await self._exec_in_container(sandbox_id, f"export PATH={new_path}")
             # Restart agentix-server to pick up new PATH
             await self._exec_in_container(sandbox_id, "pkill -f agentix-server || true")

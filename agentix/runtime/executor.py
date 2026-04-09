@@ -78,7 +78,7 @@ class Executor:
                 return stdout, stderr
 
             stdout, stderr = await asyncio.wait_for(_collect(), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             proc.kill()
             await proc.communicate()
             return -1, "", f"Command timed out after {timeout}s"

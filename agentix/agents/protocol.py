@@ -7,7 +7,10 @@ runner.py must export:
 
 from __future__ import annotations
 
-from typing import Any, Callable, Coroutine, TypedDict
+from collections.abc import Callable, Coroutine
+from typing import Any, TypedDict
+
+from agentix.trajectory import Trajectory
 
 
 class Step(TypedDict, total=False):
@@ -29,7 +32,8 @@ class AgentOutput(TypedDict, total=False):
     exit_code: int            # required
     stdout: str               # raw output
     stderr: str               # raw errors
-    trajectory: list[Step]    # structured steps (optional)
+    trajectory: list[Step]    # structured steps (optional, lightweight)
+    atif_trajectory: Trajectory | None  # full ATIF trajectory for training (optional)
 
 
 RunFn = Callable[[AgentInput], Coroutine[Any, Any, AgentOutput]]
