@@ -1,6 +1,6 @@
 """Async HTTP client for the agentix runtime server.
 
-Runs on the orchestrator side (outside the sandbox).
+Pure sandbox interface: exec, upload, download, health.
 """
 
 from __future__ import annotations
@@ -10,13 +10,7 @@ from pathlib import Path
 
 import httpx
 
-from agentix.models import (
-    EvalRequest, EvalResponse,
-    ExecRequest, ExecResponse,
-    HealthResponse,
-    RunRequest, RunResponse,
-    UploadResponse,
-)
+from agentix.models import ExecRequest, ExecResponse, HealthResponse, UploadResponse
 
 
 class RuntimeClient:
@@ -48,23 +42,6 @@ class RuntimeClient:
             except (httpx.ConnectError, httpx.ReadError, httpx.TimeoutException):
                 await asyncio.sleep(interval)
         raise TimeoutError(f"agentix server not alive after {timeout}s")
-
-    async def eval(self, agent_input: dict | None = None) -> EvalResponse:
-        """Full eval: dataset.setup → runner.run → dataset.verify."""
-        req = EvalRequest(agent_input=agent_input)
-        r = await self._client.post("/eval", json=req.model_dump(exclude_none=True))
-        r.raise_for_status()
-        return EvalResponse.model_validate(r.json())
-
-    async def run(self, agent_input: dict) -> RunResponse:
-        """Call the agent's run() function inside the sandbox.
-
-        Returns RunResponse with .output (dict) and .trajectory (dict | None).
-        """
-        req = RunRequest(agent_input=agent_input)
-        r = await self._client.post("/run", json=req.model_dump())
-        r.raise_for_status()
-        return RunResponse.model_validate(r.json())
 
     async def exec(
         self,

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 
-# ── Runtime API ───────────────────────────────────────────────────
+# ── Runtime server API ────────────────────────────────────────────
 
 
 class ExecRequest(BaseModel):
@@ -24,32 +24,11 @@ class ExecResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: str = "ok"
     version: str
-    agent_plugin: str | None = None
-    dataset_plugin: str | None = None
 
 
 class UploadResponse(BaseModel):
     path: str
     size: int
-
-
-class RunRequest(BaseModel):
-    agent_input: dict
-
-
-class RunResponse(BaseModel):
-    output: dict
-    trajectory: dict | None = None
-
-
-class EvalRequest(BaseModel):
-    agent_input: dict | None = None  # optional overrides, merged with dataset.setup()
-
-
-class EvalResponse(BaseModel):
-    output: dict
-    trajectory: dict | None = None
-    metrics: dict
 
 
 # ── Deployment ────────────────────────────────────────────────────
