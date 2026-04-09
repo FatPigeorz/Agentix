@@ -22,13 +22,11 @@ class RuntimeClient:
     def __init__(
         self,
         base_url: str,
-        token: str | None = None,
         timeout: float = 300,
         retries: int = 3,
         retry_backoff: float = 1.0,
     ):
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
-        self._client = httpx.AsyncClient(base_url=base_url, timeout=timeout, headers=headers)
+        self._client = httpx.AsyncClient(base_url=base_url, timeout=timeout)
         self._retries = retries
         self._retry_backoff = retry_backoff
 

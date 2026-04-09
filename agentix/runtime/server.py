@@ -3,12 +3,9 @@
 from __future__ import annotations
 
 import logging
-import os
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import Response
-from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from agentix import __version__
 from agentix.models import ExecRequest, ExecResponse, HealthResponse, UploadResponse
@@ -17,19 +14,8 @@ from agentix.runtime.executor import Executor
 logger = logging.getLogger("agentix.runtime")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 
-TOKEN = os.environ.get("AGENTIX_TOKEN", "")
-
 app = FastAPI(title="agentix", version=__version__)
 executor = Executor()
-
-
-@app.middleware("http")
-async def auth_middleware(request: Request, call_next):
-    if request.url.path == "/health":
-        return await call_next(request)
-    if TOKEN and request.headers.get("Authorization") != f"Bearer {TOKEN}":
-        return JSONResponse(status_code=401, content={"detail": "unauthorized"})
-    return await call_next(request)
 
 
 @app.get("/health", response_model=HealthResponse)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import secrets
 import socket
 from uuid import uuid4
 
@@ -38,14 +37,12 @@ class DockerDeployment(Deployment):
     async def create(self, config: SandboxConfig) -> SandboxInfo:
         sandbox_id = f"agentix-{uuid4().hex[:8]}"
         port = await self._allocate_port()
-        token = secrets.token_urlsafe(32)
 
         cmd = [
             "docker", "run", "-d",
             "--name", sandbox_id,
             "-v", "/nix/store:/nix/store:ro",
             "-e", f"PATH={config.agent_closure}/bin:{config.runtime_closure}/bin:/usr/local/bin:/usr/bin:/bin",
-            "-e", f"AGENTIX_TOKEN={token}",
             "-p", f"{port}:8000",
             config.task_image,
             f"{config.runtime_closure}/bin/agentix-server", "--port", "8000",
@@ -69,7 +66,7 @@ class DockerDeployment(Deployment):
             status="running",
         )
         self._sandboxes[sandbox_id] = _DockerSandbox(
-            sandbox_id=sandbox_id, port=port, config=config, token=token
+            sandbox_id=sandbox_id, port=port, config=config,
         )
 
         logger.info("Created sandbox %s on port %d", sandbox_id, port)
@@ -154,8 +151,7 @@ class DockerDeployment(Deployment):
 
 
 class _DockerSandbox:
-    def __init__(self, sandbox_id: str, port: int, config: SandboxConfig, token: str):
+    def __init__(self, sandbox_id: str, port: int, config: SandboxConfig):
         self.sandbox_id = sandbox_id
         self.port = port
         self.config = config
-        self.token = token
