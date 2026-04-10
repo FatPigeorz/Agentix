@@ -82,7 +82,7 @@ class DockerDeployment(Deployment):
                         r = await client.get("/health")
                         if r.status_code == 200:
                             break
-                    except (httpx.ConnectError, httpx.ReadError):
+                    except (httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError):
                         pass
                     await asyncio.sleep(0.5)
 

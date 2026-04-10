@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -18,6 +19,16 @@ import httpx
 logger = logging.getLogger("agentix.runtime.loader")
 
 SOCKET_DIR = Path(os.environ.get("AGENTIX_SOCKET_DIR", "/tmp/agentix"))
+
+
+def _is_python_script(path: Path) -> bool:
+    """Check if a file starts with a Python shebang."""
+    try:
+        with open(path, "rb") as f:
+            first_line = f.readline(100)
+            return b"python" in first_line
+    except (OSError, UnicodeDecodeError):
+        return False
 
 
 @dataclass
@@ -89,11 +100,24 @@ class ClosureLoader:
             socket_path.unlink()
 
         # Spawn the closure process
+        # Pass the runtime's sys.path as PYTHONPATH so closures can import
+        # fastapi, uvicorn, etc. from the runtime closure's dependencies.
         logger.info("Loading closure '%s' from %s (entry=%s)", name, path, entry)
+        cmd = [str(entry), "--socket", str(socket_path)]
+        if str(entry).endswith(".py") or _is_python_script(entry):
+            cmd = [sys.executable, str(entry), "--socket", str(socket_path)]
+
+        env = dict(os.environ)
+        # Export runtime's site-packages so closure subprocesses can find them
+        site_packages = [p for p in sys.path if "site-packages" in p]
+        if site_packages:
+            env["PYTHONPATH"] = ":".join(site_packages) + ":" + env.get("PYTHONPATH", "")
+
         proc = await asyncio.create_subprocess_exec(
-            str(entry), "--socket", str(socket_path),
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
 
         # Wait for socket to appear
