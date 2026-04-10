@@ -35,27 +35,13 @@ Each line is one instance:
 {"instance_id": "django__django-16139", "problem_statement": "...", "image": "sweb.eval.x86_64.django__django-16139:latest"}
 ```
 
-## Step 2: Build SWE-bench Docker images
+## Step 2: Pull SWE-bench Docker image
 
 ```bash
-python -c "
-from datasets import load_dataset
-from swebench.harness.test_spec.test_spec import make_test_spec
-from swebench.harness.docker_build import build_base_images, build_env_images, build_instance_images
-import docker
+# Get the image name from your instance
+IMAGE=$(head -1 examples/claude-code-swebench/data.jsonl | python -c "import sys,json; print(json.load(sys.stdin)['image'])")
 
-client = docker.from_env()
-ds = load_dataset('princeton-nlp/SWE-bench_Verified', split='test')
-
-# Pick instances you want to run (or all 500)
-instances = [ds[0]]  # just the first one
-specs = [make_test_spec(inst) for inst in instances]
-
-build_base_images(client, specs)
-build_env_images(client, specs)
-build_instance_images(client, specs)
-print('Done. Images built.')
-"
+docker pull $IMAGE
 ```
 
 ## Step 3: Start runtime server inside a SWE-bench container
