@@ -17,6 +17,7 @@ class DockerDeployment(Deployment):
     """Manages sandboxes as local Docker containers.
 
     Injects closures via volume mount (-v /nix/store:/nix/store:ro).
+    After sandbox creation, closures are loaded via POST /load.
     """
 
     def __init__(self, host_port_start: int = 18000):
@@ -42,15 +43,11 @@ class DockerDeployment(Deployment):
             "docker", "run", "-d",
             "--name", sandbox_id,
             "-v", "/nix/store:/nix/store:ro",
-            "-e", f"PATH={config.agent_closure}/bin:{config.runtime_closure}/bin:/usr/local/bin:/usr/bin:/bin",
-        ]
-        if config.dataset_closure:
-            cmd.extend(["-e", f"PYTHONPATH={config.dataset_closure}/lib/python3.12/site-packages"])
-        cmd.extend([
+            "-e", f"PATH={config.runtime_closure}/bin:/usr/local/bin:/usr/bin:/bin",
             "-p", f"{port}:8000",
             config.task_image,
             f"{config.runtime_closure}/bin/agentix-server", "--port", "8000",
-        ])
+        ]
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -74,6 +71,28 @@ class DockerDeployment(Deployment):
         )
 
         logger.info("Created sandbox %s on port %d", sandbox_id, port)
+
+        # Load closures via runtime server /load endpoint
+        if config.closures:
+            import httpx
+            async with httpx.AsyncClient(base_url=f"http://localhost:{port}", timeout=60) as client:
+                # Wait for server to be ready
+                for _ in range(120):
+                    try:
+                        r = await client.get("/health")
+                        if r.status_code == 200:
+                            break
+                    except (httpx.ConnectError, httpx.ReadError):
+                        pass
+                    await asyncio.sleep(0.5)
+
+                for closure_path in config.closures:
+                    r = await client.post("/load", json={"path": closure_path})
+                    if r.status_code == 200:
+                        logger.info("Loaded closure %s in sandbox %s", closure_path, sandbox_id)
+                    else:
+                        logger.error("Failed to load closure %s: %s", closure_path, r.text)
+
         return info
 
     async def get(self, sandbox_id: str) -> SandboxInfo:
@@ -101,48 +120,26 @@ class DockerDeployment(Deployment):
         if not sb:
             raise KeyError(f"Sandbox not found: {sandbox_id}")
 
-        # Diff: what changed?
-        image_changed = config.task_image != sb.config.task_image
-        agent_changed = config.agent_closure != sb.config.agent_closure
-        runtime_changed = config.runtime_closure != sb.config.runtime_closure
-        dataset_changed = config.dataset_closure != sb.config.dataset_closure
-
-        if force_recreate or image_changed or runtime_changed or dataset_changed:
-            # Full recreate — can't update base image or runtime in-place
-            logger.info("Recreating sandbox %s (force=%s image=%s runtime=%s)",
-                        sandbox_id, force_recreate, image_changed, runtime_changed)
+        if force_recreate or config.task_image != sb.config.task_image or config.runtime_closure != sb.config.runtime_closure:
             await self.delete(sandbox_id)
             return await self.create(config)
 
-        if agent_changed:
-            # In-place: update PATH to point to new agent closure, restart server
-            logger.info("In-place agent update for sandbox %s", sandbox_id)
-            new_path = f"{config.agent_closure}/bin:{config.runtime_closure}/bin:/usr/local/bin:/usr/bin:/bin"
-            await self._exec_in_container(sandbox_id, f"export PATH={new_path}")
-            # Restart agentix-server to pick up new PATH
-            await self._exec_in_container(sandbox_id, "pkill -f agentix-server || true")
-            await self._exec_in_container(
-                sandbox_id,
-                f"PATH={new_path} {config.runtime_closure}/bin/agentix-server --port 8000 &",
-            )
+        # Closures changed — reload via /load
+        if config.closures != sb.config.closures:
+            import httpx
+            async with httpx.AsyncClient(base_url=f"http://localhost:{sb.port}", timeout=60) as client:
+                # Unload old closures
+                for closure_path in sb.config.closures:
+                    name = closure_path.rstrip("/").split("/")[-1]
+                    await client.post("/unload", json={"namespace": name})
+
+                # Load new closures
+                for closure_path in config.closures:
+                    await client.post("/load", json={"path": closure_path})
+
             sb.config = config
-            return await self.get(sandbox_id)
 
-        # Nothing changed
-        logger.info("No changes for sandbox %s, skipping update", sandbox_id)
         return await self.get(sandbox_id)
-
-    async def _exec_in_container(self, sandbox_id: str, command: str) -> None:
-        """Execute a shell command inside a running container."""
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", sandbox_id, "sh", "-c", command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            logger.warning("exec in %s failed (rc=%d): %s",
-                           sandbox_id, proc.returncode, stderr.decode(errors="replace"))
 
     async def delete(self, sandbox_id: str) -> None:
         proc = await asyncio.create_subprocess_exec(

@@ -1,6 +1,6 @@
 """Async HTTP client for the agentix runtime server.
 
-Pure sandbox interface: exec, upload, download, health.
+Sandbox interface: exec, upload, download, health, load, call.
 """
 
 from __future__ import annotations
@@ -56,6 +56,8 @@ class RuntimeClient:
     async def __aexit__(self, *args):
         await self.close()
 
+    # ── Core endpoints ──────────────────────────────────────────
+
     async def health(self) -> HealthResponse:
         r = await self._client.get("/health")
         r.raise_for_status()
@@ -110,5 +112,54 @@ class RuntimeClient:
             lp.parent.mkdir(parents=True, exist_ok=True)
             lp.write_bytes(r.content)
             return len(r.content)
+
+        return await self._with_retry(_do)
+
+    # ── Closure management ──────────────────────────────────────
+
+    async def load(self, path: str, namespace: str | None = None) -> str:
+        """Load a closure into the runtime server.
+
+        Returns the namespace under which endpoints are available.
+        """
+        body = {"path": path}
+        if namespace:
+            body["namespace"] = namespace
+
+        async def _do():
+            r = await self._client.post("/load", json=body)
+            r.raise_for_status()
+            return r.json()["namespace"]
+
+        return await self._with_retry(_do)
+
+    async def unload(self, namespace: str) -> None:
+        """Unload a closure."""
+        await self._client.post("/unload", json={"namespace": namespace})
+
+    async def closures(self) -> list[dict]:
+        """List loaded closures."""
+        r = await self._client.get("/closures")
+        r.raise_for_status()
+        return r.json()
+
+    # ── Closure proxy ───────────────────────────────────────────
+
+    async def call(self, namespace: str, endpoint: str,
+                   data: dict | None = None, method: str = "POST") -> dict:
+        """Call an endpoint on a loaded closure.
+
+        Example:
+            result = await client.call("swebench", "setup", data={"instance_id": "..."})
+        """
+        url = f"/{namespace}/{endpoint}"
+
+        async def _do():
+            if method.upper() == "GET":
+                r = await self._client.get(url, params=data)
+            else:
+                r = await self._client.post(url, json=data)
+            r.raise_for_status()
+            return r.json()
 
         return await self._with_retry(_do)

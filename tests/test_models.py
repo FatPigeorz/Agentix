@@ -16,14 +16,14 @@ def test_exec_request_defaults():
 
 
 def test_sandbox_config():
-    """SandboxConfig requires task_image, runtime_closure, agent_closure."""
+    """SandboxConfig requires task_image and runtime_closure."""
     cfg = SandboxConfig(
         task_image="ubuntu:22.04",
         runtime_closure="/nix/store/abc-runtime",
-        agent_closure="/nix/store/def-agent",
+        closures=["/nix/store/def-agent", "/nix/store/ghi-dataset"],
     )
     assert cfg.task_image == "ubuntu:22.04"
-    assert cfg.agent_closure == "/nix/store/def-agent"
+    assert len(cfg.closures) == 2
 
 
 def test_round_trip():

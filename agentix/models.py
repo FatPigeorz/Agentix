@@ -38,8 +38,7 @@ class UploadResponse(BaseModel):
 class SandboxConfig(BaseModel):
     task_image: str = Field(description="Docker image for the task environment")
     runtime_closure: str = Field(description="Nix store path for agentix runtime")
-    agent_closure: str = Field(description="Nix store path for agent binary")
-    dataset_closure: str | None = Field(default=None, description="Nix store path for dataset eval code")
+    closures: list[str] = Field(default_factory=list, description="Nix store paths for closures to load")
 
 
 class SandboxInfo(BaseModel):
