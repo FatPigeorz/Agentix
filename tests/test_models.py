@@ -20,10 +20,11 @@ def test_sandbox_config():
     cfg = SandboxConfig(
         task_image="ubuntu:22.04",
         runtime_closure="/nix/store/abc-runtime",
-        closures=["/nix/store/def-agent", "/nix/store/ghi-dataset"],
+        closures={"claude": "/nix/store/def-agent", "swebench": "/nix/store/ghi-dataset"},
     )
     assert cfg.task_image == "ubuntu:22.04"
     assert len(cfg.closures) == 2
+    assert cfg.closures["claude"] == "/nix/store/def-agent"
 
 
 def test_round_trip():

@@ -39,14 +39,20 @@ class DockerDeployment(Deployment):
         sandbox_id = f"agentix-{uuid4().hex[:8]}"
         port = await self._allocate_port()
 
+        # Build PATH: closure bins + runtime + system
+        path_parts = [f"{p}/bin" for p in config.closures.values()]
+        path_parts.append(f"{config.runtime_closure}/bin")
+        path_parts.extend(["/usr/local/bin", "/usr/bin", "/bin"])
+        path_env = ":".join(path_parts)
+
         cmd = [
             "docker", "run", "-d",
             "--name", sandbox_id,
+            "--network", "host",
             "-v", "/nix/store:/nix/store:ro",
-            "-e", f"PATH={config.runtime_closure}/bin:/usr/local/bin:/usr/bin:/bin",
-            "-p", f"{port}:8000",
+            "-e", f"PATH={path_env}",
             config.task_image,
-            f"{config.runtime_closure}/bin/agentix-server", "--port", "8000",
+            f"{config.runtime_closure}/bin/agentix-server", "--port", str(port),
         ]
 
         proc = await asyncio.create_subprocess_exec(
@@ -86,8 +92,8 @@ class DockerDeployment(Deployment):
                         pass
                     await asyncio.sleep(0.5)
 
-                for closure_path in config.closures:
-                    r = await client.post("/load", json={"path": closure_path})
+                for namespace, closure_path in config.closures.items():
+                    r = await client.post("/load", json={"path": closure_path, "namespace": namespace})
                     if r.status_code == 200:
                         logger.info("Loaded closure %s in sandbox %s", closure_path, sandbox_id)
                     else:
@@ -129,13 +135,12 @@ class DockerDeployment(Deployment):
             import httpx
             async with httpx.AsyncClient(base_url=f"http://localhost:{sb.port}", timeout=60) as client:
                 # Unload old closures
-                for closure_path in sb.config.closures:
-                    name = closure_path.rstrip("/").split("/")[-1]
-                    await client.post("/unload", json={"namespace": name})
+                for namespace in sb.config.closures:
+                    await client.post("/unload", json={"namespace": namespace})
 
                 # Load new closures
-                for closure_path in config.closures:
-                    await client.post("/load", json={"path": closure_path})
+                for namespace, closure_path in config.closures.items():
+                    await client.post("/load", json={"path": closure_path, "namespace": namespace})
 
             sb.config = config
 
