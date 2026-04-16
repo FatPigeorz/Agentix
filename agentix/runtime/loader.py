@@ -28,6 +28,7 @@ class LoadedClosure:
     socket_path: Path
     process: asyncio.subprocess.Process
     client: httpx.AsyncClient
+    manifest: dict = field(default_factory=dict)  # endpoint descriptions from GET /
 
 
 class ClosureLoader:
@@ -111,11 +112,16 @@ class ClosureLoader:
         transport = httpx.AsyncHTTPTransport(uds=str(socket_path))
         client = httpx.AsyncClient(transport=transport, base_url="http://closure", timeout=300)
 
-        # Health check
+        # Health check + reflection: GET / returns closure manifest
+        manifest = {}
         for _ in range(50):  # 5 seconds max
             try:
                 r = await client.get("/")
                 if r.status_code < 500:
+                    try:
+                        manifest = r.json()
+                    except Exception:
+                        manifest = {"status": "ok"}
                     break
             except (httpx.ConnectError, httpx.ReadError):
                 await asyncio.sleep(0.1)
@@ -128,8 +134,9 @@ class ClosureLoader:
         self._closures[name] = LoadedClosure(
             name=name, path=closure_path,
             socket_path=socket_path, process=proc, client=client,
+            manifest=manifest,
         )
-        logger.info("Closure '%s' loaded, socket=%s, pid=%d", name, socket_path, proc.pid)
+        logger.info("Closure '%s' loaded (manifest=%s)", name, manifest)
         return name
 
     async def unload(self, name: str) -> None:
@@ -178,7 +185,7 @@ class ClosureLoader:
         return r
 
     async def list_closures(self) -> list[dict]:
-        """List all loaded closures."""
+        """List all loaded closures with their manifests."""
         result = []
         for name, c in self._closures.items():
             result.append({
@@ -186,6 +193,7 @@ class ClosureLoader:
                 "path": str(c.path),
                 "pid": c.process.pid,
                 "socket": str(c.socket_path),
+                "manifest": c.manifest,
             })
         return result
 
