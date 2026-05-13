@@ -15,18 +15,22 @@ decorators, no base classes.
 
 from __future__ import annotations
 
+import asyncio
 import collections.abc as cabc
+import importlib
 import inspect
 import json
 import logging
+import sys
 import traceback
 from collections.abc import AsyncIterator, Awaitable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Generic, ParamSpec, TypeVar, get_args, get_origin
 
 from pydantic import TypeAdapter, ValidationError
 
-from agentix.models import RemoteError, RemoteRequest, RemoteResponse
+from agentix.models import ClosureManifest, RemoteError, RemoteRequest, RemoteResponse
 
 _STREAM_ORIGINS = (cabc.AsyncIterator, cabc.AsyncGenerator)
 
@@ -261,26 +265,109 @@ def _ndjson(obj: dict[str, Any]) -> bytes:
     return (json.dumps(obj) + "\n").encode()
 
 
+@dataclass
+class _Entry:
+    """One registered closure. `dispatcher` is built lazily on first use."""
+
+    manifest: ClosureManifest
+    mount: Path
+    dispatcher: Dispatcher | None = None
+    error: Exception | None = None
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
 class Registry:
-    """Per-runtime collection of package-path → Dispatcher mappings.
+    """Per-runtime collection of package-path → closure entry.
+
+    Closures are registered at sandbox-startup mount discovery, but their
+    Python packages are not imported and their Dispatchers are not built
+    until the first call to `get_or_load(package)`. This keeps sandbox
+    boot cheap and isolates per-closure import failures so they surface
+    on call rather than blocking startup.
 
     The closure's Python import path (e.g. 'agentix_closures.claude_code')
     is the routing key — there are no caller-chosen namespaces.
     """
 
     def __init__(self) -> None:
-        self._d: dict[str, Dispatcher] = {}
+        self._entries: dict[str, _Entry] = {}
 
-    def add(self, package: str, dispatcher: Dispatcher) -> None:
-        if package in self._d:
+    def register(self, package: str, manifest: ClosureManifest, mount: Path) -> None:
+        """Mark a closure as known but not yet loaded. Adds the closure's
+        `entry/python` to sys.path so the stub module becomes importable —
+        the Dispatcher is still deferred.
+        """
+        if package in self._entries:
             raise ValueError(f"package '{package}' already registered")
-        self._d[package] = dispatcher
+        py_root = mount / "entry" / "python"
+        if py_root.is_dir():
+            py_str = str(py_root)
+            if py_str not in sys.path:
+                sys.path.insert(0, py_str)
+        self._entries[package] = _Entry(manifest=manifest, mount=mount)
 
-    def get(self, package: str) -> Dispatcher | None:
-        return self._d.get(package)
+    async def get_or_load(self, package: str) -> Dispatcher | None:
+        """Return the dispatcher for `package`, importing + registering it
+        on first call. Returns None for unknown packages. Re-raises the
+        original exception on every call if the load has previously failed.
+
+        Concurrent first calls to the same package serialise on a
+        per-entry lock so the import + `_register.register()` runs once.
+        """
+        entry = self._entries.get(package)
+        if entry is None:
+            return None
+        if entry.dispatcher is not None:
+            return entry.dispatcher
+        if entry.error is not None:
+            raise entry.error
+        async with entry.lock:
+            if entry.dispatcher is not None:
+                return entry.dispatcher
+            if entry.error is not None:
+                raise entry.error
+            try:
+                entry.dispatcher = _import_and_register(entry.manifest)
+            except Exception as exc:
+                logger.exception("lazy-load failed for closure '%s'", package)
+                entry.error = exc
+                raise
+            return entry.dispatcher
 
     def packages(self) -> list[str]:
-        return list(self._d)
+        """All known packages — registered, regardless of load state."""
+        return list(self._entries)
+
+    def loaded_packages(self) -> list[str]:
+        """Packages whose dispatcher has been built (post first-use)."""
+        return [pkg for pkg, e in self._entries.items() if e.dispatcher is not None]
+
+    def manifest_for(self, package: str) -> ClosureManifest | None:
+        e = self._entries.get(package)
+        return e.manifest if e else None
+
+    def mount_for(self, package: str) -> Path | None:
+        e = self._entries.get(package)
+        return e.mount if e else None
 
     def __contains__(self, package: str) -> bool:
-        return package in self._d
+        return package in self._entries
+
+
+def _import_and_register(manifest: ClosureManifest) -> Dispatcher:
+    """Import the closure's package and call `<pkg>._register.register()`.
+
+    `entry/python` is already on sys.path (added at `Registry.register` time).
+    The caller wraps any exception into the entry's `.error`.
+    """
+    importlib.import_module(manifest.package)  # validate the stub module exists
+    register_mod = importlib.import_module(f"{manifest.package}._register")
+    if not hasattr(register_mod, "register"):
+        raise AttributeError(f"{manifest.package}._register has no register()")
+    dispatcher = register_mod.register()
+    if not isinstance(dispatcher, Dispatcher):
+        raise TypeError(
+            f"{manifest.package}._register.register() returned "
+            f"{type(dispatcher).__name__}, expected Dispatcher"
+        )
+    return dispatcher

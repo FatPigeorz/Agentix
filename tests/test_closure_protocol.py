@@ -263,6 +263,109 @@ async def test_runtime_client_propagates_remote_error(runtime_module, mount_pack
     assert ei.value.error.type == "RuntimeError"
 
 
+# ── lazy load ────────────────────────────────────────────────────
+
+
+async def test_register_is_pending_until_first_call(runtime_module, mount_echo):
+    """`_auto_load` only marks the closure pending — no Dispatcher built."""
+    server, _, _ = runtime_module
+    mount_echo()
+    await server._auto_load()
+    # Known package, but dispatcher not yet built.
+    assert "agentix_closures.echo" in server.registry
+    assert server.registry.packages() == ["agentix_closures.echo"]
+    assert server.registry.loaded_packages() == []
+
+
+async def test_lazy_load_on_first_remote(runtime_module, mount_echo):
+    """First `/_remote` call materialises the Dispatcher; second call reuses it."""
+    server, _, _ = runtime_module
+    mount_echo()
+    await server._auto_load()
+
+    transport = httpx.ASGITransport(app=server.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        body = {"package": "agentix_closures.echo", "method": "echo", "kwargs": {"msg": "x"}}
+        r = await http.post("/_remote", json=body)
+        assert r.status_code == 200
+        assert server.registry.loaded_packages() == ["agentix_closures.echo"]
+        # Same dispatcher instance reused on subsequent calls.
+        d1 = await server.registry.get_or_load("agentix_closures.echo")
+        r = await http.post("/_remote", json=body)
+        assert r.status_code == 200
+        d2 = await server.registry.get_or_load("agentix_closures.echo")
+        assert d1 is d2
+
+
+async def test_lazy_load_failure_cached(runtime_module, mount_package):
+    """A closure whose `_register.register()` raises caches the error and
+    re-raises on every subsequent call (no retry storm)."""
+    server, _, _ = runtime_module
+    mount_package(
+        "broken",
+        package="agentix_closures.broken_reg",
+        init_src="def x(): ...",
+        impl_src="def x(): return 1",
+        register_src=textwrap.dedent("""
+            def register():
+                raise RuntimeError("register-side boom")
+        """),
+    )
+    await server._auto_load()
+
+    transport = httpx.ASGITransport(app=server.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
+        body = {"package": "agentix_closures.broken_reg", "method": "x"}
+        r1 = await http.post("/_remote", json=body)
+        r2 = await http.post("/_remote", json=body)
+    assert r1.status_code == 500
+    assert "register-side boom" in r1.json()["detail"]
+    # Second call hits the cached error, same response (no second import attempt).
+    assert r2.status_code == 500
+    assert r2.json()["detail"] == r1.json()["detail"]
+
+
+async def test_concurrent_first_calls_serialise(runtime_module, mount_package):
+    """Two simultaneous first-time `/_remote` calls share a single import."""
+    server, _, _ = runtime_module
+    # The register module records how many times register() is called.
+    impl_src = textwrap.dedent("""
+        import time
+        from . import x
+        async def x():
+            return 42
+    """)
+    register_src = textwrap.dedent("""
+        from agentix.dispatch import Dispatcher
+        from . import x
+        from ._impl import x as _x
+        _call_count = 0
+        def register():
+            global _call_count
+            _call_count += 1
+            d = Dispatcher(); d.bind(x, _x); return d
+    """)
+    mount_package(
+        "race",
+        package="agentix_closures.race_pkg",
+        init_src="async def x() -> int: ...",
+        impl_src=impl_src,
+        register_src=register_src,
+    )
+    await server._auto_load()
+
+    import asyncio as _asyncio
+    results = await _asyncio.gather(
+        server.registry.get_or_load("agentix_closures.race_pkg"),
+        server.registry.get_or_load("agentix_closures.race_pkg"),
+        server.registry.get_or_load("agentix_closures.race_pkg"),
+    )
+    assert results[0] is results[1] is results[2]
+    # register() called exactly once across all three concurrent loaders.
+    from agentix_closures.race_pkg import _register as race_reg
+    assert race_reg._call_count == 1
+
+
 # ── streaming ────────────────────────────────────────────────────
 
 

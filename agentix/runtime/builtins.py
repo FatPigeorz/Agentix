@@ -70,18 +70,15 @@ CLOSURE_MOUNT_ROOT = os.environ.get("AGENTIX_CLOSURE_MOUNT_ROOT", "/mnt")
 
 def _resolve_closure_bins(packages: list[str]) -> list[str]:
     """Turn closure package paths into their `entry/bin` paths.
-    `["*"]` expands to every currently-registered closure.
-
-    Uses agentix.runtime.server._mount_paths as the package → mount map;
-    unknown packages are silently dropped.
+    `["*"]` expands to every currently-registered closure. Unknown packages
+    are silently dropped.
     """
-    from agentix.runtime.server import _mount_paths, registry
+    from agentix.runtime.server import registry
 
-    if packages == ["*"]:
-        return [str(_mount_paths[p] / "entry" / "bin") for p in registry.packages()]
+    pkg_list = registry.packages() if packages == ["*"] else packages
     out: list[str] = []
-    for pkg in packages:
-        mount = _mount_paths.get(pkg)
+    for pkg in pkg_list:
+        mount = registry.mount_for(pkg)
         if mount is not None:
             out.append(str(mount / "entry" / "bin"))
     return out

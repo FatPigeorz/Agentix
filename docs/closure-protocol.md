@@ -132,15 +132,21 @@ Sandbox boot
     ├─ ln -sfn /mnt/*/store/*  /nix/store/
     └─ exec /mnt/runtime/entry/bin/start
            │
-           └─ lifespan: scan /mnt/*  (skip 'runtime')
+           └─ lifespan: scan /mnt/* (skip 'runtime')
                 for each /mnt/<dir>/entry/manifest.json (valid + matching abi):
                     sys.path.insert(0, /mnt/<dir>/entry/python)
-                    pkg = importlib.import_module(manifest.package)
-                    dispatcher = pkg._register.register()
-                    registry[manifest.package] = dispatcher
+                    registry.register(pending=manifest)        # no import yet
+
+First POST /_remote for <pkg>:
+    registry.get_or_load(<pkg>):
+        async with per-pkg lock:
+            importlib.import_module(<pkg>)
+            dispatcher = importlib.import_module("<pkg>._register").register()
+            entry.dispatcher = dispatcher
+    dispatcher.dispatch(request)
 ```
 
-Closures are **fixed at sandbox create time**; change the set by recreating the sandbox.
+Closures are **fixed at sandbox create time** (the set is discovered at boot); import is **lazy** (deferred until first call per closure). Change the set by recreating the sandbox.
 
 ## Wire
 

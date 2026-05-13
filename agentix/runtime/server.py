@@ -5,27 +5,25 @@ In-process closure dispatch. The runtime is a single Python process serving:
 - built-in operations (exec/upload/download) mounted at root
 - `POST /_remote` — direct dispatch to a bound impl, body specifies the
   closure's Python package path + method name
-- `GET /closures` — inventory
+- `GET /closures` — inventory (always cheap; does not force-load anything)
 - `GET /health`
 
 There are no caller-chosen namespaces: each closure's Python import path
 (`manifest.package`) is its routing key. Two images shipping the same
 package collide; the second is skipped with a warning.
 
-Discovery: on startup, scan /mnt/* for `entry/manifest.json`, validate
-against ClosureManifest, prepend each closure's `entry/python` to sys.path,
-import its declared `package`, and call `<package>._register.register()`
-to obtain a Dispatcher. Closures with no/invalid/abi-mismatched manifest
-are skipped — non-closure mounts (task data, caches) can coexist under
-/mnt without tripping discovery.
+Discovery on startup is cheap: scan `/mnt/*` for `entry/manifest.json`,
+validate against ClosureManifest, prepend each closure's `entry/python`
+to sys.path, and register the closure in the Registry as a pending entry.
+The actual `importlib.import_module(<pkg>)` + `_register.register()` is
+deferred until the first `POST /_remote` for that package — slow boots
+no longer block the runtime, and a broken closure does not crash startup.
 """
 
 from __future__ import annotations
 
-import importlib
 import logging
 import os
-import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -34,7 +32,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from agentix import __version__
-from agentix.dispatch import Dispatcher, Registry
+from agentix.dispatch import Registry
 from agentix.models import (
     AGENTIX_CLOSURE_ABI,
     ClosureInfo,
@@ -51,21 +49,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message
 CLOSURE_MOUNT_ROOT = Path(os.environ.get("AGENTIX_CLOSURE_MOUNT_ROOT", "/mnt"))
 
 registry = Registry()
-_manifests: dict[str, ClosureManifest] = {}  # package -> manifest
-_mount_paths: dict[str, Path] = {}            # package -> /mnt/<dir>
 
 
 async def _auto_load() -> None:
-    """Scan /mnt for closures and register each one's Dispatcher.
+    """Scan /mnt for closures and register each one as a pending entry.
 
-    For each mount with a valid `entry/manifest.json`:
-      1. Prepend `<mount>/entry/python` to sys.path.
-      2. Import the package named in `manifest.package`.
-      3. Import `<package>._register` and call `register()` -> Dispatcher.
-      4. Add to the Registry keyed by `manifest.package`.
+    Does NOT import any closure packages or build any Dispatchers — that
+    work happens lazily on first `/_remote` call (see `Registry.get_or_load`).
+    Cheap manifest validation is sufficient at boot to fail loudly on a
+    malformed mount while keeping startup latency flat.
 
-    Failures at any step skip that closure with an error log; runtime keeps
-    going. The mount named `runtime` is reserved (the server itself).
+    `/mnt/runtime` is reserved (the runtime itself) and skipped.
     """
     if not CLOSURE_MOUNT_ROOT.is_dir():
         return
@@ -78,20 +72,12 @@ async def _auto_load() -> None:
         if manifest.package in registry:
             logger.error(
                 "skip mount %s: package %r already registered from %s",
-                mount, manifest.package, _mount_paths[manifest.package],
+                mount, manifest.package, registry.mount_for(manifest.package),
             )
             continue
-        try:
-            dispatcher = _load_dispatcher(mount, manifest)
-        except Exception as exc:
-            logger.exception("skip mount %s: failed to load package '%s': %s",
-                             mount, manifest.package, exc)
-            continue
-        registry.add(manifest.package, dispatcher)
-        _manifests[manifest.package] = manifest
-        _mount_paths[manifest.package] = mount
-        logger.info("registered closure '%s' from %s (methods=%s)",
-                    manifest.package, mount, dispatcher.methods())
+        registry.register(manifest.package, manifest, mount)
+        logger.info("registered closure '%s' from %s (deferred)",
+                    manifest.package, mount)
 
 
 def _read_manifest(mount: Path) -> ClosureManifest | None:
@@ -112,30 +98,6 @@ def _read_manifest(mount: Path) -> ClosureManifest | None:
         )
         return None
     return manifest
-
-
-def _load_dispatcher(mount: Path, manifest: ClosureManifest) -> Dispatcher:
-    """Import the closure's package and obtain its Dispatcher.
-
-    Convention: `<package>._register.register() -> Dispatcher`. The closure
-    image arranges for the package to be importable by dropping it (and any
-    deps not provided by the runtime image) under `<mount>/entry/python/`.
-    """
-    py_root = mount / "entry" / "python"
-    if py_root.is_dir():
-        sys.path.insert(0, str(py_root))
-    pkg = importlib.import_module(manifest.package)
-    register_mod = importlib.import_module(f"{manifest.package}._register")
-    if not hasattr(register_mod, "register"):
-        raise AttributeError(f"{manifest.package}._register has no register()")
-    dispatcher = register_mod.register()
-    if not isinstance(dispatcher, Dispatcher):
-        raise TypeError(
-            f"{manifest.package}._register.register() returned "
-            f"{type(dispatcher).__name__}, expected Dispatcher"
-        )
-    _ = pkg  # imported for side effects (stub module must exist)
-    return dispatcher
 
 
 @asynccontextmanager
@@ -159,10 +121,15 @@ async def health() -> HealthResponse:
 
 @app.get("/closures")
 async def list_closures() -> list[ClosureInfo]:
-    return [
-        ClosureInfo(path=str(_mount_paths[pkg]), manifest=_manifests[pkg])
-        for pkg in registry.packages()
-    ]
+    """All registered closures (loaded or not). Doesn't force-load."""
+    out: list[ClosureInfo] = []
+    for pkg in registry.packages():
+        manifest = registry.manifest_for(pkg)
+        mount = registry.mount_for(pkg)
+        if manifest is None or mount is None:
+            continue
+        out.append(ClosureInfo(path=str(mount), manifest=manifest))
+    return out
 
 
 # ── Remote dispatch ─────────────────────────────────────────────
@@ -170,16 +137,22 @@ async def list_closures() -> list[ClosureInfo]:
 
 @app.post("/_remote")
 async def remote_call(request: RemoteRequest):
-    """Single dispatch endpoint.
+    """Single dispatch endpoint. Triggers lazy import on first use.
 
     - For unary impls (signature returns `R`): responds 200 application/json
       with a `RemoteResponse` body.
     - For streaming impls (signature returns `AsyncIterator[T]`): responds
-      200 application/x-ndjson, one JSON event per line (`{"item": ...}`
-      while yielding, `{"end": true}` on normal completion, `{"error": ...}`
-      if the impl raises mid-stream).
+      200 application/x-ndjson, one JSON event per line.
+    - If the closure failed to import on a prior call, every subsequent
+      request to the same package re-raises the cached error as 500.
     """
-    dispatcher = registry.get(request.package)
+    try:
+        dispatcher = await registry.get_or_load(request.package)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"closure '{request.package}' failed to load: {type(exc).__name__}: {exc}",
+        ) from exc
     if dispatcher is None:
         raise HTTPException(
             status_code=404,

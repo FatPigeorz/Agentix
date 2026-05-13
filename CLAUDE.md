@@ -78,16 +78,18 @@ for d in /mnt/*/store; do ln -sfn "$d"/* /nix/store/; done
 exec /mnt/runtime/entry/bin/start
 ```
 
-### Runtime startup
+### Runtime startup (lazy)
 
 On lifespan startup, the runtime:
 
 1. Scans `/mnt/*` for `entry/manifest.json`. Skips `/mnt/runtime`.
-2. For each valid manifest (matching abi), prepends `<mount>/entry/python` to `sys.path`.
-3. Imports `manifest.package` and `<package>._register`, calls `register()` to obtain a `Dispatcher`.
-4. Adds the Dispatcher to a global `Registry` keyed by `manifest.package`.
+2. For each valid manifest (matching abi), prepends `<mount>/entry/python` to `sys.path` and **registers a pending entry** in the global `Registry`. **No imports run.**
+3. The closure's Python package is imported and its `_register.register()` is called on **first `/_remote` request** for that package (`Registry.get_or_load`), under a per-package async lock so concurrent first-calls share one import.
+4. Import failures are cached on the entry; every subsequent call returns the same error without retrying.
 
 Two images shipping the same `package` collide — second is skipped with a warning. There are **no caller-chosen namespaces**; the Python import path is the identity.
+
+This means: a broken closure does not block sandbox boot; an unused closure costs nothing to mount; first-call latency for a closure includes its one-time import cost (typically tens of ms).
 
 ### Wire
 
