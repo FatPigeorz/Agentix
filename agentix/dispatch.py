@@ -19,7 +19,6 @@ import asyncio
 import collections.abc as cabc
 import importlib
 import inspect
-import json
 import logging
 import sys
 import traceback
@@ -48,8 +47,11 @@ class _BoundMethod(Generic[P, R]):
     signature: inspect.Signature
     param_adapters: dict[str, TypeAdapter[Any]]
     return_adapter: TypeAdapter[Any]
-    is_stream: bool = False
-    item_adapter: TypeAdapter[Any] | None = None
+    is_stream: bool = False                       # output is AsyncIterator[T]
+    item_adapter: TypeAdapter[Any] | None = None  # output item adapter
+    is_bidi: bool = False                         # input AND output are AsyncIterator[T]
+    input_stream_param: str | None = None
+    input_item_adapter: TypeAdapter[Any] | None = None
 
 
 class Dispatcher:
@@ -85,10 +87,20 @@ class Dispatcher:
         name = stub.__name__
         if name in self._methods:
             raise ValueError(f"method '{name}' already bound on this dispatcher")
+
         param_adapters: dict[str, TypeAdapter[Any]] = {}
+        stream_params: list[tuple[str, type]] = []
         for pname, param in sig.parameters.items():
             ann = param.annotation if param.annotation is not inspect.Parameter.empty else Any
-            param_adapters[pname] = TypeAdapter(ann)
+            if get_origin(ann) in _STREAM_ORIGINS:
+                # AsyncIterator[T] params: adapter validates items, not the iterator
+                args = get_args(ann)
+                item_type = args[0] if args else Any
+                stream_params.append((pname, item_type))
+                param_adapters[pname] = TypeAdapter(item_type)
+            else:
+                param_adapters[pname] = TypeAdapter(ann)
+
         return_ann = sig.return_annotation if sig.return_annotation is not inspect.Signature.empty else Any
         is_stream = get_origin(return_ann) in _STREAM_ORIGINS
         item_adapter: TypeAdapter[Any] | None = None
@@ -99,6 +111,27 @@ class Dispatcher:
             return_adapter = TypeAdapter(Any)  # unused on streaming path
         else:
             return_adapter = TypeAdapter(return_ann)
+
+        is_bidi = is_stream and len(stream_params) > 0
+        input_stream_param: str | None = None
+        input_item_adapter: TypeAdapter[Any] | None = None
+        if is_bidi:
+            if len(stream_params) > 1:
+                raise TypeError(
+                    f"method '{name}' has multiple AsyncIterator parameters "
+                    f"({[p for p, _ in stream_params]}); only one input stream "
+                    f"is supported"
+                )
+            input_stream_param, input_item_type = stream_params[0]
+            input_item_adapter = TypeAdapter(input_item_type)
+        elif stream_params and not is_stream:
+            raise TypeError(
+                f"method '{name}' has AsyncIterator parameter(s) "
+                f"{[p for p, _ in stream_params]} but a non-streaming return "
+                f"type — client-only streaming is not supported; declare the "
+                f"return type as AsyncIterator[T] to use the bidi path"
+            )
+
         self._methods[name] = _BoundMethod(
             name=name,
             stub=stub,
@@ -108,6 +141,9 @@ class Dispatcher:
             return_adapter=return_adapter,
             is_stream=is_stream,
             item_adapter=item_adapter,
+            is_bidi=is_bidi,
+            input_stream_param=input_stream_param,
+            input_item_adapter=input_item_adapter,
         )
 
     def methods(self) -> list[str]:
@@ -116,6 +152,14 @@ class Dispatcher:
     def is_streaming(self, method: str) -> bool:
         m = self._methods.get(method)
         return m is not None and m.is_stream
+
+    def is_bidi(self, method: str) -> bool:
+        m = self._methods.get(method)
+        return m is not None and m.is_bidi
+
+    def input_adapter_for(self, method: str) -> TypeAdapter[Any] | None:
+        m = self._methods.get(method)
+        return m.input_item_adapter if m else None
 
     async def dispatch(self, request: RemoteRequest) -> RemoteResponse:
         """Route a RemoteRequest to its bound impl, returning the wire response.
@@ -167,37 +211,35 @@ class Dispatcher:
             )
         return RemoteResponse(ok=True, value=value)
 
-    async def dispatch_stream(self, request: RemoteRequest) -> AsyncIterator[bytes]:
-        """Run a streaming impl, yielding NDJSON-encoded events.
+    async def dispatch_stream(self, request: RemoteRequest) -> AsyncIterator[dict[str, Any]]:
+        """Run a server-streaming impl, yielding event dicts to the transport.
 
-        Wire shape (one JSON object per line, `\\n` terminated):
+        Event shapes:
             {"item": <serialized>}      — per yielded value
-            {"error": {...}}            — impl raised mid-stream or wire-side err
+            {"error": {...}}            — impl raised, validation failed, etc.
             {"end": true}               — normal completion sentinel
 
-        Caller (RuntimeClient._remote_stream) consumes lines until either
-        `error` (raises) or `end` (terminates).
+        The transport (Socket.IO server / HTTP NDJSON) encodes the dicts to
+        the wire. The dispatcher only deals with semantic events.
         """
         m = self._methods.get(request.method)
         if m is None:
-            err = RemoteError(
+            yield {"error": RemoteError(
                 type="MethodNotFound",
                 message=f"method '{request.method}' is not bound on this dispatcher; "
                 f"available: {sorted(self._methods)}",
-            )
-            yield _ndjson({"error": err.model_dump()})
+            ).model_dump()}
             return
-        if not m.is_stream:
-            err = RemoteError(
+        if not m.is_stream or m.is_bidi:
+            yield {"error": RemoteError(
                 type="NotAStreamingMethod",
-                message=f"method '{request.method}' has non-streaming return type",
-            )
-            yield _ndjson({"error": err.model_dump()})
+                message=f"method '{request.method}' is not a (non-bidi) streaming method",
+            ).model_dump()}
             return
         try:
             args, kwargs = self._coerce(m, request.args, request.kwargs)
         except ValidationError as exc:
-            yield _ndjson({"error": RemoteError(type="ValidationError", message=str(exc)).model_dump()})
+            yield {"error": RemoteError(type="ValidationError", message=str(exc)).model_dump()}
             return
         try:
             result = m.impl(*args, **kwargs)
@@ -208,21 +250,88 @@ class Dispatcher:
                 try:
                     value = m.item_adapter.dump_python(item, mode="json")
                 except Exception as exc:
-                    yield _ndjson({"error": RemoteError(
+                    yield {"error": RemoteError(
                         type="SerializationError",
                         message=f"failed to serialize item: {exc}",
-                    ).model_dump()})
+                    ).model_dump()}
                     return
-                yield _ndjson({"item": value})
+                yield {"item": value}
         except Exception as exc:
             logger.exception("closure stream impl '%s' raised mid-stream", m.name)
-            yield _ndjson({"error": RemoteError(
+            yield {"error": RemoteError(
                 type=type(exc).__name__,
                 message=str(exc),
                 traceback=traceback.format_exc(),
-            ).model_dump()})
+            ).model_dump()}
             return
-        yield _ndjson({"end": True})
+        yield {"end": True}
+
+    async def dispatch_bidi(
+        self,
+        request: RemoteRequest,
+        input_iter: AsyncIterator[Any],
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Run a bidi impl. `input_iter` yields items already coerced to the
+        stub's input item type (transport pre-validates via `input_item_adapter`).
+
+        Event shapes match `dispatch_stream` — same vocab of `item` / `end`
+        / `error` — so the transport handles them uniformly.
+        """
+        m = self._methods.get(request.method)
+        if m is None:
+            yield {"error": RemoteError(
+                type="MethodNotFound",
+                message=f"method '{request.method}' is not bound on this dispatcher; "
+                f"available: {sorted(self._methods)}",
+            ).model_dump()}
+            return
+        if not m.is_bidi:
+            yield {"error": RemoteError(
+                type="NotABidiMethod",
+                message=f"method '{request.method}' is not bidirectional",
+            ).model_dump()}
+            return
+        assert m.input_stream_param is not None
+        # Bind non-stream args/kwargs; inject input_iter as the stream param.
+        non_stream_kwargs = dict(request.kwargs)
+        non_stream_kwargs.pop(m.input_stream_param, None)
+        try:
+            bound = m.signature.bind_partial(*request.args, **non_stream_kwargs)
+            bound.apply_defaults()
+            coerced: dict[str, Any] = {}
+            for pname, raw in bound.arguments.items():
+                if pname == m.input_stream_param:
+                    continue
+                adapter = m.param_adapters.get(pname)
+                coerced[pname] = adapter.validate_python(raw) if adapter is not None else raw
+            coerced[m.input_stream_param] = input_iter
+        except (TypeError, ValidationError) as exc:
+            yield {"error": RemoteError(type=type(exc).__name__, message=str(exc)).model_dump()}
+            return
+        try:
+            result = m.impl(**coerced)
+            if inspect.isawaitable(result):
+                result = await result
+            assert m.item_adapter is not None
+            async for item in result:
+                try:
+                    value = m.item_adapter.dump_python(item, mode="json")
+                except Exception as exc:
+                    yield {"error": RemoteError(
+                        type="SerializationError",
+                        message=f"failed to serialize item: {exc}",
+                    ).model_dump()}
+                    return
+                yield {"item": value}
+        except Exception as exc:
+            logger.exception("closure bidi impl '%s' raised mid-stream", m.name)
+            yield {"error": RemoteError(
+                type=type(exc).__name__,
+                message=str(exc),
+                traceback=traceback.format_exc(),
+            ).model_dump()}
+            return
+        yield {"end": True}
 
     @staticmethod
     def _coerce(
@@ -259,10 +368,6 @@ class Dispatcher:
             else:  # KEYWORD_ONLY
                 out_kwargs[pname] = v
         return out_args, out_kwargs
-
-
-def _ndjson(obj: dict[str, Any]) -> bytes:
-    return (json.dumps(obj) + "\n").encode()
 
 
 @dataclass

@@ -3,8 +3,9 @@
 In-process closure dispatch. The runtime is a single Python process serving:
 
 - built-in operations (exec/upload/download) mounted at root
-- `POST /_remote` — direct dispatch to a bound impl, body specifies the
-  closure's Python package path + method name
+- `POST /_remote` — typed **unary** dispatch (one request → one response)
+- Socket.IO at `/socket.io/` — server-streaming, bidi, and log subscription,
+  multiplexed by `call_id` on a single connection
 - `GET /closures` — inventory (always cheap; does not force-load anything)
 - `GET /health`
 
@@ -16,8 +17,8 @@ Discovery on startup is cheap: scan `/mnt/*` for `entry/manifest.json`,
 validate against ClosureManifest, prepend each closure's `entry/python`
 to sys.path, and register the closure in the Registry as a pending entry.
 The actual `importlib.import_module(<pkg>)` + `_register.register()` is
-deferred until the first `POST /_remote` for that package — slow boots
-no longer block the runtime, and a broken closure does not crash startup.
+deferred until the first call for that package — slow boots no longer
+block the runtime, and a broken closure does not crash startup.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from agentix import __version__
@@ -42,6 +42,7 @@ from agentix.models import (
     RemoteResponse,
 )
 from agentix.runtime.builtins import router as builtins_router
+from agentix.runtime.sio import make_sio
 
 logger = logging.getLogger("agentix.runtime")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
@@ -136,15 +137,12 @@ async def list_closures() -> list[ClosureInfo]:
 
 
 @app.post("/_remote")
-async def remote_call(request: RemoteRequest):
-    """Single dispatch endpoint. Triggers lazy import on first use.
+async def remote_call(request: RemoteRequest) -> RemoteResponse:
+    """Unary dispatch endpoint. Triggers lazy import on first use.
 
-    - For unary impls (signature returns `R`): responds 200 application/json
-      with a `RemoteResponse` body.
-    - For streaming impls (signature returns `AsyncIterator[T]`): responds
-      200 application/x-ndjson, one JSON event per line.
-    - If the closure failed to import on a prior call, every subsequent
-      request to the same package re-raises the cached error as 500.
+    Streaming and bidirectional methods are NOT served here — they live on
+    the Socket.IO connection at `/socket.io/`. A 400 with a hint is
+    returned if the caller mistakenly POSTs a streaming method to /_remote.
     """
     try:
         dispatcher = await registry.get_or_load(request.package)
@@ -158,12 +156,41 @@ async def remote_call(request: RemoteRequest):
             status_code=404,
             detail=f"closure not loaded: package={request.package!r}",
         )
+    if dispatcher.is_bidi(request.method):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"method '{request.method}' is bidirectional; "
+                f"use the Socket.IO `bidi:start` event instead"
+            ),
+        )
     if dispatcher.is_streaming(request.method):
-        return StreamingResponse(
-            dispatcher.dispatch_stream(request),
-            media_type="application/x-ndjson",
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"method '{request.method}' returns AsyncIterator; "
+                f"use the Socket.IO `stream` event instead"
+            ),
         )
     return await dispatcher.dispatch(request)
+
+
+# ── Compose ASGI app: FastAPI for HTTP, Socket.IO for streams/logs ──
+#
+# The combined ASGI app is what uvicorn (and tests) run as
+# `agentix.runtime.server:app`. `socketio.ASGIApp` routes `/socket.io/*` to
+# the Socket.IO server and everything else to FastAPI, so plain HTTP
+# endpoints (`/health`, `/_remote`, …) work unchanged through ASGITransport.
+
+import socketio as _socketio  # noqa: E402
+
+_sio, _ = make_sio(registry)
+_fastapi_app = app  # the FastAPI instance built above
+app = _socketio.ASGIApp(_sio, _fastapi_app, socketio_path="/socket.io")
+# Re-expose attributes that tests / extensions reach for via `server.app.*`.
+app.fastapi = _fastapi_app  # type: ignore[attr-defined]
+app.state = _fastapi_app.state  # type: ignore[attr-defined]
+app.sio = _sio  # type: ignore[attr-defined]
 
 
 # ── Entry point (invoked as /mnt/runtime/entry/bin/start) ───────

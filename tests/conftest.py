@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import json
 import socket
@@ -181,3 +182,61 @@ def _purge_test_packages():
     for mod in list(sys.modules):
         if mod == "agentix_closures" or mod.startswith("agentix_closures."):
             sys.modules.pop(mod, None)
+
+
+# ── live uvicorn server (for Socket.IO e2e tests) ────────────────
+
+
+@pytest.fixture
+async def live_server(runtime_module):
+    """Yields an async `start()` callable that boots uvicorn on a free port
+    serving the runtime's combined FastAPI+Socket.IO ASGI app.
+
+    Test order:
+        1. mount_package(...)        # populate /mnt
+        2. base_url = await start()  # uvicorn starts; lifespan runs _auto_load
+        3. connect via RuntimeClient(base_url) etc.
+
+    The server is torn down in fixture finalisation.
+    """
+    import contextlib as _ctx
+    import socket as _socket
+
+    import httpx as _httpx
+    import uvicorn
+
+    server, _, _ = runtime_module
+    state: dict = {"task": None, "srv": None}
+
+    async def _start() -> str:
+        if state["task"] is not None:
+            raise RuntimeError("live_server already started")
+        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        config = uvicorn.Config(
+            server.app, host="127.0.0.1", port=port,
+            log_level="error", lifespan="on",
+        )
+        srv = uvicorn.Server(config)
+        state["srv"] = srv
+        state["task"] = asyncio.create_task(srv.serve())
+        base_url = f"http://127.0.0.1:{port}"
+        async with _httpx.AsyncClient() as c:
+            for _ in range(100):
+                try:
+                    r = await c.get(f"{base_url}/health")
+                    if r.status_code == 200:
+                        return base_url
+                except (_httpx.ConnectError, _httpx.ReadError):
+                    pass
+                await asyncio.sleep(0.05)
+        raise RuntimeError("live_server did not become healthy in 5s")
+
+    try:
+        yield _start
+    finally:
+        if state["srv"] is not None:
+            state["srv"].should_exit = True
+            with _ctx.suppress(BaseException):
+                await asyncio.wait_for(state["task"], timeout=5)

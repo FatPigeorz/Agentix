@@ -88,6 +88,19 @@ class RemoteResponse(BaseModel):
     error: RemoteError | None = None
 
 
+class LogRecord(BaseModel):
+    """One log line forwarded over the Socket.IO `log` event.
+
+    Subscribers receive these whenever the runtime (or any closure logger
+    under the `agentix.*` tree) emits a logging record.
+    """
+
+    level: str          # e.g. "INFO", "WARNING"
+    name: str           # logger name
+    message: str        # formatted message
+    timestamp: float    # record.created — seconds since epoch
+
+
 # ── Runtime I/O primitives (exec / upload / download) ────────────
 
 

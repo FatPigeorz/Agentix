@@ -8,6 +8,7 @@ serves `POST /_remote` by calling the bound impl directly.
 
 from __future__ import annotations
 
+import asyncio
 import textwrap
 from pathlib import Path
 
@@ -401,7 +402,10 @@ _STREAM_REGISTER = textwrap.dedent("""
 """)
 
 
-async def test_stream_dispatch_yields_ndjson(runtime_module, mount_package):
+async def test_dispatch_stream_yields_events(runtime_module, mount_package):
+    """Dispatcher.dispatch_stream yields {item|end|error} dicts (transport-agnostic)."""
+    from agentix.models import RemoteRequest
+
     server, _, _ = runtime_module
     mount_package(
         "streamer",
@@ -411,21 +415,13 @@ async def test_stream_dispatch_yields_ndjson(runtime_module, mount_package):
         register_src=_STREAM_REGISTER,
     )
     await server._auto_load()
-
-    transport = httpx.ASGITransport(app=server.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
-        async with http.stream(
-            "POST", "/_remote",
-            json={
-                "package": "agentix_closures.streamer",
-                "method": "chat",
-                "kwargs": {"prompt": "hi", "n": 2},
-            },
-        ) as r:
-            assert r.status_code == 200
-            assert "x-ndjson" in r.headers["content-type"]
-            import json as _json
-            events = [_json.loads(line) async for line in r.aiter_lines() if line.strip()]
+    dispatcher = await server.registry.get_or_load("agentix_closures.streamer")
+    events = []
+    async for ev in dispatcher.dispatch_stream(
+        RemoteRequest(package="agentix_closures.streamer", method="chat",
+                      kwargs={"prompt": "hi", "n": 2}),
+    ):
+        events.append(ev)
     assert events == [
         {"item": {"text": "hi-0", "idx": 0}},
         {"item": {"text": "hi-1", "idx": 1}},
@@ -433,9 +429,8 @@ async def test_stream_dispatch_yields_ndjson(runtime_module, mount_package):
     ]
 
 
-async def test_stream_via_runtime_client_typed(runtime_module, mount_package):
-    """`async for x in c.remote(stream_fn, ...)` yields typed items."""
-    server, _, _ = runtime_module
+async def test_stream_e2e_via_socketio(runtime_module, mount_package, live_server):
+    """Full e2e: RuntimeClient.remote(stream_fn, ...) over a real Socket.IO conn."""
     mount_package(
         "streamer2",
         package="agentix_closures.streamer2",
@@ -443,22 +438,18 @@ async def test_stream_via_runtime_client_typed(runtime_module, mount_package):
         impl_src=_STREAM_IMPL,
         register_src=_STREAM_REGISTER,
     )
-    await server._auto_load()
-
+    base_url = await live_server()
     from agentix_closures.streamer2 import Token, chat
 
-    transport = httpx.ASGITransport(app=server.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
-        client = RuntimeClient.__new__(RuntimeClient)
-        client._client = http
-        out = [tok async for tok in client.remote(chat, "go", n=3)]
+    async with RuntimeClient(base_url) as c:
+        out = [tok async for tok in c.remote(chat, "go", n=3)]
     assert len(out) == 3
     assert all(isinstance(t, Token) for t in out)
     assert [t.text for t in out] == ["go-0", "go-1", "go-2"]
 
 
-async def test_stream_impl_raises_mid_stream(runtime_module, mount_package):
-    """When the impl raises after yielding some items, RuntimeClient raises."""
+async def test_stream_impl_raises_mid_stream(runtime_module, mount_package, live_server):
+    """Impl raises mid-stream → items observed first, then RemoteCallError."""
     init_src = textwrap.dedent("""
         from typing import AsyncIterator
         def explode(n: int = 2) -> AsyncIterator[int]:
@@ -477,27 +468,114 @@ async def test_stream_impl_raises_mid_stream(runtime_module, mount_package):
         def register():
             d = Dispatcher(); d.bind(explode, _e); return d
     """)
-    server, _, _ = runtime_module
     mount_package(
         "exploder",
         package="agentix_closures.exploder",
         init_src=init_src, impl_src=impl_src, register_src=register_src,
     )
-    await server._auto_load()
-
+    base_url = await live_server()
     from agentix_closures.exploder import explode
 
-    transport = httpx.ASGITransport(app=server.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
-        client = RuntimeClient.__new__(RuntimeClient)
-        client._client = http
-        collected: list[int] = []
+    collected: list[int] = []
+    async with RuntimeClient(base_url) as c:
         with pytest.raises(RemoteCallError) as ei:
-            async for x in client.remote(explode, n=2):
+            async for x in c.remote(explode, n=2):
                 collected.append(x)
-    assert collected == [0, 1]  # got items before the raise
+    assert collected == [0, 1]
     assert ei.value.error.type == "ValueError"
     assert "kaboom-after-yield" in ei.value.error.message
+
+
+# ── bidirectional ────────────────────────────────────────────────
+
+
+_BIDI_INIT = textwrap.dedent("""
+    from dataclasses import dataclass
+    from typing import AsyncIterator
+
+    @dataclass
+    class UserMsg:
+        text: str
+
+    @dataclass
+    class ReplyMsg:
+        text: str
+
+    def chat(messages: AsyncIterator[UserMsg], prefix: str = "say:") -> AsyncIterator[ReplyMsg]:
+        raise NotImplementedError
+""")
+
+_BIDI_IMPL = textwrap.dedent("""
+    from . import UserMsg, ReplyMsg
+
+    async def chat(messages, prefix="say:"):
+        async for m in messages:
+            yield ReplyMsg(text=f"{prefix}{m.text}")
+""")
+
+_BIDI_REGISTER = textwrap.dedent("""
+    from agentix.dispatch import Dispatcher
+    from . import chat
+    from ._impl import chat as _chat
+    def register():
+        d = Dispatcher(); d.bind(chat, _chat); return d
+""")
+
+
+async def test_bidi_e2e_via_socketio(runtime_module, mount_package, live_server):
+    """Full e2e bidi: caller feeds AsyncIterator inputs, receives outputs."""
+    mount_package(
+        "chatter",
+        package="agentix_closures.chatter",
+        init_src=_BIDI_INIT, impl_src=_BIDI_IMPL, register_src=_BIDI_REGISTER,
+    )
+    base_url = await live_server()
+    from agentix_closures.chatter import ReplyMsg, UserMsg, chat
+
+    async def inputs():
+        for s in ("hi", "bye", "."):
+            yield UserMsg(text=s)
+
+    async with RuntimeClient(base_url) as c:
+        out = [r async for r in c.remote(chat, inputs(), prefix=">> ")]
+
+    assert all(isinstance(r, ReplyMsg) for r in out)
+    assert [r.text for r in out] == [">> hi", ">> bye", ">> ."]
+
+
+# ── logs ─────────────────────────────────────────────────────────
+
+
+async def test_logs_subscription(runtime_module, mount_echo, live_server):
+    """Subscribing to logs receives records emitted by the runtime."""
+    import logging as _logging
+
+    mount_echo()
+    base_url = await live_server()
+
+    async with RuntimeClient(base_url) as c:
+        records = []
+
+        async def _collect():
+            async for r in c.logs():
+                records.append(r)
+                if len(records) >= 1:
+                    return
+
+        collector = asyncio.create_task(_collect())
+        await asyncio.sleep(0.5)  # let the subscription land server-side
+        # Emit several times in case the first beats the subscription handshake.
+        for _ in range(5):
+            _logging.getLogger("agentix.test").warning("hello from the test")
+            await asyncio.sleep(0.1)
+        try:
+            await asyncio.wait_for(collector, timeout=5)
+        except asyncio.TimeoutError:
+            collector.cancel()
+            raise
+
+    assert any("hello from the test" in r.message for r in records)
+    assert all(r.name.startswith("agentix") for r in records)
 
 
 # ── support fixture ──────────────────────────────────────────────

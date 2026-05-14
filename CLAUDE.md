@@ -93,7 +93,9 @@ This means: a broken closure does not block sandbox boot; an unused closure cost
 
 ### Wire
 
-A single endpoint serves all remote calls:
+Two transports, used per call shape:
+
+**Unary** — `POST /_remote` (HTTP, JSON):
 
 ```
 POST /_remote
@@ -105,7 +107,27 @@ POST /_remote
 ← { "ok": true, "value": { "exit_code": 0, "stdout": "...", "patch": "..." } }
 ```
 
-Failures (validation error, impl exception, serialization error) come back as `{ "ok": false, "error": {...} }`. Wire stays 200.
+Failures come back as `{ "ok": false, "error": {...} }`. Wire stays 200.
+
+**Server-streaming, bidirectional, and log subscription** — Socket.IO at `/socket.io/`. One persistent Socket.IO connection per `RuntimeClient` multiplexes all such calls, demultiplexed by a caller-generated `call_id`. Event shapes:
+
+```
+stream            {call_id, package, method, args, kwargs}
+stream:item       {call_id, value}
+stream:end        {call_id}
+stream:error      {call_id, error}
+
+bidi:start        {call_id, package, method, args, kwargs}
+bidi:in           {call_id, item}
+bidi:end_in       {call_id}
+bidi:out          {call_id, value}
+bidi:end          {call_id}
+bidi:error        {call_id, error}
+
+logs:subscribe    {filter?: <logger-name prefix>}
+log               {level, name, message, timestamp}
+logs:unsubscribe  {}
+```
 
 Runtime built-ins (`/exec`, `/upload`, `/download`, `/health`, `/closures`) live alongside `/_remote` at the runtime root, unrelated to closure dispatch.
 
