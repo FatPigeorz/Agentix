@@ -6,9 +6,9 @@ runtime server (sandbox side). Both client and server import from here;
 sibling subpackages (`runtime/client/`, `runtime/server/`) depend on this
 module but not on each other.
 
-Cross-cutting concepts that aren't wire types — `ClosureManifest`,
+Cross-cutting concepts that aren't wire types — `NamespaceManifest`,
 `SandboxConfig`, `SandboxInfo`, `AGENTIX_CLOSURE_ABI` — stay in
-`agentix.models` since they're consumed by closure authors / deployment
+`agentix.models` since they're consumed by namespace authors / deployment
 code that doesn't touch the runtime transport.
 """
 
@@ -20,7 +20,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from agentix.idents import CallId, MethodName, PackageName
-from agentix.models import ClosureManifest
+from agentix.models import NamespaceManifest
 
 #: Type-system origins that mark a parameter or return annotation as
 #: streaming (`AsyncIterator[T]` / `AsyncGenerator[T, ...]`). Used by the
@@ -29,13 +29,13 @@ from agentix.models import ClosureManifest
 #: both sides of the wire.
 STREAM_ORIGINS: tuple[type, ...] = (cabc.AsyncIterator, cabc.AsyncGenerator)
 
-# ── Runtime introspection (GET /closures, /health) ──────────────────
+# ── Runtime introspection (GET /namespaces, /health) ──────────────────
 
 
-class ClosureInfo(BaseModel):
-    """One entry in GET /closures. `manifest.package` is the closure identity."""
+class NamespaceInfo(BaseModel):
+    """One entry in GET /namespaces. `manifest.package` is the namespace identity."""
 
-    manifest: ClosureManifest
+    manifest: NamespaceManifest
 
 
 class HealthResponse(BaseModel):
@@ -47,9 +47,9 @@ class HealthResponse(BaseModel):
 
 
 class RemoteRequest(BaseModel):
-    """POST /_remote body. `package` is the closure's Python import path
-    (e.g. 'agentix.primitive.bash'); `method` is a stub name bound
-    by that closure's Dispatcher.
+    """POST /_remote body. `package` is the namespace's Python import path
+    (e.g. 'agentix.bash'); `method` is a stub name bound
+    by that namespace's Dispatcher.
 
     `call_id` is an optional rollout correlation key; the dispatcher pins
     it into a contextvar so trace events emitted from inside the impl
@@ -84,7 +84,7 @@ class RemoteResponse(BaseModel):
 class LogRecord(BaseModel):
     """One log line forwarded over the Socket.IO `log` event.
 
-    Subscribers receive these whenever the runtime (or any closure logger
+    Subscribers receive these whenever the runtime (or any namespace logger
     under the `agentix.*` tree) emits a logging record.
     """
 
@@ -96,7 +96,7 @@ class LogRecord(BaseModel):
 
 class TraceEvent(BaseModel):
     """One semantic event from a rollout, broadcast via the `trace` Socket.IO
-    event. Closures emit these through `agentix.trace.emit(...)` to record
+    event. Namespaces emit these through `agentix.trace.emit(...)` to record
     LLM calls, tool invocations, rewards, or arbitrary checkpoint markers.
 
     The `call_id` correlates events to a specific rollout — for unary HTTP
@@ -110,11 +110,11 @@ class TraceEvent(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     timestamp: float                # emit-time seconds since epoch
     call_id: CallId | None = None   # rollout / call correlation key
-    source: PackageName | None = None  # closure package or "runtime" that emitted this
+    source: PackageName | None = None  # namespace package or "runtime" that emitted this
 
 
 # Shell exec and file I/O used to live at this layer too (ExecRequest /
 # ExecResponse, UploadResponse). They moved to the `bash` and `files`
-# primitive closures under `primitives/`. Their request/response shapes
-# live in those closure packages (`BashResult`, `UploadResult` etc.) and
-# travel as ordinary closure dispatches over /_remote.
+# primitive namespaces under `primitives/`. Their request/response shapes
+# live in those namespace packages (`BashResult`, `UploadResult` etc.) and
+# travel as ordinary namespace dispatches over /_remote.

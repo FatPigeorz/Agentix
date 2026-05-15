@@ -2,11 +2,11 @@
 
 Wraps:
   - typed remote-call dispatch: `RuntimeClient.remote(fn, *args, **kwargs)`,
-    where `fn` is a stub function imported from a closure's Python package.
+    where `fn` is a stub function imported from a namespace's Python package.
     Routing key is `fn.__module__`; result is decoded into `fn`'s return type.
-    Shell exec / file I/O live in the `bash` and `files` primitive closures —
+    Shell exec / file I/O live in the `bash` and `files` primitive namespaces —
     call them via `c.remote(bash.Bash.run, ...)` and `c.remote(files.Files.upload, ...)`.
-  - `/closures` introspection and `/health`.
+  - `/namespaces` introspection and `/health`.
   - log subscription: `RuntimeClient.logs()` is an `AsyncIterator[LogRecord]`
     fed by a Socket.IO `log` event stream; same for `RuntimeClient.traces()`.
 
@@ -60,9 +60,9 @@ from agentix.runtime.events import (
 )
 from agentix.runtime.models import (
     STREAM_ORIGINS,
-    ClosureInfo,
     HealthResponse,
     LogRecord,
+    NamespaceInfo,
     RemoteError,
     RemoteRequest,
     RemoteResponse,
@@ -78,7 +78,7 @@ T = TypeVar("T")
 
 
 class RemoteCallError(RuntimeError):
-    """Raised when a remote closure impl returns a non-ok RemoteResponse,
+    """Raised when a remote namespace impl returns a non-ok RemoteResponse,
     or when a stream/bidi call surfaces an `error` event from the wire."""
 
     def __init__(self, package: str, method: str, error: RemoteError):
@@ -124,10 +124,10 @@ class RuntimeClient:
         r.raise_for_status()
         return HealthResponse.model_validate(r.json())
 
-    async def closures(self) -> list[ClosureInfo]:
-        r = await self._client.get("/closures")
+    async def namespaces(self) -> list[NamespaceInfo]:
+        r = await self._client.get("/namespaces")
         r.raise_for_status()
-        return [ClosureInfo.model_validate(x) for x in r.json()]
+        return [NamespaceInfo.model_validate(x) for x in r.json()]
 
     # ── typed remote call ────────────────────────────────────────
 
@@ -340,7 +340,7 @@ class RuntimeClient:
         """Subscribe to the runtime's trace stream.
 
         Yields a `TraceEvent` for every `agentix.trace.emit(...)` from any
-        closure. Optional `kind` and `call_id` filters are applied
+        namespace. Optional `kind` and `call_id` filters are applied
         client-side; the server broadcasts all events to subscribers.
         Iteration ends when the connection closes or the caller breaks.
         """
@@ -409,7 +409,7 @@ class RuntimeClient:
             q.put_nowait(data)
 
     # Shell exec / file I/O are not in the runtime core. Mount the `bash`
-    # and `files` primitive closures and dispatch through `c.remote(...)`.
+    # and `files` primitive namespaces and dispatch through `c.remote(...)`.
 
 
 def _encode_args(sig: inspect.Signature, args: tuple) -> list[Any]:

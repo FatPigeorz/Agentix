@@ -1,7 +1,7 @@
 """Generic plugin registry — one tool, all extension axes.
 
 Every framework axis (`Deployment`, trace sinks, spec resolvers, CLI
-subcommands, wire patterns, the closure surface itself) is a thin
+subcommands, wire patterns, the namespace surface itself) is a thin
 wrapper around `Registry[T]`. The registry knows two ways to find
 plugins:
 

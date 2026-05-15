@@ -29,11 +29,11 @@ class Tracer(Namespace):
 
 
 async def test_trace_emit_received_by_subscriber(
-    runtime_module, register_closure, live_server,
+    runtime_module, register_namespace, live_server,
 ):
-    """A closure emits two trace events; subscriber receives them with the
+    """A namespace emits two trace events; subscriber receives them with the
     dispatcher-pinned call_id + source filled in."""
-    register_closure(Tracer)
+    register_namespace(Tracer)
     base_url = await live_server()
 
     async with RuntimeClient(base_url) as c:
@@ -66,9 +66,9 @@ async def test_trace_emit_received_by_subscriber(
     assert received[1].payload == {"value": 0.5}
 
 
-async def test_trace_filter_by_kind(runtime_module, register_closure, live_server):
+async def test_trace_filter_by_kind(runtime_module, register_namespace, live_server):
     """`c.traces(kind=...)` only yields matching events."""
-    register_closure(Tracer)
+    register_namespace(Tracer)
     base_url = await live_server()
     async with RuntimeClient(base_url) as c:
         received: list[TraceEvent] = []
@@ -203,10 +203,10 @@ class Splody(Namespace):
 
 
 async def test_rollout_pool_maps_and_returns_results(
-    runtime_module, register_closure, live_server,
+    runtime_module, register_namespace, live_server,
 ):
     """RolloutPool fans out N tasks across parallelism slots and yields results."""
-    register_closure(EchoNs)
+    register_namespace(EchoNs)
     base_url = await live_server()
 
     class _StubSandbox:
@@ -258,10 +258,10 @@ async def test_rollout_pool_maps_and_returns_results(
 
 
 async def test_rollout_pool_surfaces_per_task_errors(
-    runtime_module, register_closure, live_server,
+    runtime_module, register_namespace, live_server,
 ):
     """One bad task doesn't tank the pool — its exception is yielded as the result."""
-    register_closure(Splody)
+    register_namespace(Splody)
     base_url = await live_server()
 
     class _StubSandbox:

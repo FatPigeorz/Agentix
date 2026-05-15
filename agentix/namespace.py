@@ -1,6 +1,6 @@
-"""`Namespace` marker + method discovery for closure stub classes.
+"""`Namespace` marker + method discovery for namespace stub classes.
 
-A closure declares its public API as a `Namespace` subclass with
+A namespace declares its public API as a `Namespace` subclass with
 `...`-bodied methods (the stub). The impl is a **separate, unrelated
 class** whose methods structurally match the stub. `_register.py`
 glues them together via `Dispatcher.bind_namespace(StubCls, impl_instance)`.
@@ -27,7 +27,7 @@ def register() -> Dispatcher:
     return Dispatcher.bind_namespace(Bash, BashImpl())
 ```
 
-`Namespace` is declared as an empty `Protocol`, so a closure author who
+`Namespace` is declared as an empty `Protocol`, so a namespace author who
 wants pyright to structurally verify their impl can declare the stub
 as a Protocol too:
 
@@ -57,7 +57,7 @@ from typing import Protocol, runtime_checkable
 
 @runtime_checkable
 class Namespace(Protocol):
-    """Marker Protocol for a closure's typed surface.
+    """Marker Protocol for a namespace's typed surface.
 
     Declaring this as a Protocol means subclasses can opt into Protocol
     semantics by adding `Protocol` to their own base list:

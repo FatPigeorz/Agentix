@@ -1,4 +1,4 @@
-"""`agentix install` — bundle multiple closures into a single image.
+"""`agentix install` — bundle multiple namespaces into a single image.
 
 Usage:
 
@@ -6,17 +6,17 @@ Usage:
     agentix install ./primitives/bash ./my-agent  -o demo:dev
     agentix install bash files --dry-run          # stage to ./build/<tag>/
 
-A bundle is one docker image carrying multiple closures' Python packages
+A bundle is one docker image carrying multiple namespaces' Python packages
 + native deps under a single `/nix/entry/` tree, with a `bundle.json`
 discriminator so the runtime's `_auto_load` discovers every nested
-closure on boot.
+namespace on boot.
 
 Spec resolution (per arg):
 
   1. **Path:** an existing directory containing `pyproject.toml` and an
-     `agentix_closures/<name>/` package — used as-is.
+     `agentix_namespaces/<name>/` package — used as-is.
   2. **Image ref:** a string with a `:` AND a `/` — treated as a
-     pre-built closure image and pulled at bundle build time.
+     pre-built namespace image and pulled at bundle build time.
   3. **Short name:** searched against the framework's conventional
      extension roots — `primitives/<name>/`, `agents/<name>/`,
      `datasets/<name>/` (relative to the repo root). If none match,
@@ -37,7 +37,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from agentix.cli._resolve import REPO_ROOT, ClosureSpec, resolve_spec
+from agentix.cli._resolve import REPO_ROOT, NamespaceSpec, resolve_spec
 
 TEMPLATE_DIR = REPO_ROOT / "primitives" / "_template"
 
@@ -51,7 +51,7 @@ _SOURCE_SKIP = {
 def _stage_bundle(
     bundle_name: str,
     bundle_version: str,
-    specs: list[ClosureSpec],
+    specs: list[NamespaceSpec],
     build_dir: Path,
 ) -> None:
     """Lay out a self-contained docker build context for the bundle.
@@ -62,11 +62,11 @@ def _stage_bundle(
       ├── gen_manifest.py                  # copied from tools/
       ├── default.nix                      # copied from primitives/_template/
       ├── bundle.json                      # baked into the final image
-      └── <short>/                         # per-closure staging (the whole project)
+      └── <short>/                         # per-namespace staging (the whole project)
           ├── pyproject.toml
-          └── src/<pkg>/...                # or whatever the closure ships
+          └── src/<pkg>/...                # or whatever the namespace ships
     """
-    # Per-closure source staging (path kind only at this stage).
+    # Per-namespace source staging (path kind only at this stage).
     for spec in specs:
         if spec.kind != "path":
             # Image and PyPI paths require pulling artifacts before staging —
@@ -74,7 +74,7 @@ def _stage_bundle(
             # error if we ever reach it.
             raise NotImplementedError(
                 f"`agentix install {spec.short}`: {spec.kind} sourcing not "
-                f"implemented yet. Use a local path or check that the closure "
+                f"implemented yet. Use a local path or check that the namespace "
                 f"lives under primitives/, agents/, or datasets/ in this repo."
             )
         assert spec.path is not None
@@ -89,18 +89,18 @@ def _stage_bundle(
             else:
                 shutil.copy2(item, dest)
 
-    # Shared build infra — same default.nix used for single-closure builds.
+    # Shared build infra — same default.nix used for single-namespace builds.
     shutil.copy2(TEMPLATE_DIR / "default.nix", build_dir / "default.nix")
 
-    # The bundle Dockerfile builds each closure's nix derivation in a
+    # The bundle Dockerfile builds each namespace's nix derivation in a
     # builder stage and pip-installs all of them into the final image. The
     # runtime's `_auto_load` walks `importlib.metadata.entry_points`, so as
-    # long as every closure's wheel is installed, discovery works without
+    # long as every namespace's wheel is installed, discovery works without
     # any extra disposition file.
     (build_dir / "Dockerfile").write_text(_render_dockerfile(specs))
 
 
-def _render_dockerfile(specs: list[ClosureSpec]) -> str:
+def _render_dockerfile(specs: list[NamespaceSpec]) -> str:
     builder_steps = "\n".join(
         f"WORKDIR /src/{spec.short}\n"
         f"COPY {spec.short}/ ./\n"
@@ -129,8 +129,8 @@ RUN mkdir -p /export/nix/store /export/nix/entry
 FROM busybox:stable
 COPY --from=builder /export /
 VOLUME /nix
-LABEL org.agentix.closure=1
-LABEL org.agentix.closure.kind=bundle
+LABEL org.agentix.namespace=1
+LABEL org.agentix.namespace.kind=bundle
 """
 
 
@@ -141,7 +141,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("specs", nargs="+",
-                        help="closure short names, paths, or image refs")
+                        help="namespace short names, paths, or image refs")
     parser.add_argument("-o", "--output", required=True,
                         help="bundle image tag, e.g. my-agent:0.1.0")
     parser.add_argument("--dry-run", action="store_true",
@@ -153,12 +153,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     bundle_name, bundle_version = args.output.rsplit(":", 1)
 
     specs = [resolve_spec(s) for s in args.specs]
-    # Validate uniqueness on `short` — same closure twice would collide
+    # Validate uniqueness on `short` — same namespace twice would collide
     # both in the build dir and at runtime registration.
     shorts = [s.short for s in specs]
     dupes = {n for n in shorts if shorts.count(n) > 1}
     if dupes:
-        raise SystemExit(f"duplicate closure short names: {sorted(dupes)}")
+        raise SystemExit(f"duplicate namespace short names: {sorted(dupes)}")
 
     try:
         if args.dry_run:
@@ -169,7 +169,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             _stage_bundle(bundle_name, bundle_version, specs, out)
             print(f"staged bundle build context → {out}")
             print(f"would build → {args.output}")
-            print(f"  closures: {', '.join(shorts)}")
+            print(f"  namespaces: {', '.join(shorts)}")
             return 0
 
         with TemporaryDirectory(prefix="agentix-bundle-") as tmp:

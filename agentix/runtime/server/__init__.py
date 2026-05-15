@@ -2,7 +2,7 @@
 
 Composes FastAPI (for HTTP RPC + LLM proxy) and Socket.IO (for streams,
 bidi, and log subscription) into the ASGI app uvicorn runs. Imports each
-mounted closure's Python package lazily on first call.
+mounted namespace's Python package lazily on first call.
 
 Submodules:
   - `app`         — FastAPI app, lifespan, Registry, /_remote unary dispatch
@@ -11,7 +11,7 @@ Submodules:
   - `trace_bridge` — pipes `agentix.trace.emit(...)` to the Socket.IO `trace` room
 
 Shell exec and file I/O moved out of the core: they ship as the `bash`
-and `files` primitive closures under `primitives/`. Invoke via
+and `files` primitive namespaces under `primitives/`. Invoke via
 `c.remote(bash.Bash.run, ...)` / `c.remote(files.Files.upload, ...)`.
 
 Public names re-exported here so legacy imports keep working:

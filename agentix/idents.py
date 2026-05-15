@@ -1,7 +1,7 @@
 """Branded string identifiers.
 
 `NewType` aliases for the four `str`s that appear in the wire layer and
-that are easy to confuse: a closure's import path, a method name bound
+that are easy to confuse: a namespace's import path, a method name bound
 in a Dispatcher, the rollout/call correlation key, and the sandbox
 handle returned by deployment. They're plain `str` at runtime (zero
 cost) but pyright treats them as distinct, so swapping one for another
@@ -18,17 +18,17 @@ from typing import NewType
 CallId = NewType("CallId", str)
 """Rollout / call correlation key. Pinned into a contextvar by the
 dispatcher before invoking an impl, so `trace.emit()` from inside the
-closure inherits it automatically. Travels on `RemoteRequest.call_id`
+namespace inherits it automatically. Travels on `RemoteRequest.call_id`
 (unary) and on Socket.IO stream/bidi frames."""
 
 PackageName = NewType("PackageName", str)
-"""A closure's Python import path (e.g. `agentix.primitive.bash`). The
+"""A namespace's Python import path (e.g. `agentix.bash`). The
 identity used by `Registry` for routing — there are no caller-chosen
-namespaces. Equal to `ClosureManifest.package`."""
+namespaces. Equal to `NamespaceManifest.package`."""
 
 MethodName = NewType("MethodName", str)
 """A method bound on a Dispatcher. For a `Namespace` subclass this is
-the method name; for legacy function-stub closures it's the function
+the method name; for legacy function-stub namespaces it's the function
 name. Travels on `RemoteRequest.method` and on stream/bidi frames."""
 
 SandboxId = NewType("SandboxId", str)

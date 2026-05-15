@@ -54,7 +54,7 @@ async def _run_async(backend: str, args: argparse.Namespace) -> int:
     config = SandboxConfig(
         image=args.base,
         runtime=args.runtime,
-        closures=[args.image],
+        namespaces=[args.image],
     )
     if args.detach:
         sandbox = await deployment.create(config)
@@ -96,7 +96,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--image", required=True,
-        help="closure or bundle image tag (e.g. my-agent:0.1.0)",
+        help="namespace or bundle image tag (e.g. my-agent:0.1.0)",
     )
     parser.add_argument(
         "--base", default=DEFAULT_BASE_IMAGE,

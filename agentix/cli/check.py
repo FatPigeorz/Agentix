@@ -1,12 +1,12 @@
-"""`agentix check` — list installed closures and smoke-import them.
+"""`agentix check` — list installed namespaces and smoke-import them.
 
 With entry-point-only discovery, stub↔impl drift can't happen — there's
 only one class, signature and body share the same source line. The
 useful thing the check still does is *exercise* the discovery:
 
-  * walk `importlib.metadata.entry_points(group="agentix.closure")`
-  * `ep.load()` each — fails fast if the closure's module imports break
-  * print one line per closure so the user can see what's installed
+  * walk `importlib.metadata.entry_points(group="agentix.namespace")`
+  * `ep.load()` each — fails fast if the namespace's module imports break
+  * print one line per namespace so the user can see what's installed
 
 Run as `agentix check`. Non-zero exit on any load failure.
 """
@@ -31,7 +31,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     eps = discover_entry_points()
     if not eps:
-        print("no closures found (no `agentix.closure` entry points installed)")
+        print("no namespaces found (no `agentix.namespace` entry points installed)")
         return 0
 
     failures = 0
@@ -54,7 +54,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"OK   {ep.name:20s} {ep.value:40s} {dist_str}")
 
     if failures:
-        print(f"\n{failures} closure(s) failed to load", file=sys.stderr)
+        print(f"\n{failures} namespace(s) failed to load", file=sys.stderr)
         return 1
     return 0
 

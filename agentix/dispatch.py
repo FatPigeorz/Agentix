@@ -1,8 +1,8 @@
-"""In-process closure dispatch.
+"""In-process namespace dispatch.
 
-A `Dispatcher` binds typed stub signatures to their impl callables. Closures
+A `Dispatcher` binds typed stub signatures to their impl callables. Namespaces
 ship a `_register.register()` function that returns a populated Dispatcher.
-The runtime imports each mounted closure's package, collects Dispatchers
+The runtime imports each mounted namespace's package, collects Dispatchers
 into a `Registry`, and serves `POST /{ns}/_remote` by calling
 `registry.get(ns).dispatch(request)` directly — no subprocess, no UDS,
 no reverse proxy.
@@ -75,7 +75,7 @@ class _BoundMethod(Generic[P, R]):
 class Dispatcher:
     """A namespace's collection of bound (stub, impl) pairs.
 
-    Closures construct one of these in their `_register.register()`:
+    Namespaces construct one of these in their `_register.register()`:
 
         from agentix.dispatch import Dispatcher
         from . import run               # the stub (Ellipsis body)
@@ -168,7 +168,7 @@ class Dispatcher:
     def bind_namespace(self, cls: type[Namespace]) -> Dispatcher:
         """Bind every public method of `cls`.
 
-        Closure methods are `@staticmethod` — the class is a namespace,
+        Namespace methods are `@staticmethod` — the class is a namespace,
         method bodies carry the real logic, the signature is the
         contract. The dispatcher binds each function to itself (stub
         and impl are the same callable). No instance is needed.
@@ -225,7 +225,7 @@ class Dispatcher:
                 if inspect.isawaitable(result):
                     result = await result
             except Exception as exc:
-                logger.exception("closure impl '%s' raised", m.name)
+                logger.exception("namespace impl '%s' raised", m.name)
                 return RemoteResponse(
                     ok=False,
                     error=RemoteError(
@@ -296,7 +296,7 @@ class Dispatcher:
                         return
                     yield {"item": value}
             except Exception as exc:
-                logger.exception("closure stream impl '%s' raised mid-stream", m.name)
+                logger.exception("namespace stream impl '%s' raised mid-stream", m.name)
                 yield {"error": RemoteError(
                     type=type(exc).__name__,
                     message=str(exc),
@@ -367,7 +367,7 @@ class Dispatcher:
                         return
                     yield {"item": value}
             except Exception as exc:
-                logger.exception("closure bidi impl '%s' raised mid-stream", m.name)
+                logger.exception("namespace bidi impl '%s' raised mid-stream", m.name)
                 yield {"error": RemoteError(
                     type=type(exc).__name__,
                     message=str(exc),
@@ -416,28 +416,28 @@ class Dispatcher:
 
 
 def _source_for(impl: Callable[..., Any]) -> PackageName | None:
-    """Derive a closure package path from an impl function for trace events."""
+    """Derive a namespace package path from an impl function for trace events."""
     mod = getattr(impl, "__module__", None)
     if mod is None:
         return None
     return PackageName(mod)
 
 
-# The entry-point group every closure declares under in its pyproject.toml:
+# The entry-point group every namespace declares under in its pyproject.toml:
 #
-#   [project.entry-points."agentix.closure"]
+#   [project.entry-points."agentix.namespace"]
 #   bash = "agentix.bash:Bash"
 #
 # The framework reads this at startup via `importlib.metadata.entry_points`.
-CLOSURE_ENTRY_POINT_GROUP = "agentix.closure"
+NAMESPACE_ENTRY_POINT_GROUP = "agentix.namespace"
 
 
 @dataclass
 class _Entry:
-    """One registered closure. `dispatcher` is built lazily on first use.
+    """One registered namespace. `dispatcher` is built lazily on first use.
 
-    `loader` returns the closure's `Namespace` subclass on demand. For
-    entry-point-discovered closures it's `ep.load`; for test fixtures it's
+    `loader` returns the namespace's `Namespace` subclass on demand. For
+    entry-point-discovered namespaces it's `ep.load`; for test fixtures it's
     a pre-bound `lambda: cls`. Either way, the actual import + dispatcher
     build is deferred until `get_or_load(...)` is awaited.
     """
@@ -451,16 +451,16 @@ class _Entry:
 
 
 class Registry:
-    """Per-runtime collection of package-path → closure entry.
+    """Per-runtime collection of package-path → namespace entry.
 
-    Closures are discovered via `importlib.metadata.entry_points(group=
-    "agentix.closure")` at sandbox-startup time, but their Python packages
+    Namespaces are discovered via `importlib.metadata.entry_points(group=
+    "agentix.namespace")` at sandbox-startup time, but their Python packages
     are not imported and their Dispatchers are not built until the first
     call to `get_or_load(package)`. This keeps sandbox boot cheap and
-    isolates per-closure import failures so they surface on call rather
+    isolates per-namespace import failures so they surface on call rather
     than at startup.
 
-    The closure's Python import path (e.g. 'agentix.bash') is the routing
+    The namespace's Python import path (e.g. 'agentix.bash') is the routing
     key — there are no caller-chosen namespaces.
     """
 
@@ -475,12 +475,12 @@ class Registry:
         dist_name: str | None = None,
         dist_version: str | None = None,
     ) -> None:
-        """Mark a closure as known but not yet loaded.
+        """Mark a namespace as known but not yet loaded.
 
-        `loader()` must return the closure's `Namespace` subclass. The
+        `loader()` must return the namespace's `Namespace` subclass. The
         registry calls it lazily on first dispatch. `dist_name` and
         `dist_version` come from `importlib.metadata` and are surfaced
-        via `/closures` for introspection.
+        via `/namespaces` for introspection.
         """
         if package in self._entries:
             raise ValueError(f"package '{package}' already registered")
@@ -537,7 +537,7 @@ class Registry:
                     )
                 entry.dispatcher = Dispatcher().bind_namespace(cls)
             except Exception as exc:
-                logger.exception("lazy-load failed for closure '%s'", package)
+                logger.exception("lazy-load failed for namespace '%s'", package)
                 entry.error = exc
                 raise
             return entry.dispatcher
@@ -551,7 +551,7 @@ class Registry:
         return [pkg for pkg, e in self._entries.items() if e.dispatcher is not None]
 
     def info_for(self, package: PackageName) -> tuple[str | None, str | None] | None:
-        """`(dist_name, dist_version)` for the closure, or None if not registered."""
+        """`(dist_name, dist_version)` for the namespace, or None if not registered."""
         e = self._entries.get(package)
         if e is None:
             return None
@@ -562,14 +562,14 @@ class Registry:
 
 
 def discover_entry_points() -> list[Any]:
-    """Return every installed `agentix.closure` entry point.
+    """Return every installed `agentix.namespace` entry point.
 
     Cheap: walks `importlib.metadata` dist metadata; nothing is imported.
     The framework uses this at sandbox-startup to populate the Registry
-    without paying the import cost of every closure.
+    without paying the import cost of every namespace.
     """
     eps = importlib.metadata.entry_points()
     # Python 3.10+: SelectableGroups with .select(); earlier: dict.
     if hasattr(eps, "select"):
-        return list(eps.select(group=CLOSURE_ENTRY_POINT_GROUP))
-    return list(eps.get(CLOSURE_ENTRY_POINT_GROUP, []))  # type: ignore[attr-defined]
+        return list(eps.select(group=NAMESPACE_ENTRY_POINT_GROUP))
+    return list(eps.get(NAMESPACE_ENTRY_POINT_GROUP, []))  # type: ignore[attr-defined]

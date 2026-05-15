@@ -1,7 +1,7 @@
 """Protocol-level integration tests for the runtime server's dispatch path.
 
 These tests drive the real `agentix.runtime.server` FastAPI app over an
-ASGI transport. The fixture `register_closure` injects a `Namespace`
+ASGI transport. The fixture `register_namespace` injects a `Namespace`
 subclass straight into the runtime's registry, bypassing the
 `importlib.metadata.entry_points` discovery that production uses — same
 end state, no on-disk packaging.
@@ -28,7 +28,7 @@ from agentix.runtime.models import RemoteRequest
 pytestmark = pytest.mark.asyncio
 
 
-# ── closure shapes used across tests ─────────────────────────────────
+# ── namespace shapes used across tests ─────────────────────────────────
 
 
 @dataclass
@@ -91,19 +91,19 @@ class Talker(Namespace):
 # ── registry + dispatch basics ───────────────────────────────────────
 
 
-async def test_register_closure_makes_it_dispatchable(
-    runtime_module, register_closure,
+async def test_register_namespace_makes_it_dispatchable(
+    runtime_module, register_namespace,
 ):
-    """A registered closure surfaces in `/closures` and dispatches via /_remote."""
+    """A registered namespace surfaces in `/namespaces` and dispatches via /_remote."""
     server, _, _ = runtime_module
-    register_closure(Echo)
+    register_namespace(Echo)
     pkg = Echo.__module__
 
     assert pkg in server.registry
 
     transport = httpx.ASGITransport(app=server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
-        r = await http.get("/closures")
+        r = await http.get("/namespaces")
         assert r.status_code == 200
         pkgs = [c["manifest"]["package"] for c in r.json()]
         assert pkg in pkgs
@@ -126,10 +126,10 @@ async def test_remote_call_unknown_package_404(runtime_module):
 
 
 async def test_remote_call_unknown_method_returns_error_body(
-    runtime_module, register_closure,
+    runtime_module, register_namespace,
 ):
     server, _, _ = runtime_module
-    register_closure(Echo)
+    register_namespace(Echo)
     transport = httpx.ASGITransport(app=server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
         body = RemoteRequest(
@@ -143,10 +143,10 @@ async def test_remote_call_unknown_method_returns_error_body(
 
 
 async def test_impl_exception_surfaces_as_remote_error(
-    runtime_module, register_closure,
+    runtime_module, register_namespace,
 ):
     server, _, _ = runtime_module
-    register_closure(Boom)
+    register_namespace(Boom)
     transport = httpx.ASGITransport(app=server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
         body = RemoteRequest(package=Boom.__module__, method="go").model_dump()
@@ -159,9 +159,9 @@ async def test_impl_exception_surfaces_as_remote_error(
 
 
 async def test_client_remote_round_trip(
-    runtime_module, register_closure, live_server,
+    runtime_module, register_namespace, live_server,
 ):
-    register_closure(Echo)
+    register_namespace(Echo)
     base_url = await live_server()
     async with RuntimeClient(base_url) as c:
         result = await c.remote(Echo.echo, msg="hello")
@@ -169,9 +169,9 @@ async def test_client_remote_round_trip(
 
 
 async def test_client_remote_raises_on_impl_error(
-    runtime_module, register_closure, live_server,
+    runtime_module, register_namespace, live_server,
 ):
-    register_closure(Boom)
+    register_namespace(Boom)
     base_url = await live_server()
     async with RuntimeClient(base_url) as c:
         with pytest.raises(RemoteCallError):
@@ -182,9 +182,9 @@ async def test_client_remote_raises_on_impl_error(
 
 
 async def test_stream_round_trip_via_socketio(
-    runtime_module, register_closure, live_server,
+    runtime_module, register_namespace, live_server,
 ):
-    register_closure(Streamer)
+    register_namespace(Streamer)
     base_url = await live_server()
     async with RuntimeClient(base_url) as c:
         items = [t async for t in c.remote(Streamer.chat, prompt="hi", n=2)]
@@ -192,9 +192,9 @@ async def test_stream_round_trip_via_socketio(
 
 
 async def test_bidi_round_trip_via_socketio(
-    runtime_module, register_closure, live_server,
+    runtime_module, register_namespace, live_server,
 ):
-    register_closure(Chat)
+    register_namespace(Chat)
     base_url = await live_server()
 
     async def _inputs() -> AsyncIterator[UserMsg]:
@@ -211,9 +211,9 @@ async def test_bidi_round_trip_via_socketio(
 
 @pytest.mark.skip(reason="log forwarding fixture timing flake; tracked separately")
 async def test_logs_subscription_receives_emitted_log(
-    runtime_module, register_closure, live_server,
+    runtime_module, register_namespace, live_server,
 ):
-    register_closure(Talker)
+    register_namespace(Talker)
     base_url = await live_server()
     async with RuntimeClient(base_url) as c:
         seen: list[str] = []

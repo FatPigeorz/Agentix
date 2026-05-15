@@ -1,21 +1,21 @@
-"""agentix — a Nix-closure runtime for Docker sandboxes.
+"""agentix — typed Python namespaces for sandbox-based agent workflows.
 
 `agentix` is a namespace-extensible regular package. The framework
 ships its own subpackages (`agentix.cli`, `agentix.dispatch`,
-`agentix.runtime`, …); closures contribute additional subpackages
-under reserved kind-roots: `agentix.primitive.<short>`,
-`agentix.agent.<short>`, `agentix.dataset.<short>`. The
-`pkgutil.extend_path` call below makes `agentix.__path__` aggregate
-every `agentix/` directory on `sys.path`, so a closure dist
-installing files at `<site-packages>/agentix/primitive/bash/`
-becomes importable as `from agentix.primitive.bash import Bash`.
+`agentix.runtime`, …); third-party namespaces contribute additional
+subpackages under `agentix.<short>` (e.g. `agentix.bash`,
+`agentix.claude_code`). The `pkgutil.extend_path` call below makes
+`agentix.__path__` aggregate every `agentix/` directory on `sys.path`,
+so a namespace dist installing files at `<site-packages>/agentix/bash/`
+becomes importable as `from agentix.bash import Bash`. Reserved
+framework subpackages are listed in CLAUDE.md.
 """
 
 import pkgutil
 
 __path__ = pkgutil.extend_path(__path__, __name__)
 
-# `trace` is imported eagerly so closure impls can `from agentix import trace`
+# `trace` is imported eagerly so namespace impls can `from agentix import trace`
 # without circular-import gymnastics. It has no runtime deps and registers an
 # emitter only when the server boots, so this is cheap.
 from agentix import trace

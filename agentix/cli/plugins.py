@@ -21,7 +21,7 @@ from collections.abc import Sequence
 
 # Known framework axes. Each entry: (group name, one-line description).
 _KNOWN_GROUPS: tuple[tuple[str, str], ...] = (
-    ("agentix.closure", "closures — runtime-mounted Namespace classes"),
+    ("agentix.namespace", "namespaces — runtime-loaded service classes"),
     ("agentix.deployment", "deployment backends — sandbox lifecycle"),
     ("agentix.trace_sink", "trace sinks — fan-out trace event consumers"),
     ("agentix.spec_resolver", "spec resolvers — agentix build/install input lookups"),

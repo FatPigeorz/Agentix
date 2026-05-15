@@ -1,8 +1,8 @@
 """Closure metadata + sandbox / deployment models.
 
-Cross-cutting types: closure metadata (surfaced via `/closures` for
+Cross-cutting types: namespace metadata (surfaced via `/namespaces` for
 introspection — no longer shipped as an on-disk file, since the runtime
-discovers closures via `importlib.metadata` entry points) and the
+discovers namespaces via `importlib.metadata` entry points) and the
 top-level sandbox/deployment config that orchestrators hand to a
 `Deployment`. Runtime transport / wire types live in
 `agentix.runtime.models` instead.
@@ -19,12 +19,12 @@ from pydantic import BaseModel, Field, field_validator
 from agentix.idents import PackageName, SandboxId
 
 
-class ClosureManifest(BaseModel):
-    """Lightweight metadata for one registered closure.
+class NamespaceManifest(BaseModel):
+    """Lightweight metadata for one registered namespace.
 
     Populated by the runtime from `importlib.metadata` at discovery time
-    and returned by `GET /closures` for introspection. `package` is the
-    closure's Python import path (e.g. `agentix.bash`) and the runtime's
+    and returned by `GET /namespaces` for introspection. `package` is the
+    namespace's Python import path (e.g. `agentix.bash`) and the runtime's
     routing key — there are no caller-chosen namespaces.
     """
 
@@ -43,15 +43,15 @@ class ClosureManifest(BaseModel):
 
 class SandboxConfig(BaseModel):
     image: str = Field(description="Base Docker/OCI image the sandbox runs on (the task environment)")
-    runtime: str = Field(description="Runtime closure image ref")
-    closures: list[str] = Field(
+    runtime: str = Field(description="Runtime namespace image ref")
+    namespaces: list[str] = Field(
         default_factory=list,
         description=(
-            "Closures to mount. Accepts docker image refs (strings) or any object "
-            "exposing a string `__image__` attribute — typically the closure's "
-            "imported Python package, e.g. `closures=[claude_code, mock_agent]`. "
+            "Namespaces to mount. Accepts docker image refs (strings) or any object "
+            "exposing a string `__image__` attribute — typically the namespace's "
+            "imported Python package, e.g. `namespaces=[claude_code, mock_agent]`. "
             "Modules are resolved to their `__image__` at validation; the stored "
-            "list is always strings. Each closure's runtime identity still comes "
+            "list is always strings. Each namespace's runtime identity still comes "
             "from its manifest's `package` field — there are no caller-chosen "
             "namespaces."
         ),
@@ -60,24 +60,24 @@ class SandboxConfig(BaseModel):
         default=None,
         description=(
             "Optional env vars passed to the sandbox container (and therefore "
-            "visible to the runtime + all closures)."
+            "visible to the runtime + all namespaces)."
         ),
     )
 
-    @field_validator("closures", mode="before")
+    @field_validator("namespaces", mode="before")
     @classmethod
-    def _resolve_closure_specs(cls, v: Any) -> Any:
-        """Normalize each closure spec to a docker image-ref string.
+    def _resolve_namespace_specs(cls, v: Any) -> Any:
+        """Normalize each namespace spec to a docker image-ref string.
 
         Three acceptable inputs:
 
           * A raw string (passed through).
           * An object exposing a string `__image__` attribute (typically a
-            closure's imported Python package — the override path).
-          * A `types.ModuleType` (the closure's imported Python package).
+            namespace's imported Python package — the override path).
+          * A `types.ModuleType` (the namespace's imported Python package).
             We derive the image from `importlib.metadata` by mapping the
             module name to a distribution name (underscore → dash) and
-            looking up its version. This is the common case — closure
+            looking up its version. This is the common case — namespace
             authors don't have to redeclare metadata that already lives
             in `pyproject.toml`.
         """
@@ -97,22 +97,22 @@ class SandboxConfig(BaseModel):
                 out.append(derived)
                 continue
             raise ValueError(
-                f"closure spec {item!r}: cannot resolve image. Pass a "
+                f"namespace spec {item!r}: cannot resolve image. Pass a "
                 f"docker-image-ref string, set `__image__` on the module, "
-                f"or install the closure's wheel so importlib.metadata "
+                f"or install the namespace's wheel so importlib.metadata "
                 f"can derive the image from the distribution version."
             )
         return out
 
 
 def _derive_image_from_module(item: Any) -> str | None:
-    """Best-effort: a closure's Python module → its docker image ref.
+    """Best-effort: a namespace's Python module → its docker image ref.
 
     Convention: the distribution name is the module's import path with
-    `.` → `-` and `_` → `-`. E.g. `agentix.primitive.bash` →
-    `agentix-primitive-bash`. For `agentix-` dists the docker tag mirrors
+    `.` → `-` and `_` → `-`. E.g. `agentix.bash` →
+    `agentix-bash`. For `agentix-` dists the docker tag mirrors
     the dist name in the `agentix/<rest>:<version>` form (e.g.
-    `agentix/primitive-bash:0.1.0`). Non-`agentix-` dists fall through
+    `agentix/bash:0.1.0`). Non-`agentix-` dists fall through
     to a plain `<dist>:<version>` tag.
 
     Returns None when no installed distribution matches — the caller

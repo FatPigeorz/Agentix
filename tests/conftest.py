@@ -1,10 +1,10 @@
 """Shared fixtures for agentix tests.
 
-Closures are registered into the runtime via the entry-point mechanism
+Namespaces are registered into the runtime via the entry-point mechanism
 in production. For tests we bypass `importlib.metadata.entry_points`
 (which is process-global and slow to mutate) and inject `Namespace`
 subclasses directly into the registry via the test-only
-`register_closure()` fixture. Same effect, no filesystem ceremony.
+`register_namespace()` fixture. Same effect, no filesystem ceremony.
 """
 
 from __future__ import annotations
@@ -38,7 +38,7 @@ def runtime_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("AGENTIX_UPLOAD_ROOT", str(upload_root))
 
     # Reload server modules so each test gets a fresh Registry (no cross-test
-    # closure registration leakage). Order matters: leaves first, package
+    # namespace registration leakage). Order matters: leaves first, package
     # __init__ last, so dependent modules see fresh internals on import.
     for mod in (
         "agentix.runtime.server.sio",
@@ -60,21 +60,21 @@ def runtime_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-def register_closure(runtime_module) -> Callable[..., None]:
-    """Inject a closure class into the runtime's registry.
+def register_namespace(runtime_module) -> Callable[..., None]:
+    """Inject a namespace class into the runtime's registry.
 
     Usage:
-        @register_closure(package="agentix.echo")
+        @register_namespace(package="agentix.echo")
         class Echo(Namespace):
             async def echo(self, msg: str) -> str:
                 return f"echo:{msg}"
 
     Or imperatively:
-        register_closure(Echo)
-        register_closure(Echo, package="agentix.echo")
+        register_namespace(Echo)
+        register_namespace(Echo, package="agentix.echo")
 
     Defaults: `package` derives from `cls.__module__`. The framework's
-    `Registry.register` adds the closure as a pending lazy-load entry;
+    `Registry.register` adds the namespace as a pending lazy-load entry;
     `get_or_load` builds the dispatcher on first call.
     """
     server, _, _ = runtime_module
@@ -95,7 +95,7 @@ def register_closure(runtime_module) -> Callable[..., None]:
 @pytest.fixture(autouse=True)
 def _purge_test_modules():
     """Per-test cleanup: drop any test-injected modules so the next test
-    starts with a fresh slate. Real installed closures (agentix.bash,
+    starts with a fresh slate. Real installed namespaces (agentix.bash,
     agentix.files) stay loaded — they're framework-level.
     """
     yield
@@ -113,7 +113,7 @@ async def live_server(runtime_module):
     serving the runtime's combined FastAPI+Socket.IO ASGI app.
 
     Test order:
-        1. register_closure(...)        # populate the registry
+        1. register_namespace(...)        # populate the registry
         2. base_url = await start()     # uvicorn starts
         3. connect via RuntimeClient(base_url) etc.
 

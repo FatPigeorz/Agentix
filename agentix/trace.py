@@ -34,7 +34,7 @@ gets every event after that.
 
 `call_id` correlates events to a specific rollout. The dispatcher pins
 the active call_id into a contextvar before invoking each impl, so
-`emit()` picks it up automatically — closures don't have to thread it
+`emit()` picks it up automatically — namespaces don't have to thread it
 through their code.
 """
 
@@ -80,7 +80,7 @@ _current_source: contextvars.ContextVar[PackageName | None] = contextvars.Contex
 
 
 def register_sink(sink: SinkFn) -> None:
-    """Add a trace sink. Receives every event emitted from any closure
+    """Add a trace sink. Receives every event emitted from any namespace
     via `agentix.trace.emit(...)`.
 
     Sink errors are logged + swallowed (tracing must never break a
@@ -144,7 +144,7 @@ def current_call_id() -> CallId | None:
 
 
 def current_source() -> PackageName | None:
-    """The closure package currently being dispatched, if any."""
+    """The namespace package currently being dispatched, if any."""
     return _current_source.get()
 
 
@@ -157,7 +157,7 @@ def emit(
 ) -> None:
     """Record a single trace event. Fans out to every registered sink.
 
-    `call_id` and `source` default to the dispatcher-set context. Closures
+    `call_id` and `source` default to the dispatcher-set context. Namespaces
     should normally call `emit("kind", {...})` and let the runtime fill
     in the correlation. Sink errors are logged + swallowed — tracing
     must never break a rollout.

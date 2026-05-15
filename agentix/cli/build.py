@@ -1,11 +1,11 @@
-"""`agentix build` — build a single closure image.
+"""`agentix build` — build a single namespace image.
 
 Usage:
 
     agentix build primitives/bash                      # explicit path
     agentix build bash                                 # short name → primitives/bash
     agentix build claude-code                          # short name → agents/claude-code
-    agentix build agentix-primitive-bash               # PyPI dist (stubbed)
+    agentix build agentix-bash               # PyPI dist (stubbed)
     agentix build primitives/bash --tag my-bash:dev
     agentix build primitives/bash --dry-run
 
@@ -14,11 +14,11 @@ explicit path, a short name resolved against `primitives/agents/datasets/`
 in the repo, or a PyPI distribution (`agentix install` and PyPI fetching
 both stub the PyPI path with a clear NotImplementedError today).
 
-A closure's minimum-viable source layout:
+A namespace's minimum-viable source layout:
 
-    <closure_dir>/
+    <namespace_dir>/
     ├── pyproject.toml            # all metadata (name, version, description)
-    └── agentix_closures/<name>/
+    └── agentix_namespaces/<name>/
         ├── __init__.py           # stub class
         └── _impl.py              # impl class
 
@@ -36,13 +36,13 @@ from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from agentix.cli._resolve import REPO_ROOT, ClosureSpec, read_pyproject, resolve_spec
+from agentix.cli._resolve import REPO_ROOT, NamespaceSpec, read_pyproject, resolve_spec
 
 TEMPLATE_DIR = REPO_ROOT / "primitives" / "_template"
 
 
 def _derive_tag(pyproject: dict) -> str:
-    """`agentix-primitive-bash` v `0.1.0` → `agentix/primitive-bash:0.1.0`.
+    """`agentix-bash` v `0.1.0` → `agentix/bash:0.1.0`.
 
     The framework's convention is `agentix-<kind>-<name>` for the
     distribution and `agentix/<kind>-<name>:<version>` for the image.
@@ -60,8 +60,8 @@ def _derive_tag(pyproject: dict) -> str:
     return f"agentix/{short}:{version}"
 
 
-def _materialize_path(spec: ClosureSpec) -> Path:
-    """Return the on-disk closure source dir for `spec`.
+def _materialize_path(spec: NamespaceSpec) -> Path:
+    """Return the on-disk namespace source dir for `spec`.
 
     `path` kinds are already on disk and used as-is. `pypi` would do
     `pip download` + wheel unpack into a temp dir — not yet wired.
@@ -75,8 +75,8 @@ def _materialize_path(spec: ClosureSpec) -> Path:
         raise NotImplementedError(
             f"`agentix build {spec.short}`: PyPI sourcing not wired yet. "
             f"The build pipeline needs a `pip download {spec.pypi_dist}` + "
-            f"wheel unpack step before the closure dir is ready. Use a local "
-            f"path or check that the closure lives under primitives/, "
+            f"wheel unpack step before the namespace dir is ready. Use a local "
+            f"path or check that the namespace lives under primitives/, "
             f"agents/, or datasets/ in this repo."
         )
     raise SystemExit(
@@ -92,14 +92,14 @@ _SOURCE_SKIP = {
 }
 
 
-def _stage(closure_dir: Path, build_dir: Path) -> None:
-    """Copy closure source + shared build infra into a self-contained context.
+def _stage(namespace_dir: Path, build_dir: Path) -> None:
+    """Copy namespace source + shared build infra into a self-contained context.
 
-    The closure source is treated as a normal Python project (uv init form):
+    The namespace source is treated as a normal Python project (uv init form):
     we copy everything except common dev artifacts, then drop in the shared
     Dockerfile + default.nix + gen_manifest.py alongside it.
     """
-    for item in closure_dir.iterdir():
+    for item in namespace_dir.iterdir():
         if item.name in _SOURCE_SKIP or item.name.endswith(".egg-info"):
             continue
         dest = build_dir / item.name
@@ -117,7 +117,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("spec", help="closure short name or path (e.g. bash, primitives/bash)")
+    parser.add_argument("spec", help="namespace short name or path (e.g. bash, primitives/bash)")
     parser.add_argument("--tag", type=str, default=None,
                         help="override the derived docker image tag")
     parser.add_argument("--dry-run", action="store_true",
@@ -126,12 +126,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     spec = resolve_spec(args.spec)
     try:
-        closure_dir = _materialize_path(spec)
+        namespace_dir = _materialize_path(spec)
     except NotImplementedError as exc:
         # Convert to SystemExit so argparse-style stderr message + exit-1
         # behaviour matches the rest of the CLI.
         raise SystemExit(f"error: {exc}") from exc
-    pyproject = read_pyproject(closure_dir)
+    pyproject = read_pyproject(namespace_dir)
     tag = args.tag or _derive_tag(pyproject)
     short_name = pyproject["project"]["name"].rsplit("-", 1)[-1]
 
@@ -140,15 +140,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if out.exists():
             shutil.rmtree(out)
         out.mkdir(parents=True)
-        _stage(closure_dir, out)
+        _stage(namespace_dir, out)
         print(f"staged build context → {out}")
         print(f"would build → {tag}")
         return 0
 
     with TemporaryDirectory(prefix=f"agentix-build-{short_name}-") as tmp:
         build_dir = Path(tmp)
-        _stage(closure_dir, build_dir)
-        print(f"building {tag} from {closure_dir}…", file=sys.stderr)
+        _stage(namespace_dir, build_dir)
+        print(f"building {tag} from {namespace_dir}…", file=sys.stderr)
         proc = subprocess.run(
             [
                 "docker", "build",

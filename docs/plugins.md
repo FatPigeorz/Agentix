@@ -23,7 +23,7 @@ example below has an in-tree precedent.
 
 | Axis | Group | Semantics | Built-ins |
 |---|---|---|---|
-| [Closures](#closures) | `agentix.closure` | discover, lazy-load on first call | (third-party only) |
+| [Namespaces](#namespaces) | `agentix.namespace` | discover, lazy-load on first call | (third-party only) |
 | [Deployments](#deployments) | `agentix.deployment` | select-one by name | `local` / `daytona` / `e2b` |
 | [Trace sinks](#trace-sinks) | `agentix.trace_sink` | fan-out, every sink receives | (third-party only) |
 | [Spec resolvers](#spec-resolvers) | `agentix.spec_resolver` | chain by priority, first claim wins | `path` / `image` / `local_repo` / `pypi` |
@@ -32,9 +32,9 @@ example below has an in-tree precedent.
 
 ---
 
-## Closures
+## Namespaces
 
-A closure is a class whose `@staticmethod` methods are the callable
+A namespace is a class whose `@staticmethod` methods are the callable
 surface. Methods carry the real implementation; the class is a namespace.
 
 ```python
@@ -53,7 +53,7 @@ class MyAgent(Namespace):
 name = "agentix-myagent"
 version = "0.1.0"
 
-[project.entry-points."agentix.closure"]
+[project.entry-points."agentix.namespace"]
 myagent = "agentix.myagent:MyAgent"
 
 [tool.hatch.build.targets.wheel]
@@ -129,28 +129,28 @@ otel = "my_otel_sink:install"
 ```
 
 `install()` runs once at lifespan startup; the sink it registers
-receives every event from every closure for the rest of the runtime's
+receives every event from every namespace for the rest of the runtime's
 life. Sink errors are logged and swallowed — tracing never breaks a
 rollout.
 
 ## Spec resolvers
 
 Spec resolvers map CLI strings (what users type after `agentix build`)
-to `ClosureSpec` objects. Resolvers are tried in priority desc order;
+to `NamespaceSpec` objects. Resolvers are tried in priority desc order;
 first non-`None` answer wins.
 
 ```python
 # my_github_resolver/__init__.py
-from agentix.cli._resolve import ClosureSpec
+from agentix.cli._resolve import NamespaceSpec
 
 class GithubResolver:
     priority = 30  # tried before LocalRepoResolver(50) only if you bump it
 
-    def resolve(self, spec: str) -> ClosureSpec | None:
+    def resolve(self, spec: str) -> NamespaceSpec | None:
         if not spec.startswith("github:"):
             return None
         org_repo = spec[len("github:"):]
-        return ClosureSpec(
+        return NamespaceSpec(
             short=org_repo.split("/")[-1],
             kind="pypi",
             pypi_dist=f"agentix-{org_repo.replace('/', '-')}",
@@ -162,7 +162,7 @@ class GithubResolver:
 github = "my_github_resolver:GithubResolver"
 ```
 
-After install, `agentix build github:my-org/my-closure` runs through
+After install, `agentix build github:my-org/my-namespace` runs through
 your resolver. Built-in resolvers (`path` p=100, `image` p=90,
 `local_repo` p=50, `pypi` p=10) handle every default case.
 

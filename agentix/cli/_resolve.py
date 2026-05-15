@@ -4,7 +4,7 @@ A *spec* is whatever the user types on the command line: a short name
 (`bash`), a relative path (`./primitives/bash`), or an image reference
 (`docker.io/me/agent:0.1.0`). The framework asks each registered
 **spec resolver** in priority order to map the string to a
-`ClosureSpec`; the first non-`None` answer wins.
+`NamespaceSpec`; the first non-`None` answer wins.
 
 Resolvers register under the `agentix.spec_resolver` entry-point group.
 Each entry value is a `module:Resolver` class implementing the
@@ -23,13 +23,13 @@ github = "my_agentix_github_resolver:GithubResolver"
 class GithubResolver:
     priority = 30  # higher → tried earlier
 
-    def resolve(self, spec: str) -> ClosureSpec | None:
+    def resolve(self, spec: str) -> NamespaceSpec | None:
         if not spec.startswith("github:"):
             return None
         ...
 ```
 
-After `pip install`, `agentix build github:my-org/closure` finds the
+After `pip install`, `agentix build github:my-org/namespace` finds the
 resolver and uses it without framework changes.
 """
 
@@ -46,7 +46,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass
-class ClosureSpec:
+class NamespaceSpec:
     """One resolved input to a build / install. Exactly one source field is set."""
 
     short: str
@@ -58,7 +58,7 @@ class ClosureSpec:
 
 @runtime_checkable
 class SpecResolver(Protocol):
-    """Plugin contract for closure-spec resolvers.
+    """Plugin contract for namespace-spec resolvers.
 
     Higher `priority` values are tried first. Two resolvers with the same
     priority fall back to entry-point name order (asc).
@@ -66,8 +66,8 @@ class SpecResolver(Protocol):
 
     priority: int
 
-    def resolve(self, spec: str) -> ClosureSpec | None:
-        """Return a `ClosureSpec` if this resolver claims the spec; else None."""
+    def resolve(self, spec: str) -> NamespaceSpec | None:
+        """Return a `NamespaceSpec` if this resolver claims the spec; else None."""
         ...
 
 
@@ -101,7 +101,7 @@ def _chain() -> list[SpecResolver]:
     return [inst for _p, _n, inst in instances]
 
 
-def resolve_spec(spec: str) -> ClosureSpec:
+def resolve_spec(spec: str) -> NamespaceSpec:
     """Walk every registered resolver in priority order; first match wins."""
     for resolver in _chain():
         result = resolver.resolve(spec)
@@ -110,10 +110,10 @@ def resolve_spec(spec: str) -> ClosureSpec:
     raise SystemExit(f"no spec resolver claimed {spec!r}")
 
 
-def read_pyproject(closure_dir: Path) -> dict:
-    pp = closure_dir / "pyproject.toml"
+def read_pyproject(namespace_dir: Path) -> dict:
+    pp = namespace_dir / "pyproject.toml"
     if not pp.is_file():
-        raise SystemExit(f"{closure_dir}: missing pyproject.toml")
+        raise SystemExit(f"{namespace_dir}: missing pyproject.toml")
     with pp.open("rb") as f:
         return tomllib.load(f)
 
@@ -138,24 +138,24 @@ def _short_from_image(ref: str) -> str:
 
 
 class PathResolver:
-    """Treat explicit-path strings and existing source dirs as closure sources."""
+    """Treat explicit-path strings and existing source dirs as namespace sources."""
 
     priority = 100
 
-    def resolve(self, spec: str) -> ClosureSpec | None:
+    def resolve(self, spec: str) -> NamespaceSpec | None:
         if spec.startswith((".", "/")):
             p = Path(spec).resolve()
             if not (p / "pyproject.toml").is_file():
                 raise SystemExit(
-                    f"{spec}: no pyproject.toml — not a closure source dir"
+                    f"{spec}: no pyproject.toml — not a namespace source dir"
                 )
-            return ClosureSpec(
+            return NamespaceSpec(
                 short=_short_from_pyproject(read_pyproject(p)),
                 kind="path", path=p,
             )
         p = Path(spec)
         if p.is_dir() and (p / "pyproject.toml").is_file():
-            return ClosureSpec(
+            return NamespaceSpec(
                 short=_short_from_pyproject(read_pyproject(p.resolve())),
                 kind="path", path=p.resolve(),
             )
@@ -167,9 +167,9 @@ class ImageRefResolver:
 
     priority = 90
 
-    def resolve(self, spec: str) -> ClosureSpec | None:
+    def resolve(self, spec: str) -> NamespaceSpec | None:
         if "/" in spec and ":" in spec and not spec.startswith((".", "/")):
-            return ClosureSpec(
+            return NamespaceSpec(
                 short=_short_from_image(spec),
                 kind="image", image_ref=spec,
             )
@@ -186,11 +186,11 @@ class LocalRepoResolver:
     priority = 50
     _roots: tuple[str, ...] = ("primitives",)
 
-    def resolve(self, spec: str) -> ClosureSpec | None:
+    def resolve(self, spec: str) -> NamespaceSpec | None:
         for root in self._roots:
             candidate = REPO_ROOT / root / spec
             if candidate.is_dir() and (candidate / "pyproject.toml").is_file():
-                return ClosureSpec(
+                return NamespaceSpec(
                     short=spec, kind="path", path=candidate,
                 )
         return None
@@ -201,18 +201,18 @@ class PyPIFallbackResolver:
 
     priority = 10
 
-    def resolve(self, spec: str) -> ClosureSpec | None:
+    def resolve(self, spec: str) -> NamespaceSpec | None:
         # If we got this far the spec wasn't a path, image ref, or local
-        # closure. Treat it as a PyPI distribution name. The actual fetch
+        # namespace. Treat it as a PyPI distribution name. The actual fetch
         # is stubbed (build/install raise NotImplementedError at stage time).
-        return ClosureSpec(
+        return NamespaceSpec(
             short=spec, kind="pypi", pypi_dist=f"agentix-{spec}",
         )
 
 
 __all__ = [
     "REPO_ROOT",
-    "ClosureSpec",
+    "NamespaceSpec",
     "ImageRefResolver",
     "LocalRepoResolver",
     "PathResolver",

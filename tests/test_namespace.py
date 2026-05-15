@@ -2,7 +2,7 @@
 
 These are the R1 (dynamic bind + static typing) + R2 (extensible wire
 patterns) primitives. Closure-protocol-level integration is exercised
-in `test_closure_protocol.py`; here we test the abstractions in
+in `test_namespace_protocol.py`; here we test the abstractions in
 isolation.
 """
 
@@ -183,7 +183,7 @@ async def test_bind_namespace_picks_correct_pattern() -> None:
 @pytest.mark.asyncio
 async def test_bind_namespace_works_with_protocol_subclass() -> None:
     """A Namespace subclass that's *also* a Protocol still binds fine —
-    the class IS the closure; method bodies carry the real logic."""
+    the class IS the namespace; method bodies carry the real logic."""
     from typing import Protocol, runtime_checkable
 
     @runtime_checkable

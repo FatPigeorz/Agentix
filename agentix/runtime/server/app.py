@@ -1,21 +1,21 @@
 """Agentix runtime server.
 
-In-process closure dispatch. The runtime is a single Python process serving:
+In-process namespace dispatch. The runtime is a single Python process serving:
 
 - `POST /_remote` — typed **unary** dispatch (one request → one response)
 - Socket.IO at `/socket.io/` — server-streaming, bidi, and log subscription,
   multiplexed by `call_id` on a single connection
-- `GET /closures` — inventory (always cheap; does not force-load anything)
+- `GET /namespaces` — inventory (always cheap; does not force-load anything)
 - `GET /health`
 
-Closure discovery uses `importlib.metadata.entry_points(group="agentix.closure")`:
+Closure discovery uses `importlib.metadata.entry_points(group="agentix.namespace")`:
 the runtime walks every installed distribution's `[project.entry-points]`,
-registers the closure as a pending entry, and defers `ep.load()` (the actual
-import) until the first `/_remote` call for that closure. A broken closure
+registers the namespace as a pending entry, and defers `ep.load()` (the actual
+import) until the first `/_remote` call for that namespace. A broken namespace
 surfaces on call, not at boot. There's no on-disk `manifest.json`, no
-`/mnt/<closure>` mount convention, no kind-segment namespace.
+`/mnt/<namespace>` mount convention, no kind-segment namespace.
 
-The closure's Python import path (e.g. `agentix.bash`) is the routing key;
+The namespace's Python import path (e.g. `agentix.bash`) is the routing key;
 there are no caller-chosen namespaces.
 """
 
@@ -29,10 +29,10 @@ from fastapi import FastAPI, HTTPException
 
 from agentix import __version__, trace
 from agentix.dispatch import Registry, discover_entry_points
-from agentix.models import ClosureManifest
+from agentix.models import NamespaceManifest
 from agentix.runtime.models import (
-    ClosureInfo,
     HealthResponse,
+    NamespaceInfo,
     RemoteRequest,
     RemoteResponse,
 )
@@ -47,13 +47,13 @@ registry = Registry()
 
 
 async def _auto_load() -> None:
-    """Discover installed closures via entry points; register each lazily.
+    """Discover installed namespaces via entry points; register each lazily.
 
-    Walks `importlib.metadata.entry_points(group="agentix.closure")`. Each
+    Walks `importlib.metadata.entry_points(group="agentix.namespace")`. Each
     such entry point has the form `<short> = "<package>:<class>"` declared
-    in the closure's `pyproject.toml`. Discovery is cheap — we record the
-    `EntryPoint` object but don't call `ep.load()` until the closure is
-    first dispatched. A broken closure (import error, bad class) thus
+    in the namespace's `pyproject.toml`. Discovery is cheap — we record the
+    `EntryPoint` object but don't call `ep.load()` until the namespace is
+    first dispatched. A broken namespace (import error, bad class) thus
     fails on call, not at boot.
     """
     for ep in discover_entry_points():
@@ -66,7 +66,7 @@ async def _auto_load() -> None:
             logger.error("entry-point %r: %s", ep.name, exc)
             continue
         logger.info(
-            "registered closure '%s' (deferred) — entry point %r",
+            "registered namespace '%s' (deferred) — entry point %r",
             ep.value.split(":", 1)[0], ep.name,
         )
 
@@ -94,16 +94,16 @@ async def health() -> HealthResponse:
     return HealthResponse(version=__version__)
 
 
-@app.get("/closures")
-async def list_closures() -> list[ClosureInfo]:
-    """All registered closures (loaded or not). Doesn't force-load."""
-    out: list[ClosureInfo] = []
+@app.get("/namespaces")
+async def list_namespaces() -> list[NamespaceInfo]:
+    """All registered namespaces (loaded or not). Doesn't force-load."""
+    out: list[NamespaceInfo] = []
     for pkg in registry.packages():
         info = registry.info_for(pkg)
         if info is None:
             continue
         dist_name, dist_version = info
-        out.append(ClosureInfo(manifest=ClosureManifest(
+        out.append(NamespaceInfo(manifest=NamespaceManifest(
             name=dist_name or pkg.rsplit(".", 1)[-1],
             version=dist_version or "0.0.0",
             package=pkg,
@@ -127,12 +127,12 @@ async def remote_call(request: RemoteRequest) -> RemoteResponse:
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"closure '{request.package}' failed to load: {type(exc).__name__}: {exc}",
+            detail=f"namespace '{request.package}' failed to load: {type(exc).__name__}: {exc}",
         ) from exc
     if dispatcher is None:
         raise HTTPException(
             status_code=404,
-            detail=f"closure not loaded: package={request.package!r}",
+            detail=f"namespace not loaded: package={request.package!r}",
         )
     if dispatcher.is_bidi(request.method):
         raise HTTPException(
@@ -171,7 +171,7 @@ app.state = _fastapi_app.state  # type: ignore[attr-defined]
 _fastapi_app.state.sio = _sio
 app.sio = _sio  # type: ignore[attr-defined]
 
-# Route closure-side `agentix.trace.emit(...)` into the Socket.IO `trace` room.
+# Route namespace-side `agentix.trace.emit(...)` into the Socket.IO `trace` room.
 install_trace_bridge(_sio)
 
 

@@ -154,7 +154,7 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
                 await sio.emit(STREAM_ERROR, {
                     "call_id": call_id,
                     "error": RemoteError(type="PackageNotLoaded",
-                                         message=f"closure not loaded: {request.package!r}").model_dump(),
+                                         message=f"namespace not loaded: {request.package!r}").model_dump(),
                 }, to=sid)
                 return
             if dispatcher.is_bidi(request.method):
@@ -225,7 +225,7 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
                 await sio.emit(BIDI_ERROR, {
                     "call_id": call_id,
                     "error": RemoteError(type="PackageNotLoaded",
-                                         message=f"closure not loaded: {request.package!r}").model_dump(),
+                                         message=f"namespace not loaded: {request.package!r}").model_dump(),
                 }, to=sid)
                 return
             if not dispatcher.is_bidi(request.method):
@@ -240,7 +240,7 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
             # Sentinel value on queue closes the input iterator from the on_bidi_end_in
             # event or from disconnect cleanup. Store it on the state so handlers can
             # push it.
-            call_state.in_queue = in_queue  # noqa: F841 — closure-captures call_state below
+            call_state.in_queue = in_queue  # noqa: F841 — namespace-captures call_state below
             call_state.in_sentinel = sentinel  # type: ignore[attr-defined]
             call_state.input_adapter = input_adapter  # type: ignore[attr-defined]
 
@@ -331,7 +331,7 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
 
     # ── traces ──────────────────────────────────────────────────
     #
-    # Trace events come from closures via `agentix.trace.emit(...)`. The
+    # Trace events come from namespaces via `agentix.trace.emit(...)`. The
     # runtime broadcasts each event to clients in the "traces" room.
 
     @sio.on(TRACES_SUBSCRIBE)
@@ -342,7 +342,7 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
     async def on_traces_unsubscribe(sid: str, _data: dict[str, Any] | None = None) -> None:
         await sio.leave_room(sid, TRACES_ROOM)
 
-    # ── helpers (closure over sio + sessions) ────────────────────
+    # ── helpers (namespace over sio + sessions) ────────────────────
 
     async def _spawn_call(sess: _SessionState, call_id: str, coro, *, state: _CallState | None = None) -> None:
         task = asyncio.create_task(coro)
@@ -370,7 +370,7 @@ def _make_log_forwarder(sio: socketio.AsyncServer, sid: str, prefix: str) -> log
     going through the `agentix` (or `prefix`-rooted) logger tree is forwarded.
 
     Closure stdout/stderr via `print()` is NOT captured by this handler —
-    closures should use `logging.getLogger(__name__).info(...)`. A separate
+    namespaces should use `logging.getLogger(__name__).info(...)`. A separate
     stdout-capture handler can be added later if needed.
     """
 

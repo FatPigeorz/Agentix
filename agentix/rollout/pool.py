@@ -4,12 +4,12 @@ many tasks. Bounds concurrency by sandbox slot, not by task count.
 Typical use for an RL training loop:
 
     from agentix import DockerDeployment, RolloutPool, SandboxConfig
-    from agentix_closures import claude_code
+    from agentix_namespaces import claude_code
 
     config = SandboxConfig(
         image="ubuntu:24.04",
         runtime="agentix/runtime:0.1.0",
-        closures=[claude_code],
+        namespaces=[claude_code],
     )
 
     async def rollout(client, task):
@@ -19,7 +19,7 @@ Typical use for an RL training loop:
         async for task, result in pool.map(rollout, tasks):
             store_trajectory(task, result)
 
-Trace events emitted from inside the closures during a rollout flow over
+Trace events emitted from inside the namespaces during a rollout flow over
 each sandbox's runtime Socket.IO. To correlate them, pass `call_id` when
 making remote calls (RemoteRequest.call_id) — the dispatcher pins it into
 a contextvar, and `agentix.trace.emit(...)` from the impl inherits it.

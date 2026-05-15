@@ -2,22 +2,22 @@
 
 Design:
 
-  Every closure image declares `VOLUME /nix` and ships under `/nix`:
+  Every namespace image declares `VOLUME /nix` and ships under `/nix`:
       store/<hash>-*/             — content-addressed Nix deps
       entry/python/<package>/     — Python package the runtime imports
-      entry/manifest.json         — ClosureManifest (abi, package, ...)
+      entry/manifest.json         — NamespaceManifest (abi, package, ...)
       entry/bin/<cli>             — optional native binaries (exposed via paths_from)
 
-  Deployment's responsibility per unique closure image (cached in-process):
-      docker run --rm -v agentix-closure-<digest>:/nix <image> true
+  Deployment's responsibility per unique namespace image (cached in-process):
+      docker run --rm -v agentix-namespace-<digest>:/nix <image> true
       A fresh named volume mounted at /nix is auto-populated by Docker from
       the image's /nix layer on first attach (volume-init-from-image rule);
       subsequent calls are no-ops.
 
   Sandbox create:
       docker run --name <sid> \\
-         -v agentix-closure-<runtime-digest>:/mnt/runtime:ro \\
-         -v agentix-closure-<closure-digest>:/mnt/c<digest>:ro \\  (per closure)
+         -v agentix-namespace-<runtime-digest>:/mnt/runtime:ro \\
+         -v agentix-namespace-<namespace-digest>:/mnt/c<digest>:ro \\  (per namespace)
          --tmpfs /nix:exec,mode=755 \\
          <task-image> sh -c '<entrypoint>'
 
@@ -26,9 +26,9 @@ Design:
       for d in /mnt/*/store; do ln -sfn "$d"/* /nix/store/; done
       exec /mnt/runtime/entry/bin/start
 
-  Mount-dir names are internal — the runtime indexes closures by
+  Mount-dir names are internal — the runtime indexes namespaces by
   manifest.package, not by directory. On startup the runtime imports each
-  mounted closure's Python package in-process; no subprocesses, no UDS,
+  mounted namespace's Python package in-process; no subprocesses, no UDS,
   no reverse proxy. Sandbox contents are fixed at create time.
 """
 
@@ -80,7 +80,7 @@ class DockerDeployment(Deployment):
             s.bind(("127.0.0.1", 0))
             return s.getsockname()[1]
 
-    # ── populate one closure image into its named volume ────────
+    # ── populate one namespace image into its named volume ────────
 
     @staticmethod
     async def _image_digest(image: str) -> str:
@@ -95,13 +95,13 @@ class DockerDeployment(Deployment):
 
     async def _mount_dir_for(self, image: str) -> str:
         """Internal mount-dir name. Anything unique + short works; the
-        runtime indexes closures by manifest.package, not by mount dir.
+        runtime indexes namespaces by manifest.package, not by mount dir.
         """
         digest = await self._image_digest(image)
         return f"c{digest[:12]}"
 
     async def _ensure_populated(self, image: str) -> str:
-        """Ensure the per-content volume `agentix-closure-<digest>` is
+        """Ensure the per-content volume `agentix-namespace-<digest>` is
         populated from `image`'s /nix. Keyed by image digest (not ref), so:
 
           * rebuilding an image under the same tag → new digest → new volume
@@ -114,7 +114,7 @@ class DockerDeployment(Deployment):
         skips — idempotent and cross-process-safe.
         """
         digest = await self._image_digest(image)
-        vol = f"agentix-closure-{digest}"
+        vol = f"agentix-namespace-{digest}"
 
         if self._populated.get(image) == vol:
             return vol
@@ -124,7 +124,7 @@ class DockerDeployment(Deployment):
                 return vol
             await _docker("run", "--rm", "-v", f"{vol}:/nix", image, "true")
             self._populated[image] = vol
-            logger.info("Populated closure volume '%s' from '%s'", vol, image)
+            logger.info("Populated namespace volume '%s' from '%s'", vol, image)
             return vol
 
     # ── create ───────────────────────────────────────────────────
@@ -133,13 +133,13 @@ class DockerDeployment(Deployment):
         sandbox_id = SandboxId(f"agentix-{uuid4().hex[:8]}")
         port = self._allocate_port()
 
-        # Populate all closures in parallel (cached after first). Mount-dir
-        # names are internal — runtime indexes closures by manifest.package,
+        # Populate all namespaces in parallel (cached after first). Mount-dir
+        # names are internal — runtime indexes namespaces by manifest.package,
         # not by directory. We use 'runtime' for the runtime itself (the
         # entrypoint hardcodes /mnt/runtime/entry/bin/start) and short
         # digest-derived names for the rest.
         pairs: list[tuple[str, str]] = [("runtime", config.runtime)]
-        for img in config.closures:
+        for img in config.namespaces:
             pairs.append((await self._mount_dir_for(img), img))
         vols = await asyncio.gather(*(self._ensure_populated(img) for _, img in pairs))
 

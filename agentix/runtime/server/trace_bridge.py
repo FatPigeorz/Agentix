@@ -1,7 +1,7 @@
 """Wires `agentix.trace.emit(...)` to the Socket.IO `trace` room.
 
 Kept separate from `app.py` so the FastAPI / ASGI composition isn't
-intermixed with the closure-side tracing hook. `install(sio)` is called
+intermixed with the namespace-side tracing hook. `install(sio)` is called
 once at server module load, after the AsyncServer is constructed.
 """
 
@@ -18,7 +18,7 @@ from agentix.runtime.models import TraceEvent
 
 
 def install(sio: socketio.AsyncServer) -> None:
-    """Register the trace emitter so closure impls' `trace.emit(...)` calls
+    """Register the trace emitter so namespace impls' `trace.emit(...)` calls
     flow as Socket.IO `trace` events to subscribers in the TRACES_ROOM.
 
     Emission is best-effort and fire-and-forget — no awaiting from the

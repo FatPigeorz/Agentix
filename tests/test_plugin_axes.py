@@ -92,7 +92,7 @@ def test_trace_one_sink_failure_does_not_block_others():
 
 
 def test_trace_no_sinks_is_noop():
-    """emit() with no sinks must not raise — closures running outside
+    """emit() with no sinks must not raise — namespaces running outside
     a runtime should be able to call trace.emit() freely."""
     from agentix import trace
     # _sinks is module-private; access it for the assertion only.
@@ -110,7 +110,7 @@ def test_trace_no_sinks_is_noop():
 
 def test_spec_resolver_chain_priority_order(monkeypatch):
     from agentix.cli._resolve import (
-        ClosureSpec,
+        NamespaceSpec,
         register_spec_resolver,
         resolve_spec,
         spec_resolvers,
@@ -121,7 +121,7 @@ def test_spec_resolver_chain_priority_order(monkeypatch):
 
         def resolve(self, spec):
             if spec == "shared":
-                return ClosureSpec(short="hi", kind="pypi", pypi_dist="hi-pkg")
+                return NamespaceSpec(short="hi", kind="pypi", pypi_dist="hi-pkg")
             return None
 
     class LowPriority:
@@ -129,7 +129,7 @@ def test_spec_resolver_chain_priority_order(monkeypatch):
 
         def resolve(self, spec):
             if spec == "shared":
-                return ClosureSpec(short="lo", kind="pypi", pypi_dist="lo-pkg")
+                return NamespaceSpec(short="lo", kind="pypi", pypi_dist="lo-pkg")
             return None
 
     monkeypatch.setattr(spec_resolvers(), "_walk_entry_points", lambda: [])
@@ -144,7 +144,7 @@ def test_spec_resolver_chain_priority_order(monkeypatch):
 
 def test_spec_resolver_falls_through_on_none(monkeypatch):
     from agentix.cli._resolve import (
-        ClosureSpec,
+        NamespaceSpec,
         register_spec_resolver,
         resolve_spec,
         spec_resolvers,
@@ -158,7 +158,7 @@ def test_spec_resolver_falls_through_on_none(monkeypatch):
     class Claims:
         priority = 50
         def resolve(self, spec):
-            return ClosureSpec(short="x", kind="pypi", pypi_dist="x")
+            return NamespaceSpec(short="x", kind="pypi", pypi_dist="x")
 
     monkeypatch.setattr(spec_resolvers(), "_walk_entry_points", lambda: [])
     spec_resolvers().reset()
@@ -235,7 +235,7 @@ def test_plugins_cli_lists_known_groups(capsys):
     rc = plugins_main([])
     out = capsys.readouterr().out
     assert rc in (0, 1)  # nonzero only if some group has load errors
-    for group in ("agentix.closure", "agentix.deployment",
+    for group in ("agentix.namespace", "agentix.deployment",
                   "agentix.trace_sink", "agentix.spec_resolver",
                   "agentix.wire_pattern", "agentix.cli"):
         assert group in out

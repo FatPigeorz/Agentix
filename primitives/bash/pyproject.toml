@@ -12,7 +12,7 @@ dependencies = []
 # Entry points are the framework's sole closure-discovery contract.
 # `bash = "agentix.bash:Bash"` tells the runtime to import `agentix.bash`
 # and load the `Bash` class as the closure on first dispatch.
-[project.entry-points."agentix.closure"]
+[project.entry-points."agentix.namespace"]
 bash = "agentix.bash:Bash"
 
 [tool.hatch.build.targets.wheel]
