@@ -1,12 +1,24 @@
-"""Bash primitive impl — subprocess wrapper with env scrub + PATH composition.
+"""Bash primitive — shell command execution as an Agentix closure.
 
-`BashImpl` is an **independent class** that provides the `Bash` interface;
-it does NOT inherit from `Bash`. `_register.py` composes them via
-`Dispatcher.bind_namespace(Bash, BashImpl())`.
+Usage:
 
-Ports the env scrubbing rules + closure-bin PATH prepending that used to
-live in `agentix.runtime.server.builtins`. Closures share the runtime's
-process, so `_resolve_closure_bins` reads the runtime's Registry directly.
+    from agentix import RuntimeClient
+    from agentix.bash import Bash, BashStdout, BashStderr, BashExit, BashError
+
+    async with RuntimeClient(sandbox.runtime_url) as c:
+        r = await c.remote(Bash.run, command="ls -la", cwd="/workspace")
+        print(r.exit_code, r.stdout)
+
+        async for ev in c.remote(Bash.run_stream, command="long-job.sh"):
+            match ev:
+                case BashStdout(data=chunk): print(chunk, end="")
+                case BashStderr(data=chunk): print(chunk, end="")
+                case BashExit(exit_code=code): print(f"\\nexit {code}")
+                case BashError(message=msg): print(f"\\nerror: {msg}")
+
+The `Bash` class carries its method bodies directly (no `_impl.py`
+split). Subprocess code paths only run inside the sandbox; callers
+never invoke them locally, just pass them by reference to `c.remote`.
 """
 
 from __future__ import annotations
@@ -14,14 +26,18 @@ from __future__ import annotations
 import asyncio
 import os
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from typing import Annotated, Literal
 
-from . import BashError, BashEvent, BashExit, BashResult, BashStderr, BashStdout
+from pydantic import Field
 
-# Env vars stripped before forking a user-space subprocess.
-# The runtime is a Nix-built binary; os.environ is pre-loaded with Nix
-# runtime paths (LD_LIBRARY_PATH pointing at Nix-store libs, NIX_*,
-# PYTHONPATH, FONTCONFIG_*). Leaking these into a host-image subprocess
-# causes glibc ABI mismatches and silent library override bugs.
+from agentix.namespace import Namespace
+
+# Env vars stripped before forking a user-space subprocess. The runtime
+# is a Nix-built binary; os.environ is pre-loaded with Nix runtime paths
+# (LD_LIBRARY_PATH pointing at Nix-store libs, NIX_*, PYTHONPATH,
+# FONTCONFIG_*). Leaking those into a host-image subprocess causes glibc
+# ABI mismatches and silent library override bugs.
 _RUNTIME_ONLY_ENV = {
     "LD_LIBRARY_PATH",
     "LD_PRELOAD",
@@ -35,43 +51,16 @@ _RUNTIME_ONLY_ENV = {
 }
 
 
-def _clean_env(
-    extra: dict[str, str] | None,
-    prepend_path: list[str] | None = None,
-) -> dict[str, str]:
-    """Build a subprocess env: scrubbed base + optional PATH prefixes +
-    caller-supplied overrides.
-    """
+def _clean_env(extra: dict[str, str] | None) -> dict[str, str]:
+    """Build a subprocess env: scrubbed base + caller overrides."""
     env = {
         k: v
         for k, v in os.environ.items()
         if k not in _RUNTIME_ONLY_ENV and not k.startswith("NIX_")
     }
-    if prepend_path:
-        base_path = env.get("PATH", "/usr/local/bin:/usr/bin:/bin")
-        env["PATH"] = ":".join([*prepend_path, base_path])
     if extra:
         env.update(extra)
     return env
-
-
-def _resolve_closure_bins(packages: list[str]) -> list[str]:
-    """Resolve closure package paths to their `entry/bin/` directories.
-
-    Unknown packages are silently dropped. `["*"]` expands to every
-    currently-registered closure.
-    """
-    # Late import: closures share the runtime's Python process, so the
-    # runtime is already loaded by the time any bash.run call lands.
-    from agentix.runtime.server.app import registry
-
-    pkg_list = registry.packages() if packages == ["*"] else packages
-    out: list[str] = []
-    for pkg in pkg_list:
-        entry = registry.entry_for(pkg)
-        if entry is not None:
-            out.append(str(entry / "bin"))
-    return out
 
 
 async def _read_capped(stream: asyncio.StreamReader, limit: int) -> str:
@@ -94,21 +83,75 @@ async def _read_capped(stream: asyncio.StreamReader, limit: int) -> str:
     return b"".join(chunks).decode(errors="replace")
 
 
-class BashImpl:
-    """Bash primitive implementation. Composed with `Bash` via
-    `Dispatcher.bind_namespace`; not a subclass of `Bash`."""
+@dataclass
+class BashResult:
+    """Return value of `Bash.run` — full output captured before the call returns."""
 
+    exit_code: int
+    stdout: str
+    stderr: str
+
+
+# Algebraic stream events — each variant is its own dataclass so callers
+# can `match event: case BashStdout(...)` and pyright tracks the type.
+# The `type` field is the wire discriminator; users pattern-match the
+# class, not the field.
+
+
+@dataclass
+class BashStdout:
+    """A chunk of subprocess stdout."""
+
+    data: str
+    type: Literal["stdout"] = "stdout"
+
+
+@dataclass
+class BashStderr:
+    """A chunk of subprocess stderr."""
+
+    data: str
+    type: Literal["stderr"] = "stderr"
+
+
+@dataclass
+class BashExit:
+    """The subprocess finished. `exit_code` is its return status."""
+
+    exit_code: int
+    type: Literal["exit"] = "exit"
+
+
+@dataclass
+class BashError:
+    """Wire-side problem (e.g. timeout, fork failure). `message` explains."""
+
+    message: str
+    type: Literal["error"] = "error"
+
+
+BashEvent = Annotated[
+    BashStdout | BashStderr | BashExit | BashError,
+    Field(discriminator="type"),
+]
+"""One event from `Bash.run_stream`. Discriminated union of the four
+variants above — JSON wire form carries a `type` tag, but in Python
+the user pattern-matches the class directly."""
+
+
+class Bash(Namespace):
+    """Shell command execution primitive."""
+
+    @staticmethod
     async def run(
-        self,
         command: str,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout: float | None = None,
         max_output: int = 10 * 1024 * 1024,
-        paths_from: list[str] | None = None,
     ) -> BashResult:
-        prepend = _resolve_closure_bins(paths_from) if paths_from else None
-        sub_env = _clean_env(env, prepend_path=prepend)
+        """Run a shell command in the sandbox and return its captured output."""
+        sub_env = _clean_env(env)
         proc = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
@@ -132,16 +175,19 @@ class BashImpl:
             )
         return BashResult(exit_code=proc.returncode or 0, stdout=stdout, stderr=stderr)
 
+    @staticmethod
     async def run_stream(
-        self,
         command: str,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout: float | None = None,
-        paths_from: list[str] | None = None,
     ) -> AsyncIterator[BashEvent]:
-        prepend = _resolve_closure_bins(paths_from) if paths_from else None
-        sub_env = _clean_env(env, prepend_path=prepend)
+        """Run a shell command, yielding events as the subprocess emits them.
+
+        Terminates with a single `BashExit` event on normal completion or
+        a single `BashError` event on timeout / wire-level failure.
+        """
+        sub_env = _clean_env(env)
         proc = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,

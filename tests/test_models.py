@@ -4,45 +4,33 @@ from __future__ import annotations
 
 import pytest
 
-from agentix.models import (
-    AGENTIX_CLOSURE_ABI,
-    ClosureManifest,
-    SandboxConfig,
-)
+from agentix.models import ClosureManifest, SandboxConfig
 from agentix.runtime.models import RemoteError, RemoteRequest, RemoteResponse
 
 
 def test_closure_manifest_minimal():
-    m = ClosureManifest(
-        abi=AGENTIX_CLOSURE_ABI,
-        name="core",
-        version="0.1.0",
-        package="agentix_closures.core",
-    )
-    assert m.package == "agentix_closures.core"
+    m = ClosureManifest(name="core", version="0.1.0", package="agentix.core")
+    assert m.package == "agentix.core"
     assert m.description is None
 
 
 def test_closure_manifest_extra_allow():
-    m = ClosureManifest.model_validate(
-        {
-            "abi": AGENTIX_CLOSURE_ABI,
-            "name": "mock-agent",
-            "version": "0.1.0",
-            "package": "agentix_closures.mock_agent",
-            "extra_field": "ignored-but-preserved",
-        }
-    )
-    assert m.name == "mock-agent"
+    m = ClosureManifest.model_validate({
+        "name": "agentix-mock-agent",
+        "version": "0.1.0",
+        "package": "agentix.mock_agent",
+        "extra_field": "ignored-but-preserved",
+    })
+    assert m.name == "agentix-mock-agent"
 
 
-def test_closure_manifest_requires_abi_name_version_package():
+def test_closure_manifest_requires_name_version_package():
     with pytest.raises(Exception):
-        ClosureManifest(name="x", version="0.0.0", package="x")  # type: ignore[call-arg]
+        ClosureManifest(name="x", version="0.0.0")  # type: ignore[call-arg]
 
 
 def test_remote_request_defaults():
-    r = RemoteRequest(package="agentix_closures.echo", method="echo")
+    r = RemoteRequest(package="agentix.echo", method="echo")
     assert r.args == []
     assert r.kwargs == {}
 
@@ -83,7 +71,7 @@ def test_sandbox_config_resolves_closures_from_module():
     """Modules with __image__ get resolved to their image ref string."""
     import types
 
-    mod = types.ModuleType("agentix_closures.fake")
+    mod = types.ModuleType("agentix.fake")
     mod.__image__ = "fake/img:1.0"
     cfg = SandboxConfig(
         image="ubuntu:24.04",
@@ -100,17 +88,4 @@ def test_sandbox_config_rejects_unknown_closure_spec():
             image="ubuntu:24.04",
             runtime="agentix/runtime:0.1.0",
             closures=[42],  # type: ignore[list-item]
-        )
-
-
-def test_sandbox_config_rejects_module_with_empty_image():
-    import types
-
-    mod = types.ModuleType("agentix_closures.bad")
-    mod.__image__ = ""
-    with pytest.raises(Exception):
-        SandboxConfig(
-            image="ubuntu:24.04",
-            runtime="agentix/runtime:0.1.0",
-            closures=[mod],
         )

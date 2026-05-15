@@ -1,19 +1,22 @@
-"""Shared fixtures for agentix tests."""
+"""Shared fixtures for agentix tests.
+
+Closures are registered into the runtime via the entry-point mechanism
+in production. For tests we bypass `importlib.metadata.entry_points`
+(which is process-global and slow to mutate) and inject `Namespace`
+subclasses directly into the registry via the test-only
+`register_closure()` fixture. Same effect, no filesystem ceremony.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import importlib
-import json
 import socket
 import sys
-import textwrap
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-
-# ── network / runtime setup ──────────────────────────────────────
 
 
 @pytest.fixture
@@ -25,218 +28,83 @@ def free_port() -> int:
 
 @pytest.fixture
 def runtime_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    """Isolated runtime: tmp /mnt + tmp upload root + reloaded modules.
+    """Fresh runtime per test: tmp upload root + reloaded server modules.
 
-    Returns (server_module, mount_root, upload_root).
+    Returns (server_module, tmp_path, upload_root). The tmp_path slot is
+    kept for tests that need a scratch directory.
     """
-    mount_root = tmp_path / "mnt"
-    mount_root.mkdir()
     upload_root = tmp_path / "workspace"
     upload_root.mkdir()
-    monkeypatch.setenv("AGENTIX_CLOSURE_MOUNT_ROOT", str(mount_root))
     monkeypatch.setenv("AGENTIX_UPLOAD_ROOT", str(upload_root))
 
-    # Reload in dependency order: leaves first, package __init__ last.
+    # Reload server modules so each test gets a fresh Registry (no cross-test
+    # closure registration leakage). Order matters: leaves first, package
+    # __init__ last, so dependent modules see fresh internals on import.
     for mod in (
-        "agentix.runtime.server.builtins",
         "agentix.runtime.server.sio",
+        "agentix.runtime.server.trace_bridge",
+        "agentix.runtime.server.llm_proxy",
         "agentix.runtime.server.app",
         "agentix.runtime.server",
     ):
         if mod in sys.modules:
-            importlib.reload(sys.modules[mod])
+            try:
+                importlib.reload(sys.modules[mod])
+            except ImportError:
+                # Module was popped from sys.modules mid-test or never fully
+                # loaded — re-import on demand below.
+                sys.modules.pop(mod, None)
 
     from agentix.runtime import server
-
-    return server, mount_root, upload_root
-
-
-# ── closure-on-disk builder ──────────────────────────────────────
-
-
-def _write_pkg(py_root: Path, package: str, init_src: str, impl_src: str, register_src: str) -> None:
-    """Drop a Python package tree at `py_root/<package-path>/` with PEP 420
-    namespace-package treatment for parents (only the leaf has __init__.py).
-    """
-    parts = package.split(".")
-    parent = py_root
-    for p in parts[:-1]:
-        parent = parent / p
-        parent.mkdir(parents=True, exist_ok=True)
-    leaf = parent / parts[-1]
-    leaf.mkdir(parents=True, exist_ok=True)
-    (leaf / "__init__.py").write_text(init_src)
-    (leaf / "_impl.py").write_text(impl_src)
-    (leaf / "_register.py").write_text(register_src)
+    return server, tmp_path, upload_root
 
 
 @pytest.fixture
-def mount_package(runtime_module) -> Callable[..., Path]:
-    """Lay out a closure mount: `<mount>/entry/{manifest.json, python/<pkg>/}`.
+def register_closure(runtime_module) -> Callable[..., None]:
+    """Inject a closure class into the runtime's registry.
 
     Usage:
-        mount = mount_package(
-            "echo",
-            package="agentix_closures.echo",
-            init_src="...",
-            impl_src="...",
-            register_src="...",
+        @register_closure(package="agentix.echo")
+        class Echo(Namespace):
+            async def echo(self, msg: str) -> str:
+                return f"echo:{msg}"
+
+    Or imperatively:
+        register_closure(Echo)
+        register_closure(Echo, package="agentix.echo")
+
+    Defaults: `package` derives from `cls.__module__`. The framework's
+    `Registry.register` adds the closure as a pending lazy-load entry;
+    `get_or_load` builds the dispatcher on first call.
+    """
+    server, _, _ = runtime_module
+
+    def _register(cls: type, *, package: str | None = None,
+                  dist_name: str | None = None,
+                  dist_version: str = "0.1.0") -> None:
+        pkg = package or cls.__module__
+        server.registry.register(
+            pkg, loader=lambda: cls,
+            dist_name=dist_name or f"agentix-{pkg.rsplit('.', 1)[-1].replace('_', '-')}",
+            dist_version=dist_version,
         )
-    """
-    server, mount_root, _ = runtime_module
 
-    def _mount(
-        dirname: str,
-        *,
-        package: str,
-        init_src: str,
-        impl_src: str,
-        register_src: str,
-        abi: int = 1,
-        version: str = "0.1.0",
-        extra_manifest: dict | None = None,
-    ) -> Path:
-        mount = mount_root / dirname
-        entry = mount / "entry"
-        entry.mkdir(parents=True)
-        manifest = {
-            "abi": abi,
-            "name": package.rsplit(".", 1)[-1].replace("_", "-"),
-            "version": version,
-            "package": package,
-            **(extra_manifest or {}),
-        }
-        (entry / "manifest.json").write_text(json.dumps(manifest))
-        _write_pkg(
-            entry / "python",
-            package=package,
-            init_src=init_src,
-            impl_src=impl_src,
-            register_src=register_src,
-        )
-        return mount
-
-    return _mount
-
-
-# ── reusable closure sources ─────────────────────────────────────
-
-
-ECHO_INIT = textwrap.dedent(
-    """\
-    from dataclasses import dataclass
-
-    @dataclass
-    class EchoResult:
-        msg: str
-
-    def echo(msg: str) -> EchoResult:
-        raise NotImplementedError("call via RuntimeClient.remote(echo, ...)")
-    """
-)
-
-ECHO_IMPL = textwrap.dedent(
-    """\
-    from . import EchoResult
-
-    def echo(msg: str) -> EchoResult:
-        return EchoResult(msg=f"echo:{msg}")
-    """
-)
-
-ECHO_REGISTER = textwrap.dedent(
-    """\
-    from agentix.dispatch import Dispatcher
-    from . import echo
-    from ._impl import echo as _echo_impl
-
-    def register() -> Dispatcher:
-        d = Dispatcher()
-        d.bind(echo, _echo_impl)
-        return d
-    """
-)
-
-
-@pytest.fixture
-def mount_bundle(runtime_module) -> Callable[..., Path]:
-    """Lay out a bundle mount: one mount, multiple closures under entry/.
-
-    `<mount>/entry/bundle.json` marks the mount as a bundle; each member
-    closure lives at `<mount>/entry/<short>/{manifest.json, python/}`.
-
-    Usage:
-        mount_bundle("agent-bundle", closures={
-            "echo": dict(package="agentix_closures.echo", init_src=..., impl_src=..., register_src=...),
-            "greet": dict(...),
-        })
-    """
-    server, mount_root, _ = runtime_module
-
-    def _mount(dirname: str, *, closures: dict[str, dict]) -> Path:
-        mount = mount_root / dirname
-        entry = mount / "entry"
-        entry.mkdir(parents=True)
-        (entry / "bundle.json").write_text(json.dumps({
-            "abi": 1,
-            "kind": "bundle",
-            "closures": list(closures.keys()),
-        }))
-        for short, spec in closures.items():
-            sub = entry / short
-            sub.mkdir()
-            package = spec["package"]
-            manifest = {
-                "abi": spec.get("abi", 1),
-                "name": package.rsplit(".", 1)[-1].replace("_", "-"),
-                "version": spec.get("version", "0.1.0"),
-                "package": package,
-            }
-            (sub / "manifest.json").write_text(json.dumps(manifest))
-            _write_pkg(
-                sub / "python",
-                package=package,
-                init_src=spec["init_src"],
-                impl_src=spec["impl_src"],
-                register_src=spec["register_src"],
-            )
-        return mount
-
-    return _mount
-
-
-@pytest.fixture
-def mount_echo(mount_package) -> Callable[..., Path]:
-    """Mount the canonical 'echo' closure used across many tests.
-
-    Returns the mount dir. After this fixture runs and the runtime's
-    `_auto_load()` is called, `from agentix_closures.echo import echo`
-    becomes importable in the test process (because _auto_load prepends
-    the closure's `entry/python` to sys.path).
-    """
-    def _mount(dirname: str = "echo", *, package: str = "agentix_closures.echo") -> Path:
-        return mount_package(
-            dirname,
-            package=package,
-            init_src=ECHO_INIT,
-            impl_src=ECHO_IMPL,
-            register_src=ECHO_REGISTER,
-        )
-    return _mount
+    return _register
 
 
 @pytest.fixture(autouse=True)
-def _purge_test_packages():
-    """Per-test cleanup: drop any agentix_closures.* modules imported by the
-    runtime's _auto_load so the next test's fresh sys.path takes effect.
+def _purge_test_modules():
+    """Per-test cleanup: drop any test-injected modules so the next test
+    starts with a fresh slate. Real installed closures (agentix.bash,
+    agentix.files) stay loaded — they're framework-level.
     """
     yield
+    # Test fixtures may have stashed temporary modules under arbitrary names.
+    # Be conservative: only drop modules under `_agentix_test_*` prefixes
+    # that test code might create.
     for mod in list(sys.modules):
-        if mod == "agentix_closures" or mod.startswith("agentix_closures."):
+        if mod.startswith("_agentix_test_"):
             sys.modules.pop(mod, None)
-
-
-# ── live uvicorn server (for Socket.IO e2e tests) ────────────────
 
 
 @pytest.fixture
@@ -245,8 +113,8 @@ async def live_server(runtime_module):
     serving the runtime's combined FastAPI+Socket.IO ASGI app.
 
     Test order:
-        1. mount_package(...)        # populate /mnt
-        2. base_url = await start()  # uvicorn starts; lifespan runs _auto_load
+        1. register_closure(...)        # populate the registry
+        2. base_url = await start()     # uvicorn starts
         3. connect via RuntimeClient(base_url) etc.
 
     The server is torn down in fixture finalisation.

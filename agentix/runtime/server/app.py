@@ -8,16 +8,15 @@ In-process closure dispatch. The runtime is a single Python process serving:
 - `GET /closures` — inventory (always cheap; does not force-load anything)
 - `GET /health`
 
-There are no caller-chosen namespaces: each closure's Python import path
-(`manifest.package`) is its routing key. Two images shipping the same
-package collide; the second is skipped with a warning.
+Closure discovery uses `importlib.metadata.entry_points(group="agentix.closure")`:
+the runtime walks every installed distribution's `[project.entry-points]`,
+registers the closure as a pending entry, and defers `ep.load()` (the actual
+import) until the first `/_remote` call for that closure. A broken closure
+surfaces on call, not at boot. There's no on-disk `manifest.json`, no
+`/mnt/<closure>` mount convention, no kind-segment namespace.
 
-Discovery on startup is cheap: scan `/mnt/*` for `entry/manifest.json`,
-validate against ClosureManifest, prepend each closure's `entry/python`
-to sys.path, and register the closure in the Registry as a pending entry.
-The actual `importlib.import_module(<pkg>)` + `_register.register()` is
-deferred until the first call for that package — slow boots no longer
-block the runtime, and a broken closure does not crash startup.
+The closure's Python import path (e.g. `agentix.bash`) is the routing key;
+there are no caller-chosen namespaces.
 """
 
 from __future__ import annotations
@@ -25,14 +24,12 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from pydantic import ValidationError
 
 from agentix import __version__
-from agentix.dispatch import Registry
-from agentix.models import AGENTIX_CLOSURE_ABI, ClosureManifest
+from agentix.dispatch import Registry, discover_entry_points
+from agentix.models import ClosureManifest
 from agentix.runtime.models import (
     ClosureInfo,
     HealthResponse,
@@ -46,96 +43,32 @@ from agentix.runtime.server.trace_bridge import install as install_trace_bridge
 logger = logging.getLogger("agentix.runtime")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 
-CLOSURE_MOUNT_ROOT = Path(os.environ.get("AGENTIX_CLOSURE_MOUNT_ROOT", "/mnt"))
-
 registry = Registry()
 
 
 async def _auto_load() -> None:
-    """Scan /mnt for closures and register each one as a pending entry.
+    """Discover installed closures via entry points; register each lazily.
 
-    Supports two on-disk shapes per mount:
-
-      Single closure (canonical layout):
-        <mount>/entry/manifest.json
-        <mount>/entry/python/...
-
-      Bundle (multiple closures packed into one image, produced by
-      `agentix install`):
-        <mount>/entry/bundle.json
-        <mount>/entry/<closure_a>/manifest.json
-        <mount>/entry/<closure_a>/python/...
-        <mount>/entry/<closure_b>/manifest.json
-        ...
-
-    Either way the unit we register is the *entry path* — the directory
-    containing `manifest.json`. The Registry tracks that path so callers
-    that reach for the closure's `bin/` use `entry_path / "bin"` and
-    work in either shape.
-
-    Does NOT import any closure packages or build any Dispatchers — that
-    work happens lazily on first `/_remote` call. `/mnt/runtime` is
-    reserved (the runtime itself) and skipped.
+    Walks `importlib.metadata.entry_points(group="agentix.closure")`. Each
+    such entry point has the form `<short> = "<package>:<class>"` declared
+    in the closure's `pyproject.toml`. Discovery is cheap — we record the
+    `EntryPoint` object but don't call `ep.load()` until the closure is
+    first dispatched. A broken closure (import error, bad class) thus
+    fails on call, not at boot.
     """
-    if not CLOSURE_MOUNT_ROOT.is_dir():
-        return
-    for mount in sorted(CLOSURE_MOUNT_ROOT.iterdir()):
-        if mount.name == "runtime" or not mount.is_dir():
+    for ep in discover_entry_points():
+        try:
+            registry.register_entry_point(ep)
+        except ValueError as exc:
+            # `register_entry_point` raises on duplicate package — common
+            # when two installed dists claim the same import path. Log
+            # and skip the second.
+            logger.error("entry-point %r: %s", ep.name, exc)
             continue
-        for entry_path in _iter_entry_dirs(mount):
-            manifest = _read_manifest_at(entry_path)
-            if manifest is None:
-                continue
-            if manifest.package in registry:
-                logger.error(
-                    "skip %s: package %r already registered from %s",
-                    entry_path, manifest.package,
-                    registry.entry_for(manifest.package),
-                )
-                continue
-            registry.register(manifest.package, manifest, entry_path)
-            logger.info("registered closure '%s' from %s (deferred)",
-                        manifest.package, entry_path)
-
-
-def _iter_entry_dirs(mount: Path) -> list[Path]:
-    """Return the entry path(s) carried by a mount.
-
-    A mount with `<mount>/entry/bundle.json` is a bundle and yields each
-    `<mount>/entry/<sub>/` that itself contains a `manifest.json`. A
-    mount with `<mount>/entry/manifest.json` is a single closure and
-    yields `<mount>/entry` once.
-    """
-    entry_root = mount / "entry"
-    if not entry_root.is_dir():
-        logger.warning("skip mount %s: missing entry/", mount)
-        return []
-    if (entry_root / "bundle.json").is_file():
-        return [d for d in sorted(entry_root.iterdir())
-                if d.is_dir() and (d / "manifest.json").is_file()]
-    return [entry_root]
-
-
-def _read_manifest_at(entry_path: Path) -> ClosureManifest | None:
-    """Read and validate `<entry_path>/manifest.json`."""
-    mf_path = entry_path / "manifest.json"
-    if not mf_path.is_file():
-        logger.warning("skip %s: missing manifest.json", entry_path)
-        return None
-    try:
-        manifest = ClosureManifest.model_validate_json(mf_path.read_text())
-    except ValidationError as exc:
-        logger.error("skip %s: invalid manifest.json: %s", entry_path, exc)
-        return None
-    if manifest.abi != AGENTIX_CLOSURE_ABI:
-        logger.warning(
-            "skip %s: abi=%d, runtime supports %d",
-            entry_path, manifest.abi, AGENTIX_CLOSURE_ABI,
+        logger.info(
+            "registered closure '%s' (deferred) — entry point %r",
+            ep.value.split(":", 1)[0], ep.name,
         )
-        return None
-    return manifest
-
-
 
 
 @asynccontextmanager
@@ -162,11 +95,15 @@ async def list_closures() -> list[ClosureInfo]:
     """All registered closures (loaded or not). Doesn't force-load."""
     out: list[ClosureInfo] = []
     for pkg in registry.packages():
-        manifest = registry.manifest_for(pkg)
-        entry = registry.entry_for(pkg)
-        if manifest is None or entry is None:
+        info = registry.info_for(pkg)
+        if info is None:
             continue
-        out.append(ClosureInfo(path=str(entry), manifest=manifest))
+        dist_name, dist_version = info
+        out.append(ClosureInfo(manifest=ClosureManifest(
+            name=dist_name or pkg.rsplit(".", 1)[-1],
+            version=dist_version or "0.0.0",
+            package=pkg,
+        )))
     return out
 
 
@@ -238,9 +175,8 @@ install_trace_bridge(_sio)
 
 
 def main() -> None:
-    """Entry point the closure convention expects at
-    /mnt/runtime/entry/bin/start. Port via AGENTIX_BIND_PORT (env, default
-    8000); dev shell can override via --port.
+    """Entry point exposed as the `start` console script. Port via
+    AGENTIX_BIND_PORT (env, default 8000); dev shell can override via --port.
     """
     import argparse
 

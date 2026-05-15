@@ -3,11 +3,20 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "agentix-primitive-bash"
+name = "agentix-bash"
 version = "0.1.0"
 description = "Bash command execution primitive for Agentix"
 requires-python = ">=3.11"
 dependencies = []
 
+# Entry points are the framework's sole closure-discovery contract.
+# `bash = "agentix.bash:Bash"` tells the runtime to import `agentix.bash`
+# and load the `Bash` class as the closure on first dispatch.
+[project.entry-points."agentix.closure"]
+bash = "agentix.bash:Bash"
+
 [tool.hatch.build.targets.wheel]
-packages = ["src/agentix/primitive/bash"]
+# Package the `agentix.bash` namespace contribution. `src/agentix/` has
+# no __init__.py (PEP 420 namespace package); hatchling walks the tree
+# and installs files at `agentix/bash/` in the wheel.
+packages = ["src/agentix"]

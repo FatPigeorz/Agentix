@@ -30,7 +30,6 @@ case works end-to-end today, which covers the in-repo dev flow.
 from __future__ import annotations
 
 import argparse
-import json
 import shutil
 import subprocess
 import sys
@@ -41,7 +40,6 @@ from tempfile import TemporaryDirectory
 from agentix.cli._resolve import REPO_ROOT, ClosureSpec, resolve_spec
 
 TEMPLATE_DIR = REPO_ROOT / "primitives" / "_template"
-GEN_MANIFEST = REPO_ROOT / "tools" / "gen_manifest.py"
 
 
 _SOURCE_SKIP = {
@@ -91,25 +89,14 @@ def _stage_bundle(
             else:
                 shutil.copy2(item, dest)
 
-    # Shared build infra — same files agentix-build uses for single closures.
+    # Shared build infra — same default.nix used for single-closure builds.
     shutil.copy2(TEMPLATE_DIR / "default.nix", build_dir / "default.nix")
-    shutil.copy2(GEN_MANIFEST, build_dir / "gen_manifest.py")
-
-    # Bundle.json discriminator — what the runtime keys off to switch
-    # `_auto_load` into nested-entry mode.
-    (build_dir / "bundle.json").write_text(json.dumps({
-        "abi": 1,
-        "kind": "bundle",
-        "name": bundle_name,
-        "version": bundle_version,
-        "closures": [s.short for s in specs],
-    }, indent=2) + "\n")
 
     # The bundle Dockerfile builds each closure's nix derivation in a
-    # builder stage, then copies the resulting `entry/` trees side by side
-    # under `/nix/entry/<short>/`. Same shared `default.nix` template is
-    # reused for each closure — pname/version are read from each closure's
-    # pyproject.toml at build time.
+    # builder stage and pip-installs all of them into the final image. The
+    # runtime's `_auto_load` walks `importlib.metadata.entry_points`, so as
+    # long as every closure's wheel is installed, discovery works without
+    # any extra disposition file.
     (build_dir / "Dockerfile").write_text(_render_dockerfile(specs))
 
 
@@ -117,7 +104,7 @@ def _render_dockerfile(specs: list[ClosureSpec]) -> str:
     builder_steps = "\n".join(
         f"WORKDIR /src/{spec.short}\n"
         f"COPY {spec.short}/ ./\n"
-        f"COPY default.nix gen_manifest.py ./\n"
+        f"COPY default.nix ./\n"
         f"RUN nix-build --no-out-link default.nix -o ./result && \\\n"
         f"    STORE_PATH=$(readlink -f ./result) && \\\n"
         f"    for p in $(nix-store -qR \"$STORE_PATH\"); do \\\n"
@@ -141,7 +128,6 @@ RUN mkdir -p /export/nix/store /export/nix/entry
 
 FROM busybox:stable
 COPY --from=builder /export /
-COPY bundle.json /nix/entry/bundle.json
 VOLUME /nix
 LABEL org.agentix.closure=1
 LABEL org.agentix.closure.kind=bundle

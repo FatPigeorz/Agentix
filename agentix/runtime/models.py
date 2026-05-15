@@ -33,11 +33,8 @@ STREAM_ORIGINS: tuple[type, ...] = (cabc.AsyncIterator, cabc.AsyncGenerator)
 
 
 class ClosureInfo(BaseModel):
-    """One entry in GET /closures. `manifest.package` is the closure identity;
-    `path` is the on-disk mount, exposed for debugging only.
-    """
+    """One entry in GET /closures. `manifest.package` is the closure identity."""
 
-    path: str
     manifest: ClosureManifest
 
 

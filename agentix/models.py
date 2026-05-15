@@ -1,7 +1,8 @@
-"""Closure ABI + sandbox / deployment models.
+"""Closure metadata + sandbox / deployment models.
 
-These are the cross-cutting types: the closure-image contract (everyone
-who builds or runs a closure depends on `ClosureManifest`) and the
+Cross-cutting types: closure metadata (surfaced via `/closures` for
+introspection — no longer shipped as an on-disk file, since the runtime
+discovers closures via `importlib.metadata` entry points) and the
 top-level sandbox/deployment config that orchestrators hand to a
 `Deployment`. Runtime transport / wire types live in
 `agentix.runtime.models` instead.
@@ -17,31 +18,20 @@ from pydantic import BaseModel, Field, field_validator
 
 from agentix.idents import PackageName, SandboxId
 
-# ── Closure manifest (shipped inside the closure image) ───────────
-
-AGENTIX_CLOSURE_ABI = 1
-"""Protocol version of the closure convention. Runtime ignores closures whose
-manifest declares a different value. Bump on hard breaks (path layout,
-manifest schema, dispatch ABI)."""
-
 
 class ClosureManifest(BaseModel):
-    """Static metadata shipped at `/nix/entry/manifest.json` inside a closure
-    image. Presence of this file is what marks a `/mnt/<ns>` mount as an
-    Agentix closure — runtime ignores anything without one.
+    """Lightweight metadata for one registered closure.
 
-    `package` is the Python import path the runtime imports at startup to
-    obtain the closure's Dispatcher (via `<package>._register.register()`).
+    Populated by the runtime from `importlib.metadata` at discovery time
+    and returned by `GET /closures` for introspection. `package` is the
+    closure's Python import path (e.g. `agentix.bash`) and the runtime's
+    routing key — there are no caller-chosen namespaces.
     """
 
-    abi: int
     name: str
     version: str
     package: PackageName = Field(
-        description=(
-            "Python import path of the closure package, whatever its "
-            "pyproject.toml ships (e.g. 'agentix.primitive.bash')."
-        ),
+        description="Python import path (e.g. 'agentix.bash').",
     )
     description: str | None = None
 

@@ -109,15 +109,11 @@ def test_dispatcher_bind_records_pubsub_pattern() -> None:
     register_pattern(PubSubPattern)
 
     class Feed(Namespace):
-        def emit(self, payload: int) -> Topic[int]: ...
-
-    class FeedImpl:
-        def emit(self, payload: int) -> Topic[int]:
-            # A real impl would push to a topic; the demo returns the
-            # marker type to satisfy the signature contract.
+        @staticmethod
+        def emit(payload: int) -> Topic[int]:
             return Topic[int]()  # type: ignore[return-value]
 
-    d = Dispatcher().bind_namespace(Feed, FeedImpl())
+    d = Dispatcher().bind_namespace(Feed)
     bound = d._methods["emit"]  # noqa: SLF001 — demo introspection
     assert bound.pattern is PubSubPattern
 
@@ -145,15 +141,14 @@ async def test_dispatcher_dispatch_rejects_pubsub_via_unary_path() -> None:
     register_pattern(PubSubPattern)
 
     class Feed(Namespace):
-        def emit(self, payload: int) -> Topic[int]: ...
+        received: int = -1
 
-    class FeedImpl:
-        def emit(self, payload: int) -> Topic[int]:
-            self.received = payload  # type: ignore[attr-defined]
+        @staticmethod
+        def emit(payload: int) -> Topic[int]:
+            Feed.received = payload  # write to class so the test can read it
             return Topic[int]()  # type: ignore[return-value]
 
-    impl = FeedImpl()
-    d = Dispatcher().bind_namespace(Feed, impl)
+    d = Dispatcher().bind_namespace(Feed)
 
     # Demo: invoke the bound impl directly to show the binding works.
     # A real PubSubPattern would intercept dispatch via its own transport.
@@ -162,8 +157,8 @@ async def test_dispatcher_dispatch_rejects_pubsub_via_unary_path() -> None:
     ))
     # The unary path can't serialize a `Topic[int]()` instance through
     # pydantic, so the response is a SerializationError. That's expected
-    # — the takeaway is that the impl ran (impl.received == 42) and the
+    # — the takeaway is that the impl ran (Feed.received == 42) and the
     # pattern was recorded; a real transport would short-circuit before
     # this point.
     assert not resp.ok
-    assert impl.received == 42  # type: ignore[attr-defined]
+    assert Feed.received == 42

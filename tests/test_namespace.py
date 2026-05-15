@@ -31,8 +31,10 @@ from agentix.wire import (
 
 def test_namespace_methods_only_lists_public_callables() -> None:
     class N(Namespace):
-        def public(self, x: int) -> int: ...
-        def _private(self) -> None: ...  # underscore → skipped
+        @staticmethod
+        def public(x: int) -> int: ...
+        @staticmethod
+        def _private() -> None: ...  # underscore → skipped
         constant = 42  # non-function → skipped
 
     names = [n for n, _ in discover_methods(N)]
@@ -43,8 +45,10 @@ def test_namespace_excluded_hides_methods() -> None:
     class N(Namespace):
         __namespace_excluded__ = frozenset({"hidden"})
 
-        def visible(self) -> None: ...
-        def hidden(self) -> None: ...
+        @staticmethod
+        def visible() -> None: ...
+        @staticmethod
+        def hidden() -> None: ...
 
     assert [n for n, _ in discover_methods(N)] == ["visible"]
 
@@ -55,10 +59,12 @@ def test_namespace_inherits_methods_from_namespace_ancestors() -> None:
     not stub↔stub."""
 
     class Base(Namespace):
-        def common(self) -> int: ...
+        @staticmethod
+        def common() -> int: ...
 
     class Extended(Base):
-        def extra(self) -> str: ...
+        @staticmethod
+        def extra() -> str: ...
 
     names = sorted(n for n, _ in discover_methods(Extended))
     assert names == ["common", "extra"]
@@ -125,21 +131,18 @@ def test_register_pattern_prepends_and_overrides_builtins() -> None:
 
 @pytest.mark.asyncio
 async def test_bind_namespace_routes_through_dispatcher() -> None:
-    """A full Namespace round-trip: stub class + independent impl class →
-    dispatcher. The impl does NOT inherit from the stub — composition."""
+    """A full Namespace round-trip: one class with real method bodies."""
 
     class Math(Namespace):
-        async def add(self, a: int, b: int) -> int: ...
-        async def echo(self, items: list[str]) -> list[str]: ...
-
-    class MathImpl:  # no inheritance from Math
-        async def add(self, a: int, b: int) -> int:
+        @staticmethod
+        async def add(a: int, b: int) -> int:
             return a + b
 
-        async def echo(self, items: list[str]) -> list[str]:
+        @staticmethod
+        async def echo(items: list[str]) -> list[str]:
             return list(reversed(items))
 
-    d = Dispatcher().bind_namespace(Math, MathImpl())
+    d = Dispatcher().bind_namespace(Math)
     assert set(d.methods()) == {"add", "echo"}
 
     resp = await d.dispatch(RemoteRequest(
@@ -154,40 +157,23 @@ async def test_bind_namespace_routes_through_dispatcher() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bind_namespace_rejects_impl_missing_methods() -> None:
-    class Stub(Namespace):
-        def run(self) -> int: ...
-        def other(self) -> str: ...
-
-    class Partial:
-        def run(self) -> int:
-            return 0
-        # `other` deliberately missing
-
-    with pytest.raises(TypeError, match="is missing method"):
-        Dispatcher().bind_namespace(Stub, Partial())
-
-
-@pytest.mark.asyncio
 async def test_bind_namespace_picks_correct_pattern() -> None:
     class N(Namespace):
-        async def unary(self, x: int) -> int: ...
-        async def stream(self, n: int) -> AsyncIterator[int]: ...
-        async def bidi(self, events: AsyncIterator[str]) -> AsyncIterator[int]: ...
-
-    class NImpl:  # composition — independent of N
-        async def unary(self, x: int) -> int:
+        @staticmethod
+        async def unary(x: int) -> int:
             return x
 
-        async def stream(self, n: int) -> AsyncIterator[int]:
+        @staticmethod
+        async def stream(n: int) -> AsyncIterator[int]:
             for i in range(n):
                 yield i
 
-        async def bidi(self, events: AsyncIterator[str]) -> AsyncIterator[int]:
+        @staticmethod
+        async def bidi(events: AsyncIterator[str]) -> AsyncIterator[int]:
             async for e in events:
                 yield len(e)
 
-    d = Dispatcher().bind_namespace(N, NImpl())
+    d = Dispatcher().bind_namespace(N)
     assert d.is_streaming("unary") is False
     assert d.is_streaming("stream") is True
     assert d.is_bidi("stream") is False
@@ -195,113 +181,27 @@ async def test_bind_namespace_picks_correct_pattern() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bind_namespace_works_with_protocol_typed_impl() -> None:
-    """If the user opts into Protocol typing, pyright structurally verifies
-    the impl satisfies the stub. The framework itself doesn't require it."""
+async def test_bind_namespace_works_with_protocol_subclass() -> None:
+    """A Namespace subclass that's *also* a Protocol still binds fine —
+    the class IS the closure; method bodies carry the real logic."""
     from typing import Protocol, runtime_checkable
 
     @runtime_checkable
     class Greeting(Namespace, Protocol):
-        async def hello(self, name: str) -> str: ...
+        @staticmethod
+        async def hello(name: str) -> str: ...
 
-    class GreetingImpl:
-        async def hello(self, name: str) -> str:
+    # Test fixture: the real class has bodies. Pyright doesn't see this
+    # as instantiating a Protocol because Greeting isn't directly used as
+    # the impl — `bind_namespace` accepts the class and instantiates it.
+    class GreetingImpl(Greeting):  # noqa: ARG001  (Protocol subclass for typing)
+        @staticmethod
+        async def hello(name: str) -> str:
             return f"hi {name}"
 
-        async def _internal(self) -> None: ...  # private — not part of ABI
-
-    impl: Greeting = GreetingImpl()  # pyright would catch a structural mismatch
-    d = Dispatcher().bind_namespace(Greeting, impl)
+    d = Dispatcher().bind_namespace(GreetingImpl)
     assert d.methods() == ["hello"]
     resp = await d.dispatch(RemoteRequest(
         package="x", method="hello", args=[], kwargs={"name": "alice"},
     ))
     assert resp.ok and resp.value == "hi alice"
-
-
-# ── Auto-discovery (no _register.py) ────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_auto_discover_finds_unique_namespace_pair(tmp_path, monkeypatch) -> None:
-    """No `_register.py` → runtime infers stub + impl by convention."""
-    import sys
-    import textwrap
-
-    pkg_root = tmp_path / "agentix_closures" / "autodisc"
-    pkg_root.mkdir(parents=True)
-    (pkg_root / "__init__.py").write_text(textwrap.dedent("""
-        from agentix.namespace import Namespace
-        class Math(Namespace):
-            async def add(self, a: int, b: int) -> int: ...
-    """))
-    (pkg_root / "_impl.py").write_text(textwrap.dedent("""
-        class MathImpl:
-            async def add(self, a: int, b: int) -> int:
-                return a + b
-    """))
-    monkeypatch.syspath_prepend(str(tmp_path))
-    from agentix.dispatch import _import_and_register
-    from agentix.models import ClosureManifest
-    manifest = ClosureManifest(
-        abi=1, name="autodisc", version="0.0.1",
-        package="agentix_closures.autodisc",
-    )
-    try:
-        d = _import_and_register(manifest)
-        assert d.methods() == ["add"]
-        resp = await d.dispatch(RemoteRequest(
-            package="x", method="add", args=[], kwargs={"a": 4, "b": 5},
-        ))
-        assert resp.ok and resp.value == 9
-    finally:
-        sys.modules.pop("agentix_closures.autodisc", None)
-        sys.modules.pop("agentix_closures.autodisc._impl", None)
-
-
-def test_auto_discover_rejects_zero_namespaces(tmp_path, monkeypatch) -> None:
-    import sys
-
-    pkg_root = tmp_path / "agentix_closures" / "empty"
-    pkg_root.mkdir(parents=True)
-    (pkg_root / "__init__.py").write_text("# no Namespace here\n")
-    (pkg_root / "_impl.py").write_text("# nothing\n")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    from agentix.dispatch import _import_and_register
-    from agentix.models import ClosureManifest
-    manifest = ClosureManifest(
-        abi=1, name="empty", version="0.0.1",
-        package="agentix_closures.empty",
-    )
-    try:
-        with pytest.raises(TypeError, match="no Namespace subclass"):
-            _import_and_register(manifest)
-    finally:
-        sys.modules.pop("agentix_closures.empty", None)
-
-
-def test_auto_discover_rejects_missing_impl_class(tmp_path, monkeypatch) -> None:
-    import sys
-    import textwrap
-
-    pkg_root = tmp_path / "agentix_closures" / "noimpl"
-    pkg_root.mkdir(parents=True)
-    (pkg_root / "__init__.py").write_text(textwrap.dedent("""
-        from agentix.namespace import Namespace
-        class Greet(Namespace):
-            async def hi(self) -> str: ...
-    """))
-    (pkg_root / "_impl.py").write_text("# missing GreetImpl\n")
-    monkeypatch.syspath_prepend(str(tmp_path))
-    from agentix.dispatch import _import_and_register
-    from agentix.models import ClosureManifest
-    manifest = ClosureManifest(
-        abi=1, name="noimpl", version="0.0.1",
-        package="agentix_closures.noimpl",
-    )
-    try:
-        with pytest.raises(TypeError, match="GreetImpl"):
-            _import_and_register(manifest)
-    finally:
-        sys.modules.pop("agentix_closures.noimpl", None)
-        sys.modules.pop("agentix_closures.noimpl._impl", None)

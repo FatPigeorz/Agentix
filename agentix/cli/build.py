@@ -39,7 +39,6 @@ from tempfile import TemporaryDirectory
 from agentix.cli._resolve import REPO_ROOT, ClosureSpec, read_pyproject, resolve_spec
 
 TEMPLATE_DIR = REPO_ROOT / "primitives" / "_template"
-GEN_MANIFEST = REPO_ROOT / "tools" / "gen_manifest.py"
 
 
 def _derive_tag(pyproject: dict) -> str:
@@ -110,7 +109,6 @@ def _stage(closure_dir: Path, build_dir: Path) -> None:
             shutil.copy2(item, dest)
     shutil.copy2(TEMPLATE_DIR / "Dockerfile", build_dir / "Dockerfile")
     shutil.copy2(TEMPLATE_DIR / "default.nix", build_dir / "default.nix")
-    shutil.copy2(GEN_MANIFEST, build_dir / "gen_manifest.py")
 
 
 def main(argv: Sequence[str] | None = None) -> int:

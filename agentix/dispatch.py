@@ -16,21 +16,18 @@ decorators, no base classes.
 from __future__ import annotations
 
 import asyncio
-import importlib
+import importlib.metadata
 import inspect
 import logging
-import sys
 import traceback
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Generic, ParamSpec, TypeVar, get_args, get_origin
 
 from pydantic import TypeAdapter, ValidationError
 
 import agentix.trace as trace
 from agentix.idents import MethodName, PackageName
-from agentix.models import ClosureManifest
 from agentix.namespace import Namespace, discover_methods
 from agentix.runtime.models import (
     STREAM_ORIGINS,
@@ -110,13 +107,6 @@ class Dispatcher:
         # `param.annotation` would be the string "AsyncIterator[Foo]" and
         # `get_origin` would return None, mis-classifying streams as unary.
         sig = inspect.signature(stub, eval_str=True)
-        # Strip a leading `self` from class-based stubs. `Namespace`
-        # stubs declare methods like `def run(self, ...)`, but the impl
-        # we bind is the bound method (self already injected). The
-        # dispatcher's signature must match the call site.
-        params = list(sig.parameters.values())
-        if params and params[0].name == "self":
-            sig = sig.replace(parameters=params[1:])
         name = MethodName(stub.__name__)
         if name in self._methods:
             raise ValueError(f"method '{name}' already bound on this dispatcher")
@@ -175,40 +165,18 @@ class Dispatcher:
             input_item_adapter=input_item_adapter,
         )
 
-    def bind_namespace(
-        self,
-        stub_cls: type[Namespace],
-        impl: object,
-    ) -> Dispatcher:
-        """Bind every public method of `stub_cls` to its `impl` counterpart.
+    def bind_namespace(self, cls: type[Namespace]) -> Dispatcher:
+        """Bind every public method of `cls`.
 
-        Stub and impl are **independent classes** — composition, not
-        inheritance. For each method discovered on `stub_cls`, the
-        dispatcher looks up the same-named attribute on `impl` and
-        binds the pair. Missing methods on `impl` raise immediately.
+        Closure methods are `@staticmethod` — the class is a namespace,
+        method bodies carry the real logic, the signature is the
+        contract. The dispatcher binds each function to itself (stub
+        and impl are the same callable). No instance is needed.
 
-        Static type-checking that `impl` actually satisfies the stub is
-        opt-in: declare the stub as a `Protocol` and annotate `impl: Stub`
-        in `_register.py`. The framework checks signature drift at CI
-        time via `tools/check_stub_impl.py`.
-
-        Returns `self` for fluent use in `_register.register()`.
+        Returns `self` for fluent use in entry-point loaders.
         """
-        missing: list[str] = []
-        bound_pairs: list[tuple[Callable[..., Any], Callable[..., Any]]] = []
-        for name, stub_fn in discover_methods(stub_cls):
-            impl_fn = getattr(impl, name, None)
-            if impl_fn is None or not callable(impl_fn):
-                missing.append(name)
-                continue
-            bound_pairs.append((stub_fn, impl_fn))
-        if missing:
-            raise TypeError(
-                f"impl {type(impl).__name__} is missing method(s) declared on "
-                f"stub {stub_cls.__name__}: {missing}"
-            )
-        for stub_fn, impl_fn in bound_pairs:
-            self.bind(stub_fn, impl_fn)
+        for name, fn in discover_methods(cls):
+            self.bind(fn, fn)
         return self
 
     def methods(self) -> list[MethodName]:
@@ -448,31 +416,35 @@ class Dispatcher:
 
 
 def _source_for(impl: Callable[..., Any]) -> PackageName | None:
-    """Derive a closure package path from an impl function for trace events.
-
-    Closure impls live at `<package>._impl`; strip the `._impl` suffix so
-    the trace source reads as the public package the caller imported.
-    """
+    """Derive a closure package path from an impl function for trace events."""
     mod = getattr(impl, "__module__", None)
     if mod is None:
         return None
-    return PackageName(mod[:-6] if mod.endswith("._impl") else mod)
+    return PackageName(mod)
+
+
+# The entry-point group every closure declares under in its pyproject.toml:
+#
+#   [project.entry-points."agentix.closure"]
+#   bash = "agentix.bash:Bash"
+#
+# The framework reads this at startup via `importlib.metadata.entry_points`.
+CLOSURE_ENTRY_POINT_GROUP = "agentix.closure"
 
 
 @dataclass
 class _Entry:
     """One registered closure. `dispatcher` is built lazily on first use.
 
-    `entry_path` is the directory that contains the closure's `manifest.json`
-    and (next to it) `python/` and optional `bin/`. For a single-closure
-    image the entry path is `<mount>/entry`; for a bundle image the same
-    closure's entry path is `<mount>/entry/<sub>/`. Code that reaches for
-    the closure's bin dir should always do `entry_path / "bin"` so it works
-    in both shapes.
+    `loader` returns the closure's `Namespace` subclass on demand. For
+    entry-point-discovered closures it's `ep.load`; for test fixtures it's
+    a pre-bound `lambda: cls`. Either way, the actual import + dispatcher
+    build is deferred until `get_or_load(...)` is awaited.
     """
 
-    manifest: ClosureManifest
-    entry_path: Path
+    loader: Callable[[], type]
+    dist_name: str | None = None
+    dist_version: str | None = None
     dispatcher: Dispatcher | None = None
     error: Exception | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -481,14 +453,15 @@ class _Entry:
 class Registry:
     """Per-runtime collection of package-path → closure entry.
 
-    Closures are registered at sandbox-startup mount discovery, but their
-    Python packages are not imported and their Dispatchers are not built
-    until the first call to `get_or_load(package)`. This keeps sandbox
-    boot cheap and isolates per-closure import failures so they surface
-    on call rather than blocking startup.
+    Closures are discovered via `importlib.metadata.entry_points(group=
+    "agentix.closure")` at sandbox-startup time, but their Python packages
+    are not imported and their Dispatchers are not built until the first
+    call to `get_or_load(package)`. This keeps sandbox boot cheap and
+    isolates per-closure import failures so they surface on call rather
+    than at startup.
 
-    The closure's Python import path (e.g. 'agentix.agent.claude_code')
-    is the routing key — there are no caller-chosen namespaces.
+    The closure's Python import path (e.g. 'agentix.bash') is the routing
+    key — there are no caller-chosen namespaces.
     """
 
     def __init__(self) -> None:
@@ -497,32 +470,47 @@ class Registry:
     def register(
         self,
         package: PackageName,
-        manifest: ClosureManifest,
-        entry_path: Path,
+        loader: Callable[[], type],
+        *,
+        dist_name: str | None = None,
+        dist_version: str | None = None,
     ) -> None:
         """Mark a closure as known but not yet loaded.
 
-        `entry_path` is the directory that holds the closure's
-        `manifest.json` (and `python/`, optional `bin/`, etc.). Adds
-        `entry_path/python` to sys.path so the stub module becomes
-        importable — the Dispatcher build is still deferred.
+        `loader()` must return the closure's `Namespace` subclass. The
+        registry calls it lazily on first dispatch. `dist_name` and
+        `dist_version` come from `importlib.metadata` and are surfaced
+        via `/closures` for introspection.
         """
         if package in self._entries:
             raise ValueError(f"package '{package}' already registered")
-        py_root = entry_path / "python"
-        if py_root.is_dir():
-            py_str = str(py_root)
-            if py_str not in sys.path:
-                sys.path.insert(0, py_str)
-        self._entries[package] = _Entry(manifest=manifest, entry_path=entry_path)
+        self._entries[package] = _Entry(
+            loader=loader,
+            dist_name=dist_name,
+            dist_version=dist_version,
+        )
+
+    def register_entry_point(self, ep: Any) -> None:
+        """Register a `importlib.metadata.EntryPoint`. Convenience for the
+        normal entry-point discovery path.
+        """
+        package = PackageName(ep.value.split(":", 1)[0])
+        dist_name = getattr(ep.dist, "name", None) if ep.dist else None
+        dist_version = getattr(ep.dist, "version", None) if ep.dist else None
+        self.register(
+            package,
+            loader=ep.load,
+            dist_name=dist_name,
+            dist_version=dist_version,
+        )
 
     async def get_or_load(self, package: PackageName) -> Dispatcher | None:
-        """Return the dispatcher for `package`, importing + registering it
-        on first call. Returns None for unknown packages. Re-raises the
-        original exception on every call if the load has previously failed.
+        """Return the dispatcher for `package`, building it on first call.
 
+        Returns None for unknown packages. Re-raises the original
+        exception on every call if the load has previously failed.
         Concurrent first calls to the same package serialise on a
-        per-entry lock so the import + `_register.register()` runs once.
+        per-entry lock so the loader + bind sequence runs once.
         """
         entry = self._entries.get(package)
         if entry is None:
@@ -537,7 +525,17 @@ class Registry:
             if entry.error is not None:
                 raise entry.error
             try:
-                entry.dispatcher = _import_and_register(entry.manifest)
+                cls = entry.loader()
+                if not isinstance(cls, type):
+                    raise TypeError(
+                        f"{package}: entry-point loader returned "
+                        f"{type(cls).__name__}, expected a class"
+                    )
+                if Namespace not in cls.__mro__ or cls is Namespace:
+                    raise TypeError(
+                        f"{package}: {cls.__name__} is not a Namespace subclass"
+                    )
+                entry.dispatcher = Dispatcher().bind_namespace(cls)
             except Exception as exc:
                 logger.exception("lazy-load failed for closure '%s'", package)
                 entry.error = exc
@@ -552,96 +550,26 @@ class Registry:
         """Packages whose dispatcher has been built (post first-use)."""
         return [pkg for pkg, e in self._entries.items() if e.dispatcher is not None]
 
-    def manifest_for(self, package: PackageName) -> ClosureManifest | None:
+    def info_for(self, package: PackageName) -> tuple[str | None, str | None] | None:
+        """`(dist_name, dist_version)` for the closure, or None if not registered."""
         e = self._entries.get(package)
-        return e.manifest if e else None
-
-    def entry_for(self, package: PackageName) -> Path | None:
-        """The directory holding the closure's manifest.json + python/ + bin/.
-
-        Works the same for single-closure images (one entry per mount) and
-        for bundle images (multiple entries nested under one mount).
-        """
-        e = self._entries.get(package)
-        return e.entry_path if e else None
+        if e is None:
+            return None
+        return e.dist_name, e.dist_version
 
     def __contains__(self, package: PackageName) -> bool:
         return package in self._entries
 
 
-def _import_and_register(manifest: ClosureManifest) -> Dispatcher:
-    """Build the dispatcher for a closure package.
+def discover_entry_points() -> list[Any]:
+    """Return every installed `agentix.closure` entry point.
 
-    Two paths, tried in order:
-
-      1. **Explicit:** if `<pkg>._register` is importable and exposes a
-         `register() -> Dispatcher`, use it. This is the escape hatch for
-         closures that bind multiple namespaces, do custom wiring, or
-         otherwise need imperative control.
-
-      2. **Convention:** otherwise, auto-discover. Find the unique
-         `Namespace` subclass declared in `<pkg>.__init__` and the class
-         `<StubName>Impl` in `<pkg>._impl`, then
-         `Dispatcher().bind_namespace(Stub, Impl())`.
-
-    `entry/python` is already on sys.path (added at `Registry.register` time).
-    The caller wraps any exception into the entry's `.error`.
+    Cheap: walks `importlib.metadata` dist metadata; nothing is imported.
+    The framework uses this at sandbox-startup to populate the Registry
+    without paying the import cost of every closure.
     """
-    pkg = importlib.import_module(manifest.package)
-    try:
-        register_mod = importlib.import_module(f"{manifest.package}._register")
-    except ImportError:
-        register_mod = None
-    if register_mod is not None and hasattr(register_mod, "register"):
-        dispatcher = register_mod.register()
-        if not isinstance(dispatcher, Dispatcher):
-            raise TypeError(
-                f"{manifest.package}._register.register() returned "
-                f"{type(dispatcher).__name__}, expected Dispatcher"
-            )
-        return dispatcher
-    return _auto_discover_dispatcher(pkg, manifest.package)
-
-
-def _auto_discover_dispatcher(pkg: Any, package: str) -> Dispatcher:
-    """Bind by convention: exactly one `Namespace` subclass in the package's
-    `__init__`, paired with `<StubName>Impl` from `_impl`.
-
-    The 'unique Namespace subclass' rule keeps mappings unambiguous; a
-    closure that genuinely needs multiple namespaces opts out by writing
-    `_register.py`.
-    """
-    # `Namespace` is a `@runtime_checkable` empty Protocol — `issubclass`
-    # against it is structural and trivially true for every class. Filter by
-    # the nominal MRO instead so only real `class X(Namespace)` declarations
-    # count, not adjacent dataclasses / dataclass discriminator variants.
-    candidates = [
-        cls for cls in vars(pkg).values()
-        if isinstance(cls, type)
-        and Namespace in cls.__mro__
-        and cls is not Namespace
-        and getattr(cls, "__module__", None) == pkg.__name__
-    ]
-    if not candidates:
-        raise TypeError(
-            f"{package}: no Namespace subclass declared in __init__.py and "
-            f"no _register.py provided — nothing to bind"
-        )
-    if len(candidates) > 1:
-        names = sorted(c.__name__ for c in candidates)
-        raise TypeError(
-            f"{package}: multiple Namespace subclasses found in __init__.py "
-            f"({names}); auto-discovery requires exactly one. Add _register.py "
-            f"to bind multiple namespaces explicitly."
-        )
-    stub_cls = candidates[0]
-    impl_mod = importlib.import_module(f"{package}._impl")
-    impl_cls_name = f"{stub_cls.__name__}Impl"
-    impl_cls = getattr(impl_mod, impl_cls_name, None)
-    if impl_cls is None or not isinstance(impl_cls, type):
-        raise TypeError(
-            f"{package}._impl: expected class '{impl_cls_name}' "
-            f"(convention: <StubName>Impl) for auto-discovery; provide "
-            f"_register.py to override the convention"
-        )
-    return Dispatcher().bind_namespace(stub_cls, impl_cls())
+    eps = importlib.metadata.entry_points()
+    # Python 3.10+: SelectableGroups with .select(); earlier: dict.
+    if hasattr(eps, "select"):
+        return list(eps.select(group=CLOSURE_ENTRY_POINT_GROUP))
+    return list(eps.get(CLOSURE_ENTRY_POINT_GROUP, []))  # type: ignore[attr-defined]

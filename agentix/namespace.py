@@ -74,15 +74,17 @@ class Namespace(Protocol):
 def discover_methods(cls: type) -> Iterator[tuple[str, object]]:
     """Yield `(name, function)` for each public ABI method on `cls`.
 
-    Walks the MRO (skipping `Namespace`, `Protocol`, and `object`),
-    filtering:
+    Closure methods are declared `@staticmethod` — the class is a pure
+    namespace, methods carry no instance state. Walks the MRO (skipping
+    `Namespace`, `Protocol`, and `object`), filtering:
+
       * names starting with `_` (private)
       * names listed in `cls.__namespace_excluded__` if defined
-      * non-functions (descriptors, classmethods, properties)
 
-    Functions are returned as they appear in `vars(klass)` — unbound,
-    suitable for `inspect.signature`. Subclass overrides take priority
-    (the MRO walk yields the most-derived definition first).
+    Both `@staticmethod`-decorated functions and plain `def` (legacy)
+    are accepted; the underlying function is returned in both cases.
+    Subclass overrides take priority (the MRO walk yields the
+    most-derived definition first).
     """
     excluded = frozenset(getattr(cls, "__namespace_excluded__", frozenset()))
     seen: set[str] = set()
@@ -95,10 +97,12 @@ def discover_methods(cls: type) -> Iterator[tuple[str, object]]:
                 continue
             if name.startswith("_"):
                 continue
-            if not inspect.isfunction(value):
-                continue
-            seen.add(name)
-            yield name, value
+            if isinstance(value, staticmethod):
+                seen.add(name)
+                yield name, value.__func__
+            elif inspect.isfunction(value):
+                seen.add(name)
+                yield name, value
 
 
 __all__ = ["Namespace", "discover_methods"]
