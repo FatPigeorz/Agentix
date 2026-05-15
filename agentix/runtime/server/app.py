@@ -41,7 +41,9 @@ from agentix.runtime.models import (
     RemoteResponse,
 )
 from agentix.runtime.server.builtins import router as builtins_router
+from agentix.runtime.server.llm_proxy import router as llm_proxy_router
 from agentix.runtime.server.sio import make_sio
+from agentix.runtime.server.trace_bridge import install as install_trace_bridge
 
 logger = logging.getLogger("agentix.runtime")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
@@ -109,6 +111,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="agentix", version=__version__, lifespan=lifespan)
 app.state.registry = registry
 app.include_router(builtins_router)
+app.include_router(llm_proxy_router)
 
 
 # ── Health & inventory ──────────────────────────────────────────
@@ -181,12 +184,7 @@ async def remote_call(request: RemoteRequest) -> RemoteResponse:
 # the Socket.IO server and everything else to FastAPI, so plain HTTP
 # endpoints (`/health`, `/_remote`, …) work unchanged through ASGITransport.
 
-import asyncio as _asyncio  # noqa: E402
-
 import socketio as _socketio  # noqa: E402
-
-import agentix.trace as _trace  # noqa: E402
-from agentix.runtime.models import TraceEvent as _TraceEvent  # noqa: E402
 
 _sio, _ = make_sio(registry)
 _fastapi_app = app  # the FastAPI instance built above
@@ -197,30 +195,8 @@ app.state = _fastapi_app.state  # type: ignore[attr-defined]
 _fastapi_app.state.sio = _sio
 app.sio = _sio  # type: ignore[attr-defined]
 
-
-# Wire the closure-side `agentix.trace.emit(...)` helper to the Socket.IO
-# `trace` room. Emission is best-effort and never blocks the caller — sync
-# logging-style fire-and-forget. The dispatcher pins call_id / source via
-# contextvars, so closure impls just write `trace.emit("kind", {...})`.
-
-def _trace_emitter(
-    kind: str,
-    payload: dict,
-    call_id: str | None,
-    source: str | None,
-) -> None:
-    event = _TraceEvent(
-        kind=kind, payload=payload, timestamp=_trace.now(),
-        call_id=call_id, source=source,
-    )
-    try:
-        loop = _asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    loop.create_task(_sio.emit("trace", event.model_dump(mode="json"), room="traces"))
-
-
-_trace._install_emitter(_trace_emitter)
+# Route closure-side `agentix.trace.emit(...)` into the Socket.IO `trace` room.
+install_trace_bridge(_sio)
 
 
 # ── Entry point (invoked as /mnt/runtime/entry/bin/start) ───────

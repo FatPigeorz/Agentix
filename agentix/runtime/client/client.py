@@ -39,8 +39,27 @@ import httpx
 import socketio
 from pydantic import TypeAdapter
 
-from agentix.dispatch import STREAM_ORIGINS
+from agentix.runtime.events import (
+    BIDI_END,
+    BIDI_END_IN,
+    BIDI_ERROR,
+    BIDI_IN,
+    BIDI_OUT,
+    BIDI_START,
+    CANCEL,
+    LOG,
+    LOGS_SUBSCRIBE,
+    LOGS_UNSUBSCRIBE,
+    STREAM,
+    STREAM_END,
+    STREAM_ERROR,
+    STREAM_ITEM,
+    TRACE,
+    TRACES_SUBSCRIBE,
+    TRACES_UNSUBSCRIBE,
+)
 from agentix.runtime.models import (
+    STREAM_ORIGINS,
     ClosureInfo,
     ExecRequest,
     ExecResponse,
@@ -195,7 +214,7 @@ class RuntimeClient:
         ret_args = get_args(sig.return_annotation)
         item_adapter = TypeAdapter(ret_args[0] if ret_args else Any)
         try:
-            await sio.emit("stream", {
+            await sio.emit(STREAM, {
                 "call_id": call_id,
                 "package": package,
                 "method": method,
@@ -214,7 +233,7 @@ class RuntimeClient:
         finally:
             self._pending.pop(call_id, None)
             with contextlib.suppress(BaseException):
-                await sio.emit("cancel", {"call_id": call_id})
+                await sio.emit(CANCEL, {"call_id": call_id})
 
     async def _remote_bidi(self, fn, sig, *args, **kwargs):
         """Bidi over Socket.IO: client emits `bidi:start`, streams inputs as
@@ -255,7 +274,7 @@ class RuntimeClient:
         q: asyncio.Queue = asyncio.Queue()
         self._pending[call_id] = q
 
-        await sio.emit("bidi:start", {
+        await sio.emit(BIDI_START, {
             "call_id": call_id, "package": package, "method": method,
             "args": [], "kwargs": non_stream_kwargs,
         })
@@ -264,8 +283,8 @@ class RuntimeClient:
             try:
                 async for item in input_iter:
                     encoded = in_adapter.dump_python(item, mode="json")
-                    await sio.emit("bidi:in", {"call_id": call_id, "item": encoded})
-                await sio.emit("bidi:end_in", {"call_id": call_id})
+                    await sio.emit(BIDI_IN, {"call_id": call_id, "item": encoded})
+                await sio.emit(BIDI_END_IN, {"call_id": call_id})
             except Exception:
                 # outer loop will see an error event or close
                 pass
@@ -287,7 +306,7 @@ class RuntimeClient:
                 await sender
             self._pending.pop(call_id, None)
             with contextlib.suppress(BaseException):
-                await sio.emit("cancel", {"call_id": call_id})
+                await sio.emit(CANCEL, {"call_id": call_id})
 
     # ── log subscription ────────────────────────────────────────
 
@@ -305,7 +324,7 @@ class RuntimeClient:
         try:
             if first_sub:
                 payload = {"filter": filter} if filter else {}
-                await sio.emit("logs:subscribe", payload)
+                await sio.emit(LOGS_SUBSCRIBE, payload)
             while True:
                 data = await sub_q.get()
                 yield LogRecord.model_validate(data)
@@ -313,7 +332,7 @@ class RuntimeClient:
             self._log_subscribers.discard(sub_q)
             if not self._log_subscribers:
                 with contextlib.suppress(BaseException):
-                    await sio.emit("logs:unsubscribe", {})
+                    await sio.emit(LOGS_UNSUBSCRIBE, {})
 
     async def traces(
         self,
@@ -334,7 +353,7 @@ class RuntimeClient:
         first_sub = len(self._trace_subscribers) == 1
         try:
             if first_sub:
-                await sio.emit("traces:subscribe", {})
+                await sio.emit(TRACES_SUBSCRIBE, {})
             while True:
                 data = await sub_q.get()
                 if kind is not None and data.get("kind") != kind:
@@ -346,7 +365,7 @@ class RuntimeClient:
             self._trace_subscribers.discard(sub_q)
             if not self._trace_subscribers:
                 with contextlib.suppress(BaseException):
-                    await sio.emit("traces:unsubscribe", {})
+                    await sio.emit(TRACES_UNSUBSCRIBE, {})
 
     # ── Socket.IO connection management ─────────────────────────
 
@@ -365,14 +384,14 @@ class RuntimeClient:
             async def _on_bidi_end(data):   await self._dispatch_event("end", data)
             async def _on_bidi_error(data): await self._dispatch_event("error", data)
 
-            sio.on("stream:item", _on_stream_item)
-            sio.on("stream:end", _on_stream_end)
-            sio.on("stream:error", _on_stream_error)
-            sio.on("bidi:out", _on_bidi_out)
-            sio.on("bidi:end", _on_bidi_end)
-            sio.on("bidi:error", _on_bidi_error)
-            sio.on("log", self._on_log)
-            sio.on("trace", self._on_trace)
+            sio.on(STREAM_ITEM, _on_stream_item)
+            sio.on(STREAM_END, _on_stream_end)
+            sio.on(STREAM_ERROR, _on_stream_error)
+            sio.on(BIDI_OUT, _on_bidi_out)
+            sio.on(BIDI_END, _on_bidi_end)
+            sio.on(BIDI_ERROR, _on_bidi_error)
+            sio.on(LOG, self._on_log)
+            sio.on(TRACE, self._on_trace)
 
             await sio.connect(self._base_url)
             self._sio = sio

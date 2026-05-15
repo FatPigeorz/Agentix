@@ -16,7 +16,6 @@ decorators, no base classes.
 from __future__ import annotations
 
 import asyncio
-import collections.abc as cabc
 import importlib
 import inspect
 import logging
@@ -31,13 +30,12 @@ from pydantic import TypeAdapter, ValidationError
 
 import agentix.trace as trace
 from agentix.models import ClosureManifest
-from agentix.runtime.models import RemoteError, RemoteRequest, RemoteResponse
-
-#: Type origins that indicate a streaming param or return annotation
-#: (`AsyncIterator[T]` / `AsyncGenerator[T, ...]`). Shared between the
-#: server-side bind detection here and the client-side route selection in
-#: `agentix.runtime.client` — single source of truth for what "streams".
-STREAM_ORIGINS: tuple[type, ...] = (cabc.AsyncIterator, cabc.AsyncGenerator)
+from agentix.runtime.models import (
+    STREAM_ORIGINS,
+    RemoteError,
+    RemoteRequest,
+    RemoteResponse,
+)
 
 logger = logging.getLogger("agentix.dispatch")
 

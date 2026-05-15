@@ -23,12 +23,12 @@ Wire (Socket.IO event names + payloads — all JSON):
     "logs:unsubscribe" {}
 
   server → client:
-    "stream:item"     {call_id, value}
-    "stream:end"      {call_id}
-    "stream:error"    {call_id, error: RemoteError}
-    "bidi:out"        {call_id, value}
-    "bidi:end"        {call_id}
-    "bidi:error"      {call_id, error: RemoteError}
+    STREAM_ITEM     {call_id, value}
+    STREAM_END      {call_id}
+    STREAM_ERROR    {call_id, error: RemoteError}
+    BIDI_OUT        {call_id, value}
+    BIDI_END        {call_id}
+    BIDI_ERROR      {call_id, error: RemoteError}
     "log"             {level, name, message, timestamp}
 """
 
@@ -44,6 +44,25 @@ import socketio
 from pydantic import ValidationError
 
 from agentix.dispatch import Registry
+from agentix.runtime.events import (
+    BIDI_END,
+    BIDI_END_IN,
+    BIDI_ERROR,
+    BIDI_IN,
+    BIDI_OUT,
+    BIDI_START,
+    CANCEL,
+    LOG,
+    LOGS_SUBSCRIBE,
+    LOGS_UNSUBSCRIBE,
+    STREAM,
+    STREAM_END,
+    STREAM_ERROR,
+    STREAM_ITEM,
+    TRACES_ROOM,
+    TRACES_SUBSCRIBE,
+    TRACES_UNSUBSCRIBE,
+)
 from agentix.runtime.models import RemoteError, RemoteRequest
 
 logger = logging.getLogger("agentix.runtime.sio")
@@ -98,14 +117,14 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
 
     # ── server-streaming ─────────────────────────────────────────
 
-    @sio.on("stream")
+    @sio.on(STREAM)
     async def on_stream(sid: str, data: dict[str, Any]) -> None:
         sess = sessions.get(sid)
         if sess is None:
             return
         call_id = data.get("call_id")
         if not isinstance(call_id, str):
-            await sio.emit("stream:error", {
+            await sio.emit(STREAM_ERROR, {
                 "call_id": "", "error": {"type": "BadRequest", "message": "missing call_id"},
             }, to=sid)
             return
@@ -118,7 +137,7 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
                     kwargs=data.get("kwargs", {}) or {},
                 )
             except (KeyError, ValidationError) as exc:
-                await sio.emit("stream:error", {
+                await sio.emit(STREAM_ERROR, {
                     "call_id": call_id,
                     "error": RemoteError(type=type(exc).__name__, message=str(exc)).model_dump(),
                 }, to=sid)
@@ -126,20 +145,20 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
             try:
                 dispatcher = await registry.get_or_load(request.package)
             except Exception as exc:
-                await sio.emit("stream:error", {
+                await sio.emit(STREAM_ERROR, {
                     "call_id": call_id,
                     "error": RemoteError(type=type(exc).__name__, message=str(exc)).model_dump(),
                 }, to=sid)
                 return
             if dispatcher is None:
-                await sio.emit("stream:error", {
+                await sio.emit(STREAM_ERROR, {
                     "call_id": call_id,
                     "error": RemoteError(type="PackageNotLoaded",
                                          message=f"closure not loaded: {request.package!r}").model_dump(),
                 }, to=sid)
                 return
             if dispatcher.is_bidi(request.method):
-                await sio.emit("stream:error", {
+                await sio.emit(STREAM_ERROR, {
                     "call_id": call_id,
                     "error": RemoteError(type="MethodIsBidi",
                                          message=f"{request.method} is bidirectional; use bidi:start").model_dump(),
@@ -147,24 +166,24 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
                 return
             async for event in dispatcher.dispatch_stream(request):
                 if "item" in event:
-                    await sio.emit("stream:item", {"call_id": call_id, "value": event["item"]}, to=sid)
+                    await sio.emit(STREAM_ITEM, {"call_id": call_id, "value": event["item"]}, to=sid)
                 elif "end" in event:
-                    await sio.emit("stream:end", {"call_id": call_id}, to=sid)
+                    await sio.emit(STREAM_END, {"call_id": call_id}, to=sid)
                 elif "error" in event:
-                    await sio.emit("stream:error", {"call_id": call_id, "error": event["error"]}, to=sid)
+                    await sio.emit(STREAM_ERROR, {"call_id": call_id, "error": event["error"]}, to=sid)
 
         await _spawn_call(sess, call_id, _drive())
 
     # ── bidi ─────────────────────────────────────────────────────
 
-    @sio.on("bidi:start")
+    @sio.on(BIDI_START)
     async def on_bidi_start(sid: str, data: dict[str, Any]) -> None:
         sess = sessions.get(sid)
         if sess is None:
             return
         call_id = data.get("call_id")
         if not isinstance(call_id, str):
-            await sio.emit("bidi:error", {
+            await sio.emit(BIDI_ERROR, {
                 "call_id": "", "error": {"type": "BadRequest", "message": "missing call_id"},
             }, to=sid)
             return
@@ -176,7 +195,7 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
                 kwargs=data.get("kwargs", {}) or {},
             )
         except (KeyError, ValidationError) as exc:
-            await sio.emit("bidi:error", {
+            await sio.emit(BIDI_ERROR, {
                 "call_id": call_id,
                 "error": RemoteError(type=type(exc).__name__, message=str(exc)).model_dump(),
             }, to=sid)
@@ -197,20 +216,20 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
             try:
                 dispatcher = await registry.get_or_load(request.package)
             except Exception as exc:
-                await sio.emit("bidi:error", {
+                await sio.emit(BIDI_ERROR, {
                     "call_id": call_id,
                     "error": RemoteError(type=type(exc).__name__, message=str(exc)).model_dump(),
                 }, to=sid)
                 return
             if dispatcher is None:
-                await sio.emit("bidi:error", {
+                await sio.emit(BIDI_ERROR, {
                     "call_id": call_id,
                     "error": RemoteError(type="PackageNotLoaded",
                                          message=f"closure not loaded: {request.package!r}").model_dump(),
                 }, to=sid)
                 return
             if not dispatcher.is_bidi(request.method):
-                await sio.emit("bidi:error", {
+                await sio.emit(BIDI_ERROR, {
                     "call_id": call_id,
                     "error": RemoteError(type="NotABidiMethod",
                                          message=f"{request.method} is not bidirectional").model_dump(),
@@ -227,18 +246,18 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
 
             async for event in dispatcher.dispatch_bidi(request, _input_iter()):
                 if "item" in event:
-                    await sio.emit("bidi:out", {"call_id": call_id, "value": event["item"]}, to=sid)
+                    await sio.emit(BIDI_OUT, {"call_id": call_id, "value": event["item"]}, to=sid)
                 elif "end" in event:
-                    await sio.emit("bidi:end", {"call_id": call_id}, to=sid)
+                    await sio.emit(BIDI_END, {"call_id": call_id}, to=sid)
                 elif "error" in event:
-                    await sio.emit("bidi:error", {"call_id": call_id, "error": event["error"]}, to=sid)
+                    await sio.emit(BIDI_ERROR, {"call_id": call_id, "error": event["error"]}, to=sid)
 
         # Pre-create the state so input handlers can push to the queue even if
         # they arrive before _drive starts iterating.
         call_state = _CallState(task=None, in_queue=in_queue)  # type: ignore[arg-type]
         await _spawn_call(sess, call_id, _drive(), state=call_state)
 
-    @sio.on("bidi:in")
+    @sio.on(BIDI_IN)
     async def on_bidi_in(sid: str, data: dict[str, Any]) -> None:
         sess = sessions.get(sid)
         if sess is None:
@@ -252,7 +271,7 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
         try:
             item = adapter.validate_python(raw) if adapter is not None else raw
         except ValidationError as exc:
-            await sio.emit("bidi:error", {
+            await sio.emit(BIDI_ERROR, {
                 "call_id": call_id,
                 "error": RemoteError(type="InputValidation", message=str(exc)).model_dump(),
             }, to=sid)
@@ -262,7 +281,7 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
             return
         await call.in_queue.put(item)
 
-    @sio.on("bidi:end_in")
+    @sio.on(BIDI_END_IN)
     async def on_bidi_end_in(sid: str, data: dict[str, Any]) -> None:
         sess = sessions.get(sid)
         if sess is None:
@@ -277,7 +296,7 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
 
     # ── cancel ───────────────────────────────────────────────────
 
-    @sio.on("cancel")
+    @sio.on(CANCEL)
     async def on_cancel(sid: str, data: dict[str, Any]) -> None:
         sess = sessions.get(sid)
         if sess is None:
@@ -289,7 +308,7 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
 
     # ── logs ─────────────────────────────────────────────────────
 
-    @sio.on("logs:subscribe")
+    @sio.on(LOGS_SUBSCRIBE)
     async def on_logs_subscribe(sid: str, data: dict[str, Any]) -> None:
         sess = sessions.get(sid)
         if sess is None:
@@ -301,7 +320,7 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
         logging.getLogger(_ROOT_LOG_NAME).addHandler(handler)
         sess.log_handler = handler
 
-    @sio.on("logs:unsubscribe")
+    @sio.on(LOGS_UNSUBSCRIBE)
     async def on_logs_unsubscribe(sid: str, _data: dict[str, Any] | None = None) -> None:
         sess = sessions.get(sid)
         if sess is None:
@@ -315,13 +334,13 @@ def make_sio(registry: Registry) -> tuple[socketio.AsyncServer, socketio.ASGIApp
     # Trace events come from closures via `agentix.trace.emit(...)`. The
     # runtime broadcasts each event to clients in the "traces" room.
 
-    @sio.on("traces:subscribe")
+    @sio.on(TRACES_SUBSCRIBE)
     async def on_traces_subscribe(sid: str, _data: dict[str, Any] | None = None) -> None:
-        await sio.enter_room(sid, "traces")
+        await sio.enter_room(sid, TRACES_ROOM)
 
-    @sio.on("traces:unsubscribe")
+    @sio.on(TRACES_UNSUBSCRIBE)
     async def on_traces_unsubscribe(sid: str, _data: dict[str, Any] | None = None) -> None:
-        await sio.leave_room(sid, "traces")
+        await sio.leave_room(sid, TRACES_ROOM)
 
     # ── helpers (closure over sio + sessions) ────────────────────
 
@@ -371,11 +390,10 @@ def _make_log_forwarder(sio: socketio.AsyncServer, sid: str, prefix: str) -> log
             }
             # `emit` must be schedulable without awaiting — logging is sync.
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
             except RuntimeError:
-                return
-            if loop.is_running():
-                loop.create_task(sio.emit("log", payload, to=sid))
+                return  # no loop on this thread → drop
+            loop.create_task(sio.emit(LOG, payload, to=sid))
 
     h = _Forwarder()
     h.setLevel(logging.DEBUG)  # forward everything; client can filter

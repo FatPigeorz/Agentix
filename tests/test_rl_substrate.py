@@ -143,7 +143,7 @@ async def test_llm_proxy_forwards_and_traces(runtime_module, live_server, monkey
     from starlette.responses import JSONResponse
     from starlette.routing import Route
 
-    from agentix.runtime.server import builtins as _builtins
+    from agentix.runtime.server import llm_proxy as _llm_proxy_mod
 
     async def _fake_messages(request):
         body = await request.body()
@@ -175,7 +175,7 @@ async def test_llm_proxy_forwards_and_traces(runtime_module, live_server, monkey
             except (httpx.ConnectError, httpx.ReadError):
                 await asyncio.sleep(0.05)
 
-    monkeypatch.setitem(_builtins._LLM_UPSTREAMS, "anthropic", fake_url)
+    monkeypatch.setitem(_llm_proxy_mod._LLM_UPSTREAMS, "anthropic", fake_url)
 
     try:
         async with RuntimeClient(base_url) as c:

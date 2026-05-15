@@ -15,11 +15,9 @@ import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-import httpx
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
-import agentix.trace as _trace
 from agentix.runtime.models import ExecRequest, ExecResponse, UploadResponse
 
 UPLOAD_ROOT = Path(os.environ.get("AGENTIX_UPLOAD_ROOT", "/workspace")).resolve()
@@ -245,13 +243,17 @@ async def upload(file: UploadFile = File(...), path: str = Form(...)) -> UploadR
 @router.get("/download")
 async def download(path: str):
     p = _resolve_within(path)
-    if not p.exists():
-        raise HTTPException(status_code=404, detail=f"Not found: {path}")
-    if p.is_dir():
-        raise HTTPException(status_code=400, detail=f"Is a directory: {path}")
+    # Open straight away — race-free vs an existence check. IsADirectoryError
+    # is the FS-level signal for /download <dir>, so we map it explicitly.
+    try:
+        f = open(p, "rb")
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Not found: {path}") from exc
+    except IsADirectoryError as exc:
+        raise HTTPException(status_code=400, detail=f"Is a directory: {path}") from exc
 
     def _iter():
-        with open(p, "rb") as f:
+        with f:
             while True:
                 chunk = f.read(64 * 1024)
                 if not chunk:
@@ -261,93 +263,3 @@ async def download(path: str):
     return StreamingResponse(_iter(), media_type="application/octet-stream")
 
 
-# ── LLM proxy ────────────────────────────────────────────────────
-#
-# Closure SDKs are pointed at `http://127.0.0.1:8000/_llm/<provider>/...`
-# instead of the provider's real base URL. The runtime forwards every
-# request to the upstream and emits two trace events per call:
-#
-#   {"kind": "llm_request",  "payload": {provider, method, path, body}}
-#   {"kind": "llm_response", "payload": {provider, status, body}}
-#
-# For streaming responses (SSE) the response body in the trace is the full
-# concatenated payload, recorded after the stream finishes. Headers from
-# the caller are forwarded verbatim except hop-by-hop hops + `host` /
-# `content-length`. Auth lives in those headers — the caller's API key
-# never enters this code, just passes through.
-
-_LLM_UPSTREAMS: dict[str, str] = {
-    "anthropic": "https://api.anthropic.com",
-    "openai":    "https://api.openai.com",
-}
-
-_LLM_PROXY_BODY_LIMIT = int(os.environ.get("AGENTIX_LLM_PROXY_TRACE_LIMIT", str(64 * 1024)))
-
-
-def _trace_body(raw: bytes) -> object:
-    """Decode a request/response body for inclusion in a trace event. JSON
-    is preserved as a dict; everything else becomes a (truncated) string."""
-    try:
-        return json.loads(raw)
-    except Exception:
-        return raw[:_LLM_PROXY_BODY_LIMIT].decode(errors="replace")
-
-
-@router.api_route(
-    "/_llm/{provider}/{path:path}",
-    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD"],
-)
-async def llm_proxy(provider: str, path: str, request: Request) -> Response:
-    upstream = _LLM_UPSTREAMS.get(provider)
-    if upstream is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"unknown LLM provider {provider!r}; known: {sorted(_LLM_UPSTREAMS)}",
-        )
-    body = await request.body()
-    headers = {
-        k: v for k, v in request.headers.items()
-        if k.lower() not in {"host", "content-length"}
-    }
-    url = f"{upstream}/{path}"
-
-    _trace.emit("llm_request", {
-        "provider": provider,
-        "method": request.method,
-        "path": "/" + path,
-        "body": _trace_body(body) if body else None,
-    })
-
-    client = httpx.AsyncClient(timeout=None)
-    upstream_req = client.build_request(
-        request.method, url,
-        headers=headers, content=body, params=request.query_params,
-    )
-    upstream_resp = await client.send(upstream_req, stream=True)
-    out_headers = {
-        k: v for k, v in upstream_resp.headers.items()
-        if k.lower() not in {"transfer-encoding", "content-encoding", "content-length"}
-    }
-
-    async def _stream_and_trace():
-        collected = bytearray()
-        try:
-            async for chunk in upstream_resp.aiter_raw():
-                if len(collected) < _LLM_PROXY_BODY_LIMIT:
-                    collected.extend(chunk[:_LLM_PROXY_BODY_LIMIT - len(collected)])
-                yield chunk
-        finally:
-            await upstream_resp.aclose()
-            await client.aclose()
-            _trace.emit("llm_response", {
-                "provider": provider,
-                "status": upstream_resp.status_code,
-                "body": _trace_body(bytes(collected)),
-            })
-
-    return StreamingResponse(
-        _stream_and_trace(),
-        status_code=upstream_resp.status_code,
-        headers=out_headers,
-        media_type=upstream_resp.headers.get("content-type"),
-    )
