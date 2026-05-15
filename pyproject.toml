@@ -32,6 +32,15 @@ agentix = "agentix.cli:main"
 start = "agentix.runtime.server:main"
 agentix-server = "agentix.runtime.server:main"
 
+# Builtin deployments. Downstream backends declare additional entries
+# under the same group (`[project.entry-points."agentix.deployment"]`
+# in their pyproject.toml) and `pip install` makes them available to
+# `agentix deploy <name>` with zero framework changes.
+[project.entry-points."agentix.deployment"]
+local = "agentix.deployment.docker:DockerDeployment"
+daytona = "agentix.deployment.daytona:DaytonaDeployment"
+e2b = "agentix.deployment.e2b:E2BDeployment"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

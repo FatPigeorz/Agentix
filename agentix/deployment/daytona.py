@@ -1,27 +1,29 @@
 """Daytona deployment backend — stub.
 
 Daytona (https://www.daytona.io/) runs managed sandboxes from OCI
-images. The integration shape will look like:
+images. The integration shape is captured below; the actual REST
+client is the next item on the deploy roadmap. The class exists so
+`agentix deploy daytona` fails with a clear error and so callers
+can write code against the real Protocol contract in advance.
 
-    DaytonaDeployment(api_key=..., workspace_image=...).create(config)
-
-That's deferred. The class exists today so `agentix deploy daytona`
-can fail with a clear error and so callers can write code against the
-real interface in advance.
+API key comes from `DAYTONA_API_KEY` env. No constructor arguments —
+plugin loaders instantiate this with `cls()` uniformly.
 """
 
 from __future__ import annotations
 
-from agentix.deployment.base import Deployment, Sandbox
+import os
+
+from agentix.deployment.base import Sandbox
 from agentix.idents import SandboxId
 from agentix.models import SandboxConfig, SandboxInfo
 
 
-class DaytonaDeployment(Deployment):
+class DaytonaDeployment:
     """Sandbox CRUD via Daytona (pending integration)."""
 
-    def __init__(self, api_key: str | None = None) -> None:
-        self._api_key = api_key
+    def __init__(self) -> None:
+        self._api_key = os.environ.get("DAYTONA_API_KEY")
 
     async def create(self, config: SandboxConfig) -> Sandbox:  # noqa: ARG002
         raise NotImplementedError(

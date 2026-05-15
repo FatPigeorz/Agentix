@@ -1,34 +1,30 @@
 """E2B deployment backend — stub.
 
 E2B (https://e2b.dev/) hosts ephemeral sandboxes seeded by their own
-"template" image format rather than arbitrary OCI images. The
-integration shape will look like:
+"template" image format. A bundle image needs to be published as an
+E2B template (`e2b template build`) before it can be deployed here.
+The class exists so `agentix deploy e2b` fails with a clear error
+and so callers can write code against the real Protocol contract.
 
-    E2BDeployment(api_key=..., template_id=...).create(config)
-
-A bundle image therefore needs to be published as an E2B template
-first (`e2b template build`) before it can be deployed here. The
-class exists today so `agentix deploy e2b` can fail with a clear
-error and so callers can write code against the real interface.
+Config comes from env: `E2B_API_KEY` and `E2B_TEMPLATE_ID`. No
+constructor arguments — plugin loaders instantiate this with `cls()`.
 """
 
 from __future__ import annotations
 
-from agentix.deployment.base import Deployment, Sandbox
+import os
+
+from agentix.deployment.base import Sandbox
 from agentix.idents import SandboxId
 from agentix.models import SandboxConfig, SandboxInfo
 
 
-class E2BDeployment(Deployment):
+class E2BDeployment:
     """Sandbox CRUD via E2B (pending integration)."""
 
-    def __init__(
-        self,
-        api_key: str | None = None,
-        template_id: str | None = None,
-    ) -> None:
-        self._api_key = api_key
-        self._template_id = template_id
+    def __init__(self) -> None:
+        self._api_key = os.environ.get("E2B_API_KEY")
+        self._template_id = os.environ.get("E2B_TEMPLATE_ID")
 
     async def create(self, config: SandboxConfig) -> Sandbox:  # noqa: ARG002
         raise NotImplementedError(

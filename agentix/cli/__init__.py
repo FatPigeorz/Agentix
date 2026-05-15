@@ -32,8 +32,10 @@ _COMMANDS: dict[str, tuple[str, callable]] = {
                 lambda: _import("agentix.cli.install").main),
     "deploy":  ("deploy a bundle to a deployment backend",
                 lambda: _import("agentix.cli.deploy").main),
-    "check":   ("stub ↔ impl signature drift",
+    "check":   ("list installed closures + smoke-import each",
                 lambda: _import("agentix.cli.check").main),
+    "plugins": ("list installed plugins across every extension axis",
+                lambda: _import("agentix.cli.plugins").main),
 }
 
 

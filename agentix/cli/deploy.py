@@ -26,7 +26,7 @@ import signal
 import sys
 from collections.abc import Sequence
 
-from agentix.deployment.base import Deployment
+from agentix.deployment.base import Deployment, load_deployment, session
 from agentix.models import SandboxConfig
 
 logger = logging.getLogger("agentix.cli.deploy")
@@ -36,24 +36,21 @@ DEFAULT_BASE_IMAGE = "ubuntu:24.04"
 DEFAULT_RUNTIME_IMAGE = "agentix/runtime:latest"
 
 
-def _make_deployment(backend: str, args: argparse.Namespace) -> Deployment:
-    """Pick the right deployment class. Lazy import keeps `--help` fast and
-    avoids importing the docker/daytona/e2b SDKs unless the user actually
-    targets that backend."""
-    if backend == "local":
-        from agentix.deployment.docker import DockerDeployment
-        return DockerDeployment()
-    if backend == "daytona":
-        from agentix.deployment.daytona import DaytonaDeployment
-        return DaytonaDeployment(api_key=args.api_key)
-    if backend == "e2b":
-        from agentix.deployment.e2b import E2BDeployment
-        return E2BDeployment(api_key=args.api_key, template_id=args.template_id)
-    raise SystemExit(f"unknown backend: {backend!r}")
+def _make_deployment(backend: str) -> Deployment:
+    """Look up the deployment class via the `agentix.deployment` entry-point
+    registry and instantiate it with no arguments. Backend-specific
+    configuration (API keys, regions, etc.) is read from environment
+    variables inside each backend's `__init__`.
+    """
+    try:
+        cls = load_deployment(backend)
+    except KeyError as exc:
+        raise SystemExit(str(exc)) from exc
+    return cls()
 
 
 async def _run_async(backend: str, args: argparse.Namespace) -> int:
-    deployment = _make_deployment(backend, args)
+    deployment = _make_deployment(backend)
     config = SandboxConfig(
         image=args.base,
         runtime=args.runtime,
@@ -70,7 +67,7 @@ async def _run_async(backend: str, args: argparse.Namespace) -> int:
 
     # Foreground mode: stay alive until SIGINT, then tear down.
     print(f"creating sandbox from {args.image}…", file=sys.stderr)
-    async with deployment.session(config) as sandbox:
+    async with session(deployment, config) as sandbox:
         print(f"sandbox alive: {sandbox.sandbox_id}")
         print(f"  runtime_url: {sandbox.runtime_url}")
         print("  Ctrl-C to stop.")
@@ -94,8 +91,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "backend",
-        choices=("local", "daytona", "e2b"),
-        help="deployment backend",
+        help="deployment backend name (any registered `agentix.deployment` "
+             "entry point; run `agentix plugins` to list)",
     )
     parser.add_argument(
         "--image", required=True,
@@ -112,14 +109,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--detach", action="store_true",
         help="exit after create; sandbox keeps running",
-    )
-    parser.add_argument(
-        "--api-key", default=None,
-        help="API key for managed backends (daytona/e2b)",
-    )
-    parser.add_argument(
-        "--template-id", default=None,
-        help="E2B template id (e2b backend only)",
     )
     args = parser.parse_args(argv)
 
