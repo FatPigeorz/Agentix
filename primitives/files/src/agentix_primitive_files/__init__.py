@@ -1,23 +1,19 @@
 """Files primitive — sandbox file upload / download as an Agentix closure.
 
 Stub-only module. Callers import the typed `Files` Namespace; the impl
-lives in `_impl.py` and runs only inside the sandbox. Stub and impl
-are independent classes, composed by `_register.py`.
+lives in `_impl.py` and runs only inside the sandbox. The framework
+composes stub + impl automatically.
 
 Usage:
 
     from agentix import RuntimeClient
-    from agentix_closures import files
+    from agentix_primitive_files import Files
 
     async with RuntimeClient(sandbox.runtime_url) as c:
-        r = await c.remote(
-            files.Files.upload,
-            path="/workspace/input.txt",
-            content=b"hello",
-        )
+        r = await c.remote(Files.upload, path="/workspace/input.txt", content=b"hello")
         print(r.size)
 
-        data = await c.remote(files.Files.download, path="/workspace/output.txt")
+        data = await c.remote(Files.download, path="/workspace/output.txt")
 
 Files are encoded as pydantic `bytes` (base64 in the JSON wire form).
 Suitable for kB–MB sized files; very large blobs should ship via a

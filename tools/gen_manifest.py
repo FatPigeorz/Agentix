@@ -32,10 +32,12 @@ AGENTIX_CLOSURE_ABI = 1
 
 
 def _derive_package(pyproject: dict) -> str:
-    """Pull the import path from `[tool.hatch.build.targets.wheel] packages`.
+    """Pull the Python import path from `[tool.hatch.build.targets.wheel] packages`.
 
-    Convention: exactly one package, formatted `agentix_closures/<name>`.
-    Returned as the dotted import form, e.g. `agentix_closures.bash`.
+    Hatchling's `packages` entries are filesystem paths *in the source*,
+    e.g. `src/agentix_primitive_bash`. The wheel layout strips the leading
+    `src/` (hatchling default) so the installed import path is just the
+    package directory's basename joined by dots — `agentix_primitive_bash`.
     """
     try:
         packages = pyproject["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"]
@@ -47,13 +49,16 @@ def _derive_package(pyproject: dict) -> str:
         raise SystemExit(
             f"pyproject.toml: expected exactly one wheel package, got {packages!r}"
         )
-    pkg_path = packages[0].replace("\\", "/").strip("/").replace("/", ".")
-    if not pkg_path.startswith("agentix_closures."):
+    raw = packages[0].replace("\\", "/").strip("/")
+    parts = raw.split("/")
+    # Strip the conventional `src/` prefix that hatchling drops at install time.
+    if parts and parts[0] == "src":
+        parts = parts[1:]
+    if not parts:
         raise SystemExit(
-            f"pyproject.toml: wheel package {pkg_path!r} must live under "
-            f"agentix_closures/<name>/"
+            f"pyproject.toml: wheel package {raw!r} is empty after src/ stripping"
         )
-    return pkg_path
+    return ".".join(parts)
 
 
 def generate(pyproject_path: Path) -> dict[str, object]:

@@ -44,6 +44,12 @@ TEMPLATE_DIR = REPO_ROOT / "primitives" / "_template"
 GEN_MANIFEST = REPO_ROOT / "tools" / "gen_manifest.py"
 
 
+_SOURCE_SKIP = {
+    "__pycache__", ".venv", "build", "dist", ".git",
+    ".pytest_cache", ".ruff_cache", ".mypy_cache",
+}
+
+
 def _stage_bundle(
     bundle_name: str,
     bundle_version: str,
@@ -58,9 +64,9 @@ def _stage_bundle(
       ├── gen_manifest.py                  # copied from tools/
       ├── default.nix                      # copied from primitives/_template/
       ├── bundle.json                      # baked into the final image
-      └── <short>/                         # per-closure staging
+      └── <short>/                         # per-closure staging (the whole project)
           ├── pyproject.toml
-          └── agentix_closures/<name>/
+          └── src/<pkg>/...                # or whatever the closure ships
     """
     # Per-closure source staging (path kind only at this stage).
     for spec in specs:
@@ -76,8 +82,14 @@ def _stage_bundle(
         assert spec.path is not None
         sub = build_dir / spec.short
         sub.mkdir()
-        shutil.copytree(spec.path / "agentix_closures", sub / "agentix_closures")
-        shutil.copy2(spec.path / "pyproject.toml", sub / "pyproject.toml")
+        for item in spec.path.iterdir():
+            if item.name in _SOURCE_SKIP or item.name.endswith(".egg-info"):
+                continue
+            dest = sub / item.name
+            if item.is_dir():
+                shutil.copytree(item, dest, ignore=shutil.ignore_patterns(*_SOURCE_SKIP))
+            else:
+                shutil.copy2(item, dest)
 
     # Shared build infra — same files agentix-build uses for single closures.
     shutil.copy2(TEMPLATE_DIR / "default.nix", build_dir / "default.nix")

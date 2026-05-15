@@ -450,8 +450,8 @@ class Dispatcher:
 def _source_for(impl: Callable[..., Any]) -> PackageName | None:
     """Derive a closure package path from an impl function for trace events.
 
-    Closure impls live at `agentix_closures.<name>._impl`; strip the `._impl`
-    so the trace source reads as the public package the caller imported.
+    Closure impls live at `<package>._impl`; strip the `._impl` suffix so
+    the trace source reads as the public package the caller imported.
     """
     mod = getattr(impl, "__module__", None)
     if mod is None:
@@ -487,8 +487,9 @@ class Registry:
     boot cheap and isolates per-closure import failures so they surface
     on call rather than blocking startup.
 
-    The closure's Python import path (e.g. 'agentix_closures.claude_code')
-    is the routing key — there are no caller-chosen namespaces.
+    The closure's Python import path (whatever its `pyproject.toml` ships,
+    e.g. 'agentix_agent_claude_code') is the routing key — there are no
+    caller-chosen namespaces.
     """
 
     def __init__(self) -> None:

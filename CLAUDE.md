@@ -33,29 +33,32 @@ Every closure image satisfies exactly:
 - `VOLUME /nix` — required by the docker deployment's volume-init-from-image populate step
 - `/nix/store/<hash>-*/` — content-addressed Nix deps (native binaries, libs, the closure's Python package wheel content)
 - `/nix/entry/python/<package-tree>/` — the closure's Python package. The runtime adds this to `sys.path` and imports the package named in the manifest.
-- `/nix/entry/manifest.json` — `ClosureManifest` JSON with `abi == AGENTIX_CLOSURE_ABI` and `package = "agentix_closures.<name>"`. **Generated at build time** from the closure's `__init__.py` metadata (`__version__` + module docstring) by `tools/gen_manifest.py`; closure authors don't write this file.
+- `/nix/entry/manifest.json` — `ClosureManifest` JSON with `abi == AGENTIX_CLOSURE_ABI` and `package` set to the closure's Python import path (whatever the closure's `pyproject.toml` ships, e.g. `agentix_primitive_bash`). **Generated at build time** from `pyproject.toml` by `tools/gen_manifest.py`; closure authors don't write this file.
 - Optional: `/nix/entry/bin/...` — native binaries the closure's impl shells out to (claude, git, …). `/exec paths_from=[<package>]` exposes them on PATH.
 
 ### Closure source layout
 
-A closure's source directory is the minimum-viable layout — three files:
+A closure is a **normal Python project** (the shape `uv init --lib` produces). No framework-specific directory naming, no hidden conventions beyond what hatchling already knows:
 
 ```
 primitives/<name>/
 ├── pyproject.toml                # all metadata: name, version, description
-└── agentix_closures/<name>/
+└── src/<package_name>/           # whatever you named your Python package
     ├── __init__.py               # stub class: `class Foo(Namespace)`
     └── _impl.py                  # impl class: `class FooImpl`
 ```
 
-- **`pyproject.toml`** is the single source of metadata truth. `name` follows the `agentix-<kind>-<short>` convention (e.g. `agentix-primitive-bash`); `version` and `description` flow into the generated manifest. Nothing else needs to know the name or version.
-- **`__init__.py`** is what callers import. Stub methods have `...` bodies — the signature is the contract; there is no body to run on the caller side. No metadata (`__version__` / `__image__`) goes here; the framework derives both from `pyproject.toml` via `importlib.metadata`.
+- **`pyproject.toml`** is the single source of truth. `[project] name` is the distribution name (PyPI-style: `agentix-primitive-bash`); `version` and `description` flow into the manifest. `[tool.hatch.build.targets.wheel] packages` points at the Python package — usually `src/<package_name>`.
+- **The Python package** can be named anything. The runtime keys on whatever import path `pyproject.toml` ships. By convention, framework-published closures use the distribution-name-with-dashes-as-underscores form (`agentix_primitive_bash`), but a user closure can be `my_cool_agent` — the framework discovers it via `pyproject.toml`.
+- **`__init__.py`** is what callers import. Stub methods have `...` bodies — the signature is the contract; the body never runs caller-side.
 - **`_impl.py`** has the real bodies on an independent class. Composition over inheritance: `FooImpl` does NOT subclass `Foo`.
 
 Optional escape hatches:
 
-- **`_register.py`** — declare imperative binding when the convention (one `Namespace` subclass paired with `<Name>Impl`) isn't enough. Rare.
-- **`manifest.json`** — ship a pre-built manifest only if your closure intentionally diverges from what `pyproject.toml` would produce.
+- **`_register.py`** — imperative binding for closures that have multiple namespaces or need custom wiring. Rare.
+- **`manifest.json`** — ship a pre-built manifest only when the closure intentionally diverges from what `pyproject.toml` would produce.
+
+`pip install ./primitives/bash` works as-is. `pytest`, `pyright`, `ruff`, `uv build` — every standard Python tool works against the closure's source dir without further configuration. Agentix doesn't impose layout above what hatchling already needs.
 
 Build infrastructure is shared, not per-closure:
 
@@ -102,7 +105,7 @@ Foreground by default: prints `runtime_url`, holds the sandbox alive until Ctrl-
     entry/manifest.json
   c<digest>/                     — closure image's /nix slice (dir name is internal)
     store/<hash>-*/
-    entry/python/agentix_closures/<name>/...
+    entry/python/<package>/...   — closure's Python package (whatever pyproject named it)
     entry/bin/<cli>              — optional native binaries
     entry/manifest.json
 ```
@@ -135,7 +138,7 @@ Two transports, used per call shape:
 
 ```
 POST /_remote
-  { "package": "agentix_closures.claude_code",
+  { "package": "agentix_agent_claude_code",
     "method":  "run",
     "args":    [],
     "kwargs":  { "instruction": "fix the bug" } }
@@ -171,24 +174,24 @@ Runtime built-ins (`/exec`, `/upload`, `/download`, `/health`, `/closures`) live
 
 ```python
 from agentix import RuntimeClient
-from agentix_closures import claude_code
+from agentix_agent_claude_code import ClaudeCode
 
 async with RuntimeClient(sandbox.runtime_url) as c:
     result = await c.remote(
-        claude_code.run,
+        ClaudeCode.run,
         instruction="fix the bug",
         workdir="/workspace",
     )
-    # `result: RunResult` — IDE / mypy infer from claude_code.run's return type
+    # `result: RunResult` — IDE / pyright infer from ClaudeCode.run's return type
 ```
 
 `RuntimeClient.remote(fn, *args, **kwargs)` reads `fn.__module__` (routing key) + `fn.__name__` (method), serialises via pydantic `TypeAdapter` driven by `inspect.signature(fn)`, decodes the response into `fn`'s return type.
 
 ### PATH policy for the `bash` primitive
 
-Shell exec is the `bash` primitive closure (`primitives/bash/`), not a runtime built-in. Invoke via `c.remote(bash.run, command=...)`.
+Shell exec is the `bash` primitive closure (`primitives/bash/`), not a runtime built-in. Invoke via `c.remote(Bash.run, command=...)`.
 
-User subprocess default `PATH=/usr/local/bin:/usr/bin:/bin` (task image's). Nix env vars (`LD_LIBRARY_PATH`, `NIX_*`, `PYTHONPATH`, etc.) scrubbed to avoid ABI clash. `paths_from=["agentix_closures.<name>"]` prepends that closure's `entry/bin` to PATH.
+User subprocess default `PATH=/usr/local/bin:/usr/bin:/bin` (task image's). Nix env vars (`LD_LIBRARY_PATH`, `NIX_*`, `PYTHONPATH`, etc.) scrubbed to avoid ABI clash. `paths_from=["<package>"]` prepends that closure's `entry/bin` to PATH.
 
 ### What Nix buys us
 

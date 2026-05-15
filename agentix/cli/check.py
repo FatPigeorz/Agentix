@@ -45,7 +45,7 @@ from gen_manifest import generate as _gen_manifest  # noqa: E402
 
 @dataclass
 class Mismatch:
-    closure: str           # closure package, e.g. "agentix_closures.bash"
+    closure: str           # closure package, e.g. "agentix_primitive_bash"
     method: str            # bound method name
     field: str             # what differs: "param.<name>", "return", "kind"
     stub: str              # stub-side rendering
@@ -62,10 +62,18 @@ class Mismatch:
 def _iter_closure_dirs(roots: Iterable[Path]) -> Iterator[Path]:
     """Yield closure directories under each root.
 
-    A closure directory exposes `agentix_closures/<name>/__init__.py`.
+    A closure directory has a `pyproject.toml` and a Python package
+    that exposes a `Namespace` subclass — by convention either
+    `src/<pkg>/__init__.py` (uv init --lib form) or `<pkg>/__init__.py`
+    at the closure root.
     """
     def _has_closure(d: Path) -> bool:
-        return any(d.glob("agentix_closures/*/__init__.py"))
+        if not (d / "pyproject.toml").is_file():
+            return False
+        return (
+            any(d.glob("src/*/__init__.py"))
+            or any(d.glob("*/__init__.py"))
+        )
 
     for r in roots:
         if _has_closure(r):
@@ -92,17 +100,24 @@ def _load_manifest(closure_dir: Path) -> ClosureManifest:
 def _load_dispatcher(closure_dir: Path, manifest: ClosureManifest):
     """Make the closure importable, then build its dispatcher.
 
-    Delegates to `agentix.dispatch._import_and_register`, which handles
-    both shapes:
-      * explicit `_register.py` (escape hatch)
-      * convention-based auto-discovery from `__init__.py` + `_impl.py`
+    The closure's Python package lives at one of a few conventional
+    spots — the source tree's `src/<pkg>/` (uv init --lib), a flat
+    `<pkg>/` at the closure root, or the deployed image's
+    `entry/python/<pkg>/`. We try each; the first that contains the
+    declared package wins and goes on `sys.path`.
+
+    Once the package is importable, `_import_and_register` handles
+    explicit `_register.py` and convention-based auto-discovery.
     """
+    package_subpath = Path(*manifest.package.split("."))
+    candidates = [
+        closure_dir / "src",
+        closure_dir,
+        closure_dir / "entry" / "python",
+    ]
     py_root = closure_dir
-    # Two layouts: source tree's `agentix_closures/<name>/` directly, or the
-    # docker image's `entry/python/agentix_closures/<name>/`. Try both.
-    candidates = [closure_dir, closure_dir / "entry" / "python"]
     for cand in candidates:
-        if (cand / Path(*manifest.package.split("."))).is_dir():
+        if (cand / package_subpath / "__init__.py").is_file():
             py_root = cand
             break
     py_str = str(py_root)

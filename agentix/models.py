@@ -38,7 +38,10 @@ class ClosureManifest(BaseModel):
     name: str
     version: str
     package: PackageName = Field(
-        description="Python import path of the closure package, e.g. 'agentix_closures.claude_code'."
+        description=(
+            "Python import path of the closure package, whatever its "
+            "pyproject.toml ships (e.g. 'agentix_primitive_bash')."
+        ),
     )
     description: str | None = None
 
@@ -81,12 +84,12 @@ class SandboxConfig(BaseModel):
           * A raw string (passed through).
           * An object exposing a string `__image__` attribute (typically a
             closure's imported Python package — the override path).
-          * A `types.ModuleType` shaped like `agentix_closures.<name>`. We
-            derive the image from `importlib.metadata` using the convention
-            `agentix-primitive-<name> → agentix/primitive-<name>:<version>`,
-            falling back to `agent` and `dataset` prefixes for those closure
-            kinds. This is the common case — closure authors don't have to
-            redeclare metadata that already lives in `pyproject.toml`.
+          * A `types.ModuleType` (the closure's imported Python package).
+            We derive the image from `importlib.metadata` by mapping the
+            module name to a distribution name (underscore → dash) and
+            looking up its version. This is the common case — closure
+            authors don't have to redeclare metadata that already lives
+            in `pyproject.toml`.
         """
         if not isinstance(v, list):
             return v  # pydantic will reject below
@@ -106,35 +109,37 @@ class SandboxConfig(BaseModel):
             raise ValueError(
                 f"closure spec {item!r}: cannot resolve image. Pass a "
                 f"docker-image-ref string, set `__image__` on the module, "
-                f"or install the closure's wheel so importlib.metadata can "
-                f"auto-derive (`agentix-<kind>-<name>` convention)."
+                f"or install the closure's wheel so importlib.metadata "
+                f"can derive the image from the distribution version."
             )
         return out
 
 
-_CLOSURE_KINDS: tuple[str, ...] = ("primitive", "agent", "dataset")
-
-
 def _derive_image_from_module(item: Any) -> str | None:
-    """Best-effort: `agentix_closures.<name>` module → its image ref.
+    """Best-effort: a closure's Python module → its docker image ref.
 
-    Tries each `agentix-<kind>-<name>` distribution in turn. Returns None
-    if the module isn't an `agentix_closures.*` package or no matching
-    distribution is installed — caller handles the ValueError.
+    Convention: the distribution name is the module's import name with
+    underscores replaced by dashes (the standard PEP 503 normalisation
+    direction). For `agentix-…` dists the docker tag mirrors the dist
+    name in the `agentix/<rest>:<version>` form. Non-`agentix-` dists
+    fall through to a plain `<dist>:<version>` tag.
+
+    Returns None when no installed distribution matches the module
+    name — the caller surfaces a clear error in that case.
     """
     if not isinstance(item, types.ModuleType):
         return None
     mod_name = getattr(item, "__name__", "")
-    if not mod_name.startswith("agentix_closures."):
+    if not mod_name:
         return None
-    short = mod_name.rsplit(".", 1)[-1]
-    for kind in _CLOSURE_KINDS:
-        try:
-            version = importlib.metadata.version(f"agentix-{kind}-{short}")
-        except importlib.metadata.PackageNotFoundError:
-            continue
-        return f"agentix/{kind}-{short}:{version}"
-    return None
+    dist = mod_name.replace("_", "-")
+    try:
+        version = importlib.metadata.version(dist)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    if dist.startswith("agentix-"):
+        return f"agentix/{dist[len('agentix-'):]}:{version}"
+    return f"{dist}:{version}"
 
 
 class SandboxInfo(BaseModel):

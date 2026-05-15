@@ -51,7 +51,7 @@ class HealthResponse(BaseModel):
 
 class RemoteRequest(BaseModel):
     """POST /_remote body. `package` is the closure's Python import path
-    (e.g. 'agentix_closures.claude_code'); `method` is a stub name bound
+    (e.g. 'agentix_primitive_bash'); `method` is a stub name bound
     by that closure's Dispatcher.
 
     `call_id` is an optional rollout correlation key; the dispatcher pins

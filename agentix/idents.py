@@ -22,9 +22,10 @@ closure inherits it automatically. Travels on `RemoteRequest.call_id`
 (unary) and on Socket.IO stream/bidi frames."""
 
 PackageName = NewType("PackageName", str)
-"""A closure's Python import path, e.g. `agentix_closures.bash`. The
-identity used by `Registry` for routing — there are no caller-chosen
-namespaces. Equal to `ClosureManifest.package`."""
+"""A closure's Python import path (whatever its `pyproject.toml` ships,
+e.g. `agentix_primitive_bash`). The identity used by `Registry` for
+routing — there are no caller-chosen namespaces. Equal to
+`ClosureManifest.package`."""
 
 MethodName = NewType("MethodName", str)
 """A method bound on a Dispatcher. For a `Namespace` subclass this is

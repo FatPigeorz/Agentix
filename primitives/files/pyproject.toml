@@ -10,4 +10,4 @@ requires-python = ">=3.11"
 dependencies = []
 
 [tool.hatch.build.targets.wheel]
-packages = ["agentix_closures/files"]
+packages = ["src/agentix_primitive_files"]

@@ -87,13 +87,27 @@ def _materialize_path(spec: ClosureSpec) -> Path:
     )
 
 
+_SOURCE_SKIP = {
+    "__pycache__", ".venv", "build", "dist", ".git",
+    ".pytest_cache", ".ruff_cache", ".mypy_cache", "*.egg-info",
+}
+
+
 def _stage(closure_dir: Path, build_dir: Path) -> None:
-    """Copy closure source + shared build infra into a self-contained context."""
-    shutil.copytree(
-        closure_dir / "agentix_closures",
-        build_dir / "agentix_closures",
-    )
-    shutil.copy2(closure_dir / "pyproject.toml", build_dir / "pyproject.toml")
+    """Copy closure source + shared build infra into a self-contained context.
+
+    The closure source is treated as a normal Python project (uv init form):
+    we copy everything except common dev artifacts, then drop in the shared
+    Dockerfile + default.nix + gen_manifest.py alongside it.
+    """
+    for item in closure_dir.iterdir():
+        if item.name in _SOURCE_SKIP or item.name.endswith(".egg-info"):
+            continue
+        dest = build_dir / item.name
+        if item.is_dir():
+            shutil.copytree(item, dest, ignore=shutil.ignore_patterns(*_SOURCE_SKIP))
+        else:
+            shutil.copy2(item, dest)
     shutil.copy2(TEMPLATE_DIR / "Dockerfile", build_dir / "Dockerfile")
     shutil.copy2(TEMPLATE_DIR / "default.nix", build_dir / "default.nix")
     shutil.copy2(GEN_MANIFEST, build_dir / "gen_manifest.py")

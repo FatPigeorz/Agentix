@@ -2,23 +2,23 @@
 
 Stub-only module. Callers import the typed `Bash` Namespace and the
 event/result dataclasses; the impl lives in `_impl.py` and runs only
-inside the sandbox. `_register.py` composes the two (stub + impl).
+inside the sandbox. The framework composes stub + impl automatically.
 
 Usage:
 
     from agentix import RuntimeClient
-    from agentix_closures import bash
+    from agentix_primitive_bash import Bash, BashStdout, BashStderr, BashExit, BashError
 
     async with RuntimeClient(sandbox.runtime_url) as c:
-        r = await c.remote(bash.Bash.run, command="ls -la", cwd="/workspace")
+        r = await c.remote(Bash.run, command="ls -la", cwd="/workspace")
         print(r.exit_code, r.stdout)
 
-        async for ev in c.remote(bash.Bash.run_stream, command="long-job.sh"):
+        async for ev in c.remote(Bash.run_stream, command="long-job.sh"):
             match ev:
-                case bash.BashStdout(data=chunk): print(chunk, end="")
-                case bash.BashStderr(data=chunk): print(chunk, end="")
-                case bash.BashExit(exit_code=code): print(f"\\nexit {code}")
-                case bash.BashError(message=msg): print(f"\\nerror: {msg}")
+                case BashStdout(data=chunk): print(chunk, end="")
+                case BashStderr(data=chunk): print(chunk, end="")
+                case BashExit(exit_code=code): print(f"\\nexit {code}")
+                case BashError(message=msg): print(f"\\nerror: {msg}")
 """
 
 from __future__ import annotations
