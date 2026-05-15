@@ -27,8 +27,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 
-from agentix import __version__
-from agentix import trace
+from agentix import __version__, trace
 from agentix.dispatch import Registry, discover_entry_points
 from agentix.models import ClosureManifest
 from agentix.runtime.models import (
