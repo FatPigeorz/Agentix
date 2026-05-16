@@ -77,7 +77,7 @@ packages = ["src/agentix"]
 ```
 
 The key on the left (`myagent`) is the short name used in
-`agentix install ... -o my-bundle:0.1.0` and shown by `agentix check`.
+`agentix build ... -o my-bundle:0.1.0` and shown by `agentix check`.
 The value on the right (`agentix.myagent:MyAgent`) is what the runtime
 imports.
 
@@ -99,7 +99,7 @@ contract.
 
 See [Architecture](/reference/architecture) for the full sandbox layout
 (`/mnt/runtime`, `/mnt/c<digest>`, the `/nix/store` symlink forest) and
-how `agentix install` bundles multiple namespaces into a single
+how `agentix build` bundles multiple namespaces into a single
 deployable image.
 
 ## Wire

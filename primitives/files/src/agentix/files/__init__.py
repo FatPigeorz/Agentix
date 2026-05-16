@@ -1,4 +1,4 @@
-"""Files primitive — sandbox file upload / download as an Agentix closure.
+"""Files primitive — sandbox file upload / download as an Agentix namespace.
 
 Usage:
 
@@ -15,8 +15,8 @@ Files are encoded as pydantic `bytes` (base64 in the JSON wire form).
 Suitable for kB–MB sized files; very large blobs should ship via a
 purpose-built binary `WirePattern` rather than the unary JSON path.
 
-One-file closure: the `Files` class carries its method bodies directly,
-no `_impl.py` split. Closures with heavier deps use lazy imports inside
+One-file namespace: the `Files` class carries its method bodies directly,
+no `_impl.py` split. Namespaces with heavier deps use lazy imports inside
 methods rather than a stub/impl two-file pattern.
 """
 

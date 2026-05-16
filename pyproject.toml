@@ -1,7 +1,7 @@
 [project]
 name = "agentix"
 version = "0.1.0"
-description = "A Nix-closure runtime for Docker sandboxes"
+description = "Typed Python namespaces for sandbox-based agent workflows"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.115",
@@ -26,8 +26,8 @@ dev = [
 # `agentix.cli`. The CLI is intentionally thin — most logic is in the
 # submodules so they can also be imported directly.
 agentix = "agentix.cli:main"
-# Runtime entrypoint the closure convention expects at
-# /mnt/<ns>/entry/bin/start; `agentix-server` is an alias for dev ergonomics.
+# Runtime server entrypoint, invoked from inside the sandbox at
+# /mnt/runtime/entry/bin/start; `agentix-server` is an alias for dev ergonomics.
 start = "agentix.runtime.server:main"
 agentix-server = "agentix.runtime.server:main"
 
@@ -71,6 +71,4 @@ reportGeneralTypeIssues = "warning"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 pythonpath = ["."]
-# smoke_docker.py is a standalone script driven by CI's e2e job, not a pytest module.
-norecursedirs = ["tests/closures"]
 python_files = ["test_*.py"]

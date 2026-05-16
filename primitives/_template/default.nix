@@ -1,10 +1,9 @@
 { pkgs ? import <nixpkgs> {} }:
 
-# Shared nix derivation for every closure. The closure is a normal
+# Shared nix derivation for every namespace. The namespace is a normal
 # Python project; hatchling reads `pyproject.toml` for metadata and the
-# wheel package list. The runtime discovers the closure via
-# `importlib.metadata.entry_points` at start-up — no manifest.json file
-# needed, no postInstall metadata generation.
+# wheel package list. The runtime discovers the namespace via
+# `importlib.metadata.entry_points` at start-up.
 let
   python = pkgs.python312;
   pythonPkgs = python.pkgs;
@@ -20,5 +19,5 @@ pythonPkgs.buildPythonApplication {
   propagatedBuildInputs = [];
   doCheck = false;
 
-  meta.description = "Agentix closure (${pyproject.project.name})";
+  meta.description = "Agentix namespace (${pyproject.project.name})";
 }

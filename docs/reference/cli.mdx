@@ -14,44 +14,37 @@ agentix --help
 
 ## `agentix build`
 
-Build a single namespace image.
+Build one namespace image, or bundle several into a single image. The
+verb is the same; passing one spec produces a single-namespace image,
+passing many produces a bundle.
 
 ```bash
-agentix build <spec>
-agentix build primitives/bash --dry-run
-agentix build bash --tag my-bash:dev
+# One namespace — tag auto-derived from pyproject.toml
+agentix build primitives/bash
+agentix build bash --dry-run
+agentix build bash -o my-bash:dev
+
+# Many namespaces — explicit -o required
+agentix build bash files claude-code -o my-agent:0.1.0
+agentix build primitives/bash ./my-experimental-namespace -o demo:dev
+agentix build bash files --dry-run -o sandbox:dev
 ```
 
-`<spec>` accepts the same forms `agentix install` does — paths, short
-names resolved against the repo, image refs, or PyPI dists. The
-resolution chain is the ordered list in `agentix/cli/_resolve.py`.
+Each spec accepts one of:
 
 - **Path:** `./primitives/bash` or any directory with a `pyproject.toml`.
 - **Short name:** looked up under the repo's `primitives/`.
 - **PyPI dist:** `agentix-bash` (currently surfaces NotImplementedError;
   fetch path is stubbed).
 
-`--tag` overrides the auto-derived `agentix/<short>:<version>` tag.
-`--dry-run` stages the docker build context to `./build/<name>/` and
-prints the path instead of invoking docker.
+`-o / --output / --tag` is the output image tag. With one spec it's
+optional (auto-derived as `agentix/<short>:<version>`). With multiple
+specs it's required. `--dry-run` stages the docker build context to
+`./build/<name>/` and prints the path instead of invoking docker.
 
-## `agentix install`
-
-Bundle multiple namespaces into one image. The runtime discovers them
-via entry points at startup.
-
-```bash
-agentix install bash files claude-code -o my-agent:0.1.0
-agentix install primitives/bash ./my-experimental-namespace -o demo:dev
-agentix install bash files --dry-run
-```
-
-The output image carries every named namespace pip-installed alongside
-the runtime. No bundle disposition file — discovery is just
-`importlib.metadata.entry_points(group="agentix.namespace")`.
-
-`-o / --output` is the bundle image tag. `--dry-run` stages to
-`./build/<bundle-short>/`.
+The runtime discovers every bundled namespace via
+`importlib.metadata.entry_points(group="agentix.namespace")` at startup —
+no bundle disposition file is needed.
 
 ## `agentix deploy`
 

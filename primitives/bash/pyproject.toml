@@ -9,9 +9,9 @@ description = "Bash command execution primitive for Agentix"
 requires-python = ">=3.11"
 dependencies = []
 
-# Entry points are the framework's sole closure-discovery contract.
+# Entry points are the framework's sole namespace-discovery contract.
 # `bash = "agentix.bash:Bash"` tells the runtime to import `agentix.bash`
-# and load the `Bash` class as the closure on first dispatch.
+# and load the `Bash` class on first dispatch.
 [project.entry-points."agentix.namespace"]
 bash = "agentix.bash:Bash"
 

@@ -1,4 +1,4 @@
-"""Spec resolution — internal helper for `agentix build` / `agentix install`.
+"""Spec resolution — internal helper for `agentix build`.
 
 A *spec* is whatever the user types on the command line: a short name
 (`bash`), a relative path (`./primitives/bash`), or an image reference

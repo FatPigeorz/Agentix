@@ -1,4 +1,4 @@
-"""Bash primitive — shell command execution as an Agentix closure.
+"""Bash primitive — shell command execution as an Agentix namespace.
 
 Usage:
 

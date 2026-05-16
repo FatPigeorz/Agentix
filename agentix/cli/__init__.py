@@ -23,7 +23,6 @@ from collections.abc import Callable, Sequence
 # `agentix.cli` whose `main(argv)` handles the verb.
 _COMMANDS: tuple[tuple[str, str], ...] = (
     ("build", "agentix.cli.build"),
-    ("install", "agentix.cli.install"),
     ("deploy", "agentix.cli.deploy"),
     ("check", "agentix.cli.check"),
 )

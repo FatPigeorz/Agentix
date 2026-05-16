@@ -103,7 +103,7 @@ Developer commands ship as the `agentix` console script (`pip install -e .[dev]`
 
 ```
 agentix build primitives/bash                              # build one namespace image
-agentix install bash files claude-code -o my-agent:0.1.0   # bundle several namespaces
+agentix build bash files claude-code -o my-agent:0.1.0     # bundle several namespaces
 agentix deploy local --image my-agent:0.1.0                # run a sandbox
 agentix check                                              # list installed namespaces, smoke-import each
 ```
@@ -112,7 +112,7 @@ Each command is a thin module under `agentix/cli/`; `agentix --help` lists them.
 
 **`agentix build <spec>`** — builds a single namespace image. `<spec>` is an explicit path (`primitives/bash`), a short name resolved against the repo (`bash`), or a PyPI dist (`agentix-bash`, currently stubbed). Stages source + shared Dockerfile/nix into a temp dir, runs `docker build`.
 
-**`agentix install <names> -o <tag>`** — bundles multiple namespaces into one image (every namespace pip-installed alongside the runtime). The runtime discovers them via `importlib.metadata.entry_points`, so no bundle disposition file is needed.
+**`agentix build <names> -o <tag>`** — same command, just N specs. Bundles multiple namespaces into one image. The runtime discovers them via `importlib.metadata.entry_points`, so no bundle disposition file is needed.
 
 **`agentix deploy <backend>`** — provisions a sandbox. `local` is wired through `DockerDeployment`; `daytona`/`e2b` are CLI surfaces awaiting their managed-sandbox integrations. Backends are one of the two plugin axes — they register under `agentix.deployment`, so `pip install agentix-deployment-fly` is enough for `agentix deploy fly --image …` to work without framework changes.
 
@@ -129,12 +129,10 @@ Foreground by default: prints `runtime_url`, holds the sandbox alive until Ctrl-
   runtime/                       — runtime image's /nix slice
     store/<hash>-*/
     entry/bin/start              — agentix-server
-    entry/manifest.json
   c<digest>/                     — namespace image's /nix slice (dir name is internal)
-    store/<hash>-*/
-    entry/python/<package>/...   — namespace's Python package (whatever pyproject named it)
-    entry/bin/<cli>              — optional native binaries
-    entry/manifest.json
+    store/<hash>-*/              — content-addressed Nix store; includes the namespace's
+                                   site-packages dir, made visible to the runtime's Python
+                                   via the symlink farm in /nix/store
 ```
 
 Sandbox entrypoint (inlined into the `docker run` command):
@@ -148,10 +146,12 @@ exec /mnt/runtime/entry/bin/start
 
 On lifespan startup, the runtime:
 
-1. Scans `/mnt/*` for `entry/manifest.json`. Skips `/mnt/runtime`.
-2. For each valid manifest (matching abi), prepends `<mount>/entry/python` to `sys.path` and **registers a pending entry** in the global `Registry`. **No imports run.**
-3. The namespace's Python package is imported and its `_register.register()` is called on **first `/_remote` request** for that package (`Registry.get_or_load`), under a per-package async lock so concurrent first-calls share one import.
+1. Walks `importlib.metadata.entry_points(group="agentix.namespace")`. Because the namespaces' wheels installed into the same Nix-managed Python environment, every namespace's `dist-info/entry_points.txt` is visible to `importlib.metadata`.
+2. For each entry point, **registers a pending entry** in the global `Registry`. **No imports run.**
+3. The namespace's class is `ep.load()`ed on **first `/_remote` request** for that package (`Registry.get_or_load`), under a per-package async lock so concurrent first-calls share one import.
 4. Import failures are cached on the entry; every subsequent call returns the same error without retrying.
+
+There is no on-disk `manifest.json` or `/mnt/*` scan — discovery is purely the entry-point walk.
 
 Two images shipping the same `package` collide — second is skipped with a warning. There are **no caller-chosen namespaces**; the Python import path is the identity.
 

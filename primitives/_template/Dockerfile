@@ -1,16 +1,13 @@
-# Shared closure-image Dockerfile.
+# Canonical agentix Dockerfile.
 #
-# Used by every closure under `primitives/<name>/`. `tools/build_closure.py`
-# stages a build context that contains:
+# Used by the runtime image build (`docker build -f primitives/_template/Dockerfile .`
+# from the repo root). `agentix build` generates its own equivalent Dockerfile
+# programmatically for namespace bundles, but the runtime image — which provides
+# `/mnt/runtime/entry/bin/start` to every sandbox — is built directly from this
+# file.
 #
-#   ./agentix_closures/<name>/{__init__.py, _impl.py}   — closure source
-#   ./pyproject.toml                                    — generated stub
-#   ./default.nix                                       — symlink/copy of shared template
-#   ./gen_manifest.py                                   — copy of the framework tool
-#
-# Build context is therefore a self-contained tarball; no out-of-tree
-# references inside the Dockerfile. The closure's name is supplied as
-# a label only — the rest is determined by the staged content.
+# Build context must contain `pyproject.toml` + `default.nix` (or a sibling that
+# `default.nix` reads) so the nix derivation can pick up name + version.
 ARG NIX_IMAGE=nixos/nix:latest
 
 FROM ${NIX_IMAGE} AS builder
@@ -28,7 +25,6 @@ RUN nix-build --no-out-link default.nix -o ./result && \
 FROM busybox:stable
 COPY --from=builder /export /
 VOLUME /nix
-ARG CLOSURE_NAME=unknown
-LABEL org.agentix.closure=1
-LABEL org.agentix.closure.kind=primitive
-LABEL org.agentix.closure.name=${CLOSURE_NAME}
+ARG NAMESPACE_NAME=unknown
+LABEL org.agentix.namespace=1
+LABEL org.agentix.namespace.name=${NAMESPACE_NAME}

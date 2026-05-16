@@ -51,8 +51,8 @@ pip install -e primitives/bash -e primitives/files   # the bundled primitives
 ## CLI
 
 ```bash
-agentix build  primitives/bash                             # build a single namespace image
-agentix install bash files claude-code -o my-agent:0.1.0   # bundle several namespaces
+agentix build primitives/bash                              # build a single namespace image
+agentix build bash files claude-code -o my-agent:0.1.0     # bundle several namespaces
 agentix deploy local --image my-agent:0.1.0                # run a sandbox + connect
 agentix check                                              # smoke-import every installed namespace
 ```

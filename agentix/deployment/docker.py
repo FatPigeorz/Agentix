@@ -2,17 +2,16 @@
 
 Design:
 
-  Every namespace image declares `VOLUME /nix` and ships under `/nix`:
-      store/<hash>-*/             — content-addressed Nix deps
-      entry/python/<package>/     — Python package the runtime imports
-      entry/manifest.json         — NamespaceManifest (abi, package, ...)
-      entry/bin/<cli>             — optional native binaries (exposed via paths_from)
+  Every namespace image declares `VOLUME /nix` and ships under `/nix/store`
+  a content-addressed Nix store containing the namespace's Python wheel.
+  The runtime image additionally ships `/nix/entry/bin/start` — the
+  entrypoint script the sandbox execs after mounting.
 
-  Deployment's responsibility per unique namespace image (cached in-process):
+  Per unique namespace image (cached in-process):
       docker run --rm -v agentix-namespace-<digest>:/nix <image> true
-      A fresh named volume mounted at /nix is auto-populated by Docker from
-      the image's /nix layer on first attach (volume-init-from-image rule);
-      subsequent calls are no-ops.
+      A fresh named volume mounted at /nix is auto-populated by Docker
+      from the image's /nix layer on first attach (volume-init-from-image
+      rule); subsequent calls are no-ops.
 
   Sandbox create:
       docker run --name <sid> \\
@@ -26,10 +25,11 @@ Design:
       for d in /mnt/*/store; do ln -sfn "$d"/* /nix/store/; done
       exec /mnt/runtime/entry/bin/start
 
-  Mount-dir names are internal — the runtime indexes namespaces by
-  manifest.package, not by directory. On startup the runtime imports each
-  mounted namespace's Python package in-process; no subprocesses, no UDS,
-  no reverse proxy. Sandbox contents are fixed at create time.
+  Mount-dir names are internal. The runtime's Python sees each mounted
+  namespace's `site-packages` via the symlink farm in /nix/store, and
+  walks `importlib.metadata.entry_points(group="agentix.namespace")` to
+  discover them. No subprocesses, no UDS, no reverse proxy. Sandbox
+  contents are fixed at create time.
 """
 
 from __future__ import annotations
