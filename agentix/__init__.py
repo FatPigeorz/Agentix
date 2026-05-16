@@ -24,22 +24,28 @@ from agentix.deployment.docker import DockerDeployment
 from agentix.dispatch import Dispatcher
 from agentix.models import SandboxConfig, SandboxInfo
 from agentix.rollout import RolloutPool
+from agentix.rpc import Bidi, Channel, RemoteCall, Stream, Unary
 from agentix.runtime.client import RemoteCallError, RuntimeClient
 from agentix.runtime.models import LogRecord, TraceEvent
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "Bidi",
+    "Channel",
     "Dispatcher",
     "DockerDeployment",
     "LogRecord",
+    "RemoteCall",
     "RemoteCallError",
     "RolloutPool",
     "RuntimeClient",
     "Sandbox",
     "SandboxConfig",
     "SandboxInfo",
+    "Stream",
     "TraceEvent",
+    "Unary",
     "__version__",
     "trace",
 ]

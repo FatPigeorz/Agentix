@@ -223,7 +223,7 @@ def _render_dockerfile(
             steps[-1] += " && \\"
             steps += [
                 f"    SP=$(cat /nix/.sys-paths/{spec.short}) && \\",
-                f"    for f in $SP/bin/*; do \\",
+                "    for f in $SP/bin/*; do \\",
                 f"        ln -sf \"$f\" /nix/{spec.short}/bin/$(basename \"$f\"); \\",
                 "    done",
             ]

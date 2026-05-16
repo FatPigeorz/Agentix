@@ -22,7 +22,6 @@ import pytest
 from agentix.runtime.models import RemoteRequest
 from agentix.runtime.multiplexer import NamespaceMultiplexer
 
-
 TESTS_DIR = Path(__file__).parent
 _PACKAGE = "_worker_target"
 _TARGET = f"{_PACKAGE}:Echo"
@@ -95,3 +94,47 @@ async def test_subprocess_worker_trace_forwarding(worker_env):
         assert ("test_event", {"msg": "x"}) in received
     finally:
         await mp.shutdown()
+
+
+async def test_subprocess_worker_death_fails_in_flight_stream(worker_env):
+    """Killing the worker mid-stream surfaces WorkerExited to the caller —
+    PROTOCOL.md invariant #5 (no call hangs indefinitely)."""
+    mp = _make_multiplexer()
+    try:
+        # Force the worker to spawn by issuing one unary first.
+        resp = await mp.dispatch_unary(RemoteRequest(
+            package=_PACKAGE, method="echo", kwargs={"msg": "warm"},
+        ))
+        assert resp.ok
+
+        # Start a long stream, kill the worker before it completes.
+        gen = mp.dispatch_stream(RemoteRequest(
+            package=_PACKAGE, method="counter", kwargs={"n": 1_000_000},
+        ))
+        events: list[dict] = []
+
+        async def _drain() -> None:
+            async for ev in gen:
+                events.append(ev)
+                if ev.get("type") in ("end", "error"):
+                    return
+
+        consumer = asyncio.create_task(_drain())
+        # Let a few items flow before pulling the rug.
+        await asyncio.sleep(0.1)
+
+        entry = mp._entries[_PACKAGE]   # noqa: SLF001  (test-internal probe)
+        worker = entry.worker
+        assert worker is not None
+        # Reach down for the live subprocess and SIGKILL it.
+        proc = worker._proc                                       # type: ignore[attr-defined]
+        assert proc is not None
+        proc.kill()
+
+        await asyncio.wait_for(consumer, timeout=5)
+    finally:
+        await mp.shutdown()
+
+    terminal = events[-1]
+    assert terminal["type"] == "error"
+    assert terminal["error"]["type"] == "WorkerExited"

@@ -54,14 +54,21 @@ or async task inside the handler body.
 
 ## Call shapes — three built-ins, detected by signature
 
-Three call shapes are detected from a method's signature by
-`agentix.dispatch.detect_shape(sig)`:
+Three call shapes are detected by `agentix.dispatch.detect_shape(fn)`
+from `inspect.isasyncgenfunction(fn)` plus a scan for `Channel[T]`
+parameters:
 
-| Shape    | Signature                                                          |
-| -------- | ------------------------------------------------------------------ |
-| `unary`  | plain return (`-> T`)                                              |
-| `stream` | `-> AsyncIterator[T]`                                              |
-| `bidi`   | one `AsyncIterator[U]` param + `-> AsyncIterator[V]` return        |
+| Shape    | Signature                                                                       |
+| -------- | ------------------------------------------------------------------------------- |
+| `unary`  | `async def f(...) -> T`                                                         |
+| `stream` | `async def f(...) -> AsyncIterator[T]: yield ...`                               |
+| `bidi`   | same as stream + one `Channel[U]` parameter (caller-pushed input)               |
+
+`c.remote(fn, ...)` returns a tagged variant — `Unary[R]` (await),
+`Stream[R]` (async iterate), or `Bidi[I, R]` (async iterate + push to
+`.inbox`). Each variant implements its natural Python protocol so the
+common case is a one-liner; `match` on the variant when writing
+generic helpers that handle any shape.
 
 Detection runs at `Dispatcher.bind` time on the server and on every
 `c.remote(...)` on the client. If a fourth shape ever becomes

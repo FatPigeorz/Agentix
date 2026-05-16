@@ -256,7 +256,7 @@ User subprocess default `PATH=/usr/local/bin:/usr/bin:/bin`. Namespaces that shi
 - **Subprocess per namespace** (not in-process). Each namespace runs in its own venv's Python, isolated for dep conflicts. The multiplexer in the runtime process routes RPC frames over stdin/stdout. The pre-isolation in-process model was reversed when per-extension venv was introduced.
 - **No reverse proxy.** `POST /_remote` is direct dispatch into the multiplexer; namespaces don't expose arbitrary HTTP routes.
 - **No caller-chosen namespaces.** Entry-point's module path is the routing identity. Two dists registering the same name raise `PluginConflictError`.
-- **Streaming returns** via `AsyncIterator[T]` annotation on the stub: `async for x in c.remote(stream_fn, ...)`. Wire is Socket.IO `stream`/`stream:item`/`stream:end` events. Bidi (stub takes one `AsyncIterator[T]` parameter and returns `AsyncIterator[U]`) is supported via the `bidi:*` event family.
+- **Streaming returns** via `async def f(...) -> AsyncIterator[T]: yield ...`: `async for x in c.remote(stream_fn, ...)`. Wire is Socket.IO `stream`/`stream:item`/`stream:end` events. Bidi (impl takes a `Channel[I]` parameter and returns `AsyncIterator[O]`; caller passes a `Channel[I]` and pushes via `inbox.send(...)`) is supported via the `bidi:*` event family. `c.remote(fn, ...)` returns a tagged variant (`Unary[R]` / `Stream[R]` / `Bidi[I, R]`) so each shape is awaited or iterated with its natural Python protocol; `match` over the variant for generic dispatch.
 - **One bundle image per sandbox.** Not many namespace images mounted at deploy time — the bundle carries every namespace venv pre-built. Rebuilding the bundle is the way to change which namespaces a sandbox exposes.
 
 ## Implementation notes
@@ -309,11 +309,11 @@ impl: Bash = BashImpl()  # pyright catches structural mismatch here
 
 Three call shapes (`unary` / `stream` / `bidi`) cover every signature the framework supports. `agentix.dispatch.detect_shape(sig)` returns one of those strings:
 
-* `unary`  — plain `T` return
-* `stream` — `-> AsyncIterator[T]` return, no `AsyncIterator` params
-* `bidi`   — one `AsyncIterator[U]` param + `-> AsyncIterator[V]` return
+* `unary`  — `async def f(...) -> T`
+* `stream` — `async def f(...) -> AsyncIterator[T]: yield ...` (real async generator)
+* `bidi`   — same as stream + a `Channel[U]` parameter (caller-pushed input channel)
 
-Detection runs at `Dispatcher.bind` time and again on every `c.remote(...)` client-side; both branch on the resulting string. There is no plugin hook for new shapes — the assumption is the framework's three are exhaustive. If a fourth ever becomes necessary, edit `detect_shape` plus the two branch sites; the abstraction overhead of a swappable pattern hierarchy isn't paying for itself.
+Detection uses `inspect.isasyncgenfunction(fn)` as the source of truth (annotations are only a hint — a regular `async def` returning an iterator value is unary, not stream) plus a scan for `Channel[T]` parameters. Runs at `Dispatcher.bind` time and again on every `c.remote(...)` client-side; both branch on the resulting string. There is no plugin hook for new shapes — the assumption is the framework's three are exhaustive. If a fourth ever becomes necessary, edit `detect_shape` plus the two branch sites; the abstraction overhead of a swappable pattern hierarchy isn't paying for itself.
 
 ### 3. Branded identifiers from `agentix.idents`
 

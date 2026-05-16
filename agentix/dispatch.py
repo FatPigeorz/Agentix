@@ -19,15 +19,15 @@ import logging
 import traceback
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Generic, Literal, ParamSpec, TypeVar, get_args, get_origin
+from typing import Any, Generic, Literal, ParamSpec, TypeVar, get_args
 
 from pydantic import TypeAdapter, ValidationError
 
 import agentix.trace as trace
 from agentix.idents import MethodName, PackageName
 from agentix.namespace import discover_methods
+from agentix.rpc import is_channel_annotation
 from agentix.runtime.models import (
-    STREAM_ORIGINS,
     RemoteError,
     RemoteRequest,
     RemoteResponse,
@@ -42,26 +42,36 @@ Shape = Literal["unary", "stream", "bidi"]
 """How a method's signature maps onto the wire:
 
   * `unary`  — plain `T` return; one request, one response
-  * `stream` — `-> AsyncIterator[T]` return, no AsyncIterator params
-  * `bidi`   — one `AsyncIterator[U]` param + `-> AsyncIterator[V]` return
+  * `stream` — `async def f(...) -> AsyncIterator[T]: yield ...`
+  * `bidi`   — same as stream + one `Channel[U]` parameter
 """
 
 
-def detect_shape(sig: inspect.Signature) -> Shape:
-    """Derive the wire shape from a function's signature.
+def detect_shape(fn: Callable[..., Any], sig: inspect.Signature | None = None) -> Shape:
+    """Derive the wire shape from a function and its signature.
 
-    The framework's three call shapes are exhaustive; adding a fourth means
-    editing this function and the matching branches in `Dispatcher` /
-    `RuntimeClient`. No plugin extension hook — by design.
+    The runtime check (`inspect.isasyncgenfunction`) is the source of
+    truth — an `async def ... yield` body is a real async generator, and
+    we trust that over annotations alone (which can be wrong: a regular
+    `async def f() -> AsyncIterator[T]: return some_iter` returns a
+    coroutine, not a stream).
+
+    Bidi is detected by a `Channel[T]` parameter in addition to async-gen
+    return. `AsyncIterator[T]` as a parameter no longer marks bidi —
+    `Channel[T]` is now the explicit, type-safe marker.
+
+    The framework's three call shapes are exhaustive; adding a fourth
+    means editing this function and the matching branches in
+    `Dispatcher` / `RuntimeClient`. No plugin extension hook — by design.
     """
-    ret_is_stream = get_origin(sig.return_annotation) in STREAM_ORIGINS
-    if not ret_is_stream:
+    if sig is None:
+        sig = inspect.signature(fn, eval_str=True)
+    if not inspect.isasyncgenfunction(fn):
         return "unary"
-    has_stream_param = any(
-        get_origin(p.annotation) in STREAM_ORIGINS
-        for p in sig.parameters.values()
+    has_channel = any(
+        is_channel_annotation(p.annotation) for p in sig.parameters.values()
     )
-    return "bidi" if has_stream_param else "stream"
+    return "bidi" if has_channel else "stream"
 
 
 @dataclass
@@ -74,7 +84,7 @@ class _BoundMethod(Generic[P, R]):
     param_adapters: dict[str, TypeAdapter[Any]]
     return_adapter: TypeAdapter[Any]
     item_adapter: TypeAdapter[Any] | None = None  # output item adapter (stream/bidi only)
-    input_stream_param: str | None = None         # bidi: name of the AsyncIterator param
+    input_channel_param: str | None = None        # bidi: name of the Channel[T] param
     input_item_adapter: TypeAdapter[Any] | None = None  # bidi: input item adapter
 
     @property
@@ -125,24 +135,24 @@ class Dispatcher:
         name = MethodName(stub.__name__)
         if name in self._methods:
             raise ValueError(f"method '{name}' already bound on this dispatcher")
-        shape = detect_shape(sig)
+        shape = detect_shape(stub, sig)
 
         param_adapters: dict[str, TypeAdapter[Any]] = {}
-        stream_params: list[tuple[str, type]] = []
+        channel_params: list[tuple[str, type]] = []
         for pname, param in sig.parameters.items():
             ann = param.annotation if param.annotation is not inspect.Parameter.empty else Any
-            if get_origin(ann) in STREAM_ORIGINS:
-                # AsyncIterator[T] params: adapter validates items, not the iterator
+            if is_channel_annotation(ann):
+                # Channel[T] params: adapter validates items, not the channel itself.
                 args = get_args(ann)
                 item_type = args[0] if args else Any
-                stream_params.append((pname, item_type))
+                channel_params.append((pname, item_type))
                 param_adapters[pname] = TypeAdapter(item_type)
             else:
                 param_adapters[pname] = TypeAdapter(ann)
 
         return_ann = sig.return_annotation if sig.return_annotation is not inspect.Signature.empty else Any
         item_adapter: TypeAdapter[Any] | None = None
-        input_stream_param: str | None = None
+        input_channel_param: str | None = None
         input_item_adapter: TypeAdapter[Any] | None = None
         if shape == "unary":
             return_adapter = TypeAdapter(return_ann)
@@ -153,7 +163,7 @@ class Dispatcher:
             item_adapter = TypeAdapter(item_type)
             return_adapter = TypeAdapter(Any)  # unused on streaming path
             if shape == "bidi":
-                input_stream_param, input_item_type = stream_params[0]
+                input_channel_param, input_item_type = channel_params[0]
                 input_item_adapter = TypeAdapter(input_item_type)
 
         self._methods[name] = _BoundMethod(
@@ -165,7 +175,7 @@ class Dispatcher:
             param_adapters=param_adapters,
             return_adapter=return_adapter,
             item_adapter=item_adapter,
-            input_stream_param=input_stream_param,
+            input_channel_param=input_channel_param,
             input_item_adapter=input_item_adapter,
         )
 
@@ -337,20 +347,20 @@ class Dispatcher:
                 message=f"method '{request.method}' is not bidirectional",
             ).model_dump()}
             return
-        assert m.input_stream_param is not None
-        # Bind non-stream args/kwargs; inject input_iter as the stream param.
-        non_stream_kwargs = dict(request.kwargs)
-        non_stream_kwargs.pop(m.input_stream_param, None)
+        assert m.input_channel_param is not None
+        # Bind non-channel args/kwargs; inject input_iter as the channel param.
+        non_channel_kwargs = dict(request.kwargs)
+        non_channel_kwargs.pop(m.input_channel_param, None)
         try:
-            bound = m.signature.bind_partial(*request.args, **non_stream_kwargs)
+            bound = m.signature.bind_partial(*request.args, **non_channel_kwargs)
             bound.apply_defaults()
             coerced: dict[str, Any] = {}
             for pname, raw in bound.arguments.items():
-                if pname == m.input_stream_param:
+                if pname == m.input_channel_param:
                     continue
                 adapter = m.param_adapters.get(pname)
                 coerced[pname] = adapter.validate_python(raw) if adapter is not None else raw
-            coerced[m.input_stream_param] = input_iter
+            coerced[m.input_channel_param] = input_iter
         except (TypeError, ValidationError) as exc:
             yield {"type": "error", "error": RemoteError(type=type(exc).__name__, message=str(exc)).model_dump()}
             return

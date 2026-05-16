@@ -152,10 +152,13 @@ log               { level, name, message, timestamp }
 logs:unsubscribe  {}
 ```
 
-`RuntimeClient.remote` picks the wire automatically by inspecting the
-method's return annotation: plain return → unary HTTP;
-`AsyncIterator[T]` → server-streaming Socket.IO; `AsyncIterator[U]`
-parameter + `AsyncIterator[V]` return → bidi.
+`RuntimeClient.remote` picks the wire automatically from the impl
+function: an `async def` returning a value → unary HTTP; an
+`async def ... yield` async generator → server-streaming Socket.IO;
+same async generator with a `Channel[T]` parameter → bidi. The call
+returns a tagged variant (`Unary[R]` / `Stream[R]` / `Bidi[I, R]`)
+that supports the matching Python protocol directly (`await` or
+`async for`); `match` for generic dispatch.
 
 ## Caller side
 
@@ -210,18 +213,35 @@ before the raise.
 
 ## Bidirectional methods
 
-A method whose **first parameter** is `AsyncIterator[U]` and whose
-**return type** is `AsyncIterator[V]` opts into bidi:
+A method with a `Channel[U]` parameter and an `AsyncIterator[V]`
+return is bidi:
 
 ```python
-async def echo(messages: AsyncIterator[str]) -> AsyncIterator[str]:
+from agentix import Channel
+from collections.abc import AsyncIterator
+
+async def echo(messages: Channel[str]) -> AsyncIterator[str]:
     async for msg in messages:
         yield f"echo: {msg}"
 ```
 
-The caller passes an async iterable of inputs and consumes another
-async iterable of outputs over the same `call_id`. Inputs flow as
-`bidi:in` events; outputs as `bidi:out`.
+Caller side: construct a `Channel`, pass it to `c.remote`, and push
+items from anywhere (typically a producer task running concurrently
+with the output `async for`):
+
+```python
+inbox: Channel[str] = Channel()
+
+async def producer():
+    for line in user_inputs():
+        await inbox.send(line)
+    await inbox.close()
+
+async for reply in c.remote(echo, messages=inbox):
+    print(reply)
+```
+
+Inputs flow as `bidi:in` events; outputs as `bidi:out`.
 
 ## Runtime built-ins
 

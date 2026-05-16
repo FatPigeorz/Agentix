@@ -3,8 +3,9 @@
 
 Discovery is duck-typed — a namespace can be a Python module, a class,
 or any object whose top-level attributes include async callables. The
-three call shapes (unary / stream / bidi) are detected directly from
-the signature by `agentix.dispatch.detect_shape`. End-to-end protocol
+three call shapes (unary / stream / bidi) are detected by
+`agentix.dispatch.detect_shape` from `isasyncgenfunction(fn)` +
+whether any parameter is annotated `Channel[T]`. End-to-end protocol
 tests live in `test_namespace_protocol.py`.
 """
 
@@ -15,6 +16,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 
+from agentix import Channel
 from agentix.dispatch import Dispatcher, detect_shape
 from agentix.namespace import discover_methods
 from agentix.runtime.models import RemoteRequest
@@ -68,23 +70,36 @@ def test_namespace_inherits_methods_from_namespace_ancestors() -> None:
 
 def _sig(fn: object) -> inspect.Signature:
     # eval_str=True mirrors what Dispatcher.bind does — resolve PEP 563
-    # stringified annotations so `get_origin(AsyncIterator[T])` works.
+    # stringified annotations so `get_origin(Channel[T])` works.
     return inspect.signature(fn, eval_str=True)  # type: ignore[arg-type]
 
 
 def test_detect_unary_for_plain_signature() -> None:
-    def f(x: int) -> str: ...
-    assert detect_shape(_sig(f)) == "unary"
+    async def f(x: int) -> str:
+        return ""
+    assert detect_shape(f, _sig(f)) == "unary"
 
 
-def test_detect_stream_for_async_iterator_return() -> None:
-    def f(x: int) -> AsyncIterator[int]: ...
-    assert detect_shape(_sig(f)) == "stream"
+def test_detect_stream_for_async_generator_return() -> None:
+    async def f(x: int) -> AsyncIterator[int]:
+        yield 0
+    assert detect_shape(f, _sig(f)) == "stream"
 
 
-def test_detect_bidi_for_async_iterator_param_and_return() -> None:
-    def f(events: AsyncIterator[str]) -> AsyncIterator[int]: ...
-    assert detect_shape(_sig(f)) == "bidi"
+def test_detect_bidi_for_channel_param() -> None:
+    async def f(events: Channel[str]) -> AsyncIterator[int]:
+        async for _ in events:
+            yield 0
+    assert detect_shape(f, _sig(f)) == "bidi"
+
+
+def test_detect_async_iter_param_is_not_bidi() -> None:
+    """Only `Channel[T]` marks bidi — a bare AsyncIterator parameter is
+    just a regular value parameter (and is silently classified as stream)."""
+    async def f(events: AsyncIterator[str]) -> AsyncIterator[int]:
+        async for _ in events:
+            yield 0
+    assert detect_shape(f, _sig(f)) == "stream"
 
 
 # ── Dispatcher.bind_namespace ───────────────────────────────────────
@@ -130,7 +145,7 @@ async def test_bind_namespace_picks_correct_pattern() -> None:
                 yield i
 
         @staticmethod
-        async def bidi(events: AsyncIterator[str]) -> AsyncIterator[int]:
+        async def bidi(events: Channel[str]) -> AsyncIterator[int]:
             async for e in events:
                 yield len(e)
 

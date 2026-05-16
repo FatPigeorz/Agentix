@@ -21,7 +21,7 @@ from dataclasses import dataclass
 import httpx
 import pytest
 
-from agentix import RemoteCallError, RuntimeClient
+from agentix import Channel, RemoteCallError, RuntimeClient
 from agentix.runtime.models import RemoteRequest
 
 pytestmark = pytest.mark.asyncio
@@ -73,7 +73,7 @@ class ReplyMsg:
 class Chat:
     @staticmethod
     async def chat(
-        messages: AsyncIterator[UserMsg],
+        messages: Channel[UserMsg],
         prefix: str = "say:",
     ) -> AsyncIterator[ReplyMsg]:
         async for m in messages:
@@ -85,6 +85,22 @@ class Talker:
     async def speak() -> str:
         logging.getLogger("agentix.test.talker").info("hello-from-impl")
         return "ok"
+
+
+@dataclass
+class Item:
+    i: int
+
+
+class SlowEcho:
+    """Bidi impl that yields slower than a producer can push — exercises
+    the worker's per-call pump task + bounded user queue backpressure."""
+
+    @staticmethod
+    async def echo(items: Channel[Item]) -> AsyncIterator[Item]:
+        async for it in items:
+            await asyncio.sleep(0.001)
+            yield Item(i=it.i)
 
 
 # ── registry + dispatch basics ───────────────────────────────────────
@@ -204,13 +220,43 @@ async def test_bidi_round_trip_via_socketio(
     register_namespace(Chat)
     base_url = await live_server()
 
-    async def _inputs() -> AsyncIterator[UserMsg]:
+    inbox: Channel[UserMsg] = Channel()
+
+    async def _push() -> None:
         for t in ("hi", "there"):
-            yield UserMsg(text=t)
+            await inbox.send(UserMsg(text=t))
+        await inbox.close()
 
     async with RuntimeClient(base_url) as c:
-        replies = [r async for r in c.remote(Chat.chat, messages=_inputs())]
+        producer = asyncio.create_task(_push())
+        replies = [r async for r in c.remote(Chat.chat, messages=inbox)]
+        await producer
         assert [r.text for r in replies] == ["say:hi", "say:there"]
+
+
+async def test_bidi_backpressure_no_drops_under_slow_consumer(
+    runtime_module, register_namespace, live_server,
+):
+    """Producer sends N items > worker's _BIDI_USER_BUFFER while the impl
+    yields slowly. With the per-call pump + bounded user queue, every
+    item must reach the impl — no silent drops."""
+    register_namespace(SlowEcho)
+    base_url = await live_server()
+
+    n = 150  # well past _BIDI_USER_BUFFER=64
+    inbox: Channel[Item] = Channel()
+
+    async def _push() -> None:
+        for i in range(n):
+            await inbox.send(Item(i=i))
+        await inbox.close()
+
+    async with RuntimeClient(base_url) as c:
+        producer = asyncio.create_task(_push())
+        received = [r.i async for r in c.remote(SlowEcho.echo, items=inbox)]
+        await producer
+
+    assert received == list(range(n))
 
 
 # ── log subscription ─────────────────────────────────────────────────

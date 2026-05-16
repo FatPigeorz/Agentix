@@ -14,20 +14,12 @@ code that doesn't touch the runtime transport.
 
 from __future__ import annotations
 
-import collections.abc as cabc
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from agentix.idents import CallId, MethodName, PackageName
 from agentix.models import NamespaceManifest
-
-#: Type-system origins that mark a parameter or return annotation as
-#: streaming (`AsyncIterator[T]` / `AsyncGenerator[T, ...]`). Used by the
-#: dispatcher to detect server-streaming / bidi impls at bind time AND by
-#: the client to pick the transport path at call time — single rule for
-#: both sides of the wire.
-STREAM_ORIGINS: tuple[type, ...] = (cabc.AsyncIterator, cabc.AsyncGenerator)
 
 # ── Runtime introspection (GET /namespaces, /health) ──────────────────
 

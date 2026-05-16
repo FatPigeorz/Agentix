@@ -39,6 +39,7 @@ from typing import Any
 import socketio
 from pydantic import ValidationError
 
+from agentix.runtime import _pump
 from agentix.runtime.codec import pack, unpack
 from agentix.runtime.events import (
     BIDI_END,
@@ -76,10 +77,20 @@ def _u(data: Any) -> dict:
 
 @dataclass
 class _CallState:
-    """Per-(session, call_id) state for an in-flight stream/bidi call."""
+    """Per-(session, call_id) state for an in-flight stream/bidi call.
+
+    Bidi inbound path is two-tier (mirroring `agentix.runtime.worker`'s
+    pump pattern): `intake` is unbounded so `on_bidi_in` is a sync
+    `put_nowait` — no await, no reordering even under `async_handlers=True`.
+    A per-call `pump` task drains intake into the bounded `in_queue`
+    that the dispatcher's `_input_iter` reads from; the pump's
+    `await put` is what gives backpressure through the wire."""
 
     task: asyncio.Task
+    intake: asyncio.Queue | None = None
     in_queue: asyncio.Queue | None = None
+    pump: asyncio.Task | None = None
+    in_sentinel: Any = None
     in_done: bool = False
 
 
@@ -96,6 +107,12 @@ def make_sio(
 ) -> tuple[socketio.AsyncServer, socketio.ASGIApp]:
     """Build the Socket.IO AsyncServer wired to `multiplexer`, plus its ASGI app."""
 
+    # `async_handlers=True` (the default) spawns one task per event, so
+    # CANCEL can interrupt an in-flight bidi flow even if BIDI_IN
+    # handlers are queued up. We keep BIDI_IN ordering by making
+    # `on_bidi_in` synchronous (`put_nowait` to an unbounded intake) and
+    # moving the only blocking `await put` onto a dedicated per-call
+    # pump task. See `_CallState` for the two-tier queue design.
     sio = socketio.AsyncServer(async_mode="asgi", cors_allowed_origins="*")
     sessions: dict[str, _SessionState] = {}
 
@@ -113,7 +130,11 @@ def make_sio(
             return
         for call in sess.calls.values():
             call.task.cancel()
-        await _drain_tasks([c.task for c in sess.calls.values()])
+            _pump.cancel_if_running(call.pump)
+        await _drain_tasks(
+            [c.task for c in sess.calls.values()]
+            + [c.pump for c in sess.calls.values() if c.pump is not None],
+        )
         if sess.log_handler is not None:
             logging.getLogger(_ROOT_LOG_NAME).removeHandler(sess.log_handler)
         logger.debug("sio disconnect %s", sid)
@@ -187,7 +208,8 @@ def make_sio(
             }), to=sid)
             return
 
-        in_queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+        intake: asyncio.Queue = asyncio.Queue()
+        in_queue: asyncio.Queue = asyncio.Queue(maxsize=_pump.DEFAULT_BIDI_BUFFER)
         sentinel = object()
 
         async def _input_iter():
@@ -207,8 +229,14 @@ def make_sio(
                 elif kind == "error":
                     await sio.emit(BIDI_ERROR, pack({"call_id": call_id, "error": ev.get("error")}), to=sid)
 
-        call_state = _CallState(task=None, in_queue=in_queue)  # type: ignore[arg-type]
-        call_state.in_sentinel = sentinel  # type: ignore[attr-defined]
+        pump_task = asyncio.create_task(_pump.drain(intake, in_queue, sentinel))
+        call_state = _CallState(
+            task=None,                  # type: ignore[arg-type]  filled in by _spawn_call
+            intake=intake,
+            in_queue=in_queue,
+            pump=pump_task,
+            in_sentinel=sentinel,
+        )
         await _spawn_call(sess, call_id, _drive(), state=call_state)
 
     @sio.on(BIDI_IN)
@@ -219,9 +247,12 @@ def make_sio(
         payload = _u(data)
         call_id = payload.get("call_id")
         call = sess.calls.get(call_id) if isinstance(call_id, str) else None
-        if call is None or call.in_queue is None or call.in_done:
+        if call is None or call.intake is None or call.in_done:
             return
-        await call.in_queue.put(payload.get("item"))
+        # Synchronous put_nowait on unbounded intake — no await, so the
+        # handler completes atomically. Order is preserved across
+        # concurrent handler tasks under `async_handlers=True`.
+        call.intake.put_nowait(payload.get("item"))
 
     @sio.on(BIDI_END_IN)
     async def on_bidi_end_in(sid: str, data: Any) -> None:
@@ -231,11 +262,10 @@ def make_sio(
         payload = _u(data)
         call_id = payload.get("call_id")
         call = sess.calls.get(call_id) if isinstance(call_id, str) else None
-        if call is None or call.in_queue is None or call.in_done:
+        if call is None or call.intake is None or call.in_done:
             return
-        sentinel = getattr(call, "in_sentinel", None)
-        if sentinel is not None:
-            await call.in_queue.put(sentinel)
+        if call.in_sentinel is not None:
+            call.intake.put_nowait(call.in_sentinel)
             call.in_done = True
 
     # ── cancel ───────────────────────────────────────────────────
@@ -250,6 +280,7 @@ def make_sio(
         call = sess.calls.pop(call_id, None) if isinstance(call_id, str) else None
         if call is not None:
             call.task.cancel()
+            _pump.cancel_if_running(call.pump)
 
     # ── logs ─────────────────────────────────────────────────────
 
@@ -297,7 +328,12 @@ def make_sio(
         sess.calls[call_id] = state
 
         def _on_done(_t: asyncio.Task) -> None:
-            sess.calls.pop(call_id, None)
+            popped = sess.calls.pop(call_id, None)
+            # Pump task outlives the dispatch task only until the next item
+            # arrives at intake. Cancel it explicitly so it doesn't sit
+            # idle waiting on an intake that will never get more frames.
+            if popped is not None:
+                _pump.cancel_if_running(popped.pump)
 
         task.add_done_callback(_on_done)
 

@@ -353,11 +353,11 @@ class _SubprocessWorker:
             pass
         try:
             await asyncio.wait_for(self._proc.wait(), timeout=5)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._proc.terminate()
             try:
                 await asyncio.wait_for(self._proc.wait(), timeout=2)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 self._proc.kill()
                 # SIGKILL is guaranteed; wait so we reap the zombie.
                 await self._proc.wait()

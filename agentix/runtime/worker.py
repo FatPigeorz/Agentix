@@ -31,6 +31,7 @@ from typing import Any
 
 from agentix import trace
 from agentix.dispatch import Dispatcher
+from agentix.runtime import _pump
 from agentix.runtime import frames as F
 from agentix.runtime.models import RemoteError, RemoteRequest
 from agentix.runtime.rpc import read_frame, write_frame
@@ -79,7 +80,19 @@ class Worker:
         self._dispatcher = dispatcher
         self._package = package
         self._calls: dict[str, asyncio.Task] = {}
+        # Bidi inbound path is two-tier so the main read loop never blocks
+        # on a slow impl: `_bidi_intakes[cid]` is unbounded (drained from
+        # the main loop with `put_nowait`); a per-call `_bidi_pumps[cid]`
+        # task moves items from intake into the bounded `_bidi_queues[cid]`
+        # that the impl reads from. The bounded user queue is what gives
+        # backpressure — when full, the pump's `await put` blocks, the
+        # intake grows briefly, OS pipe fills, multiplexer's stdin write
+        # blocks, Socket.IO emit backs up, ultimately the caller's
+        # `Channel.send()` awaits. CANCEL frames bypass all this via
+        # the main read loop.
         self._bidi_queues: dict[str, asyncio.Queue] = {}
+        self._bidi_intakes: dict[str, asyncio.Queue] = {}
+        self._bidi_pumps: dict[str, asyncio.Task] = {}
         self._writer: asyncio.StreamWriter | None = None
         self._reader: asyncio.StreamReader | None = None
         self._shutdown = asyncio.Event()
@@ -193,9 +206,14 @@ class Worker:
         elif kind == F.KIND_STREAM:
             task = asyncio.create_task(self._run_stream(call_id, request))
         elif kind == F.KIND_BIDI:
-            in_q: asyncio.Queue = asyncio.Queue(maxsize=64)
-            self._bidi_queues[call_id] = in_q
-            task = asyncio.create_task(self._run_bidi(call_id, request, in_q))
+            user_q: asyncio.Queue = asyncio.Queue(maxsize=_pump.DEFAULT_BIDI_BUFFER)
+            intake_q: asyncio.Queue = asyncio.Queue()
+            self._bidi_queues[call_id] = user_q
+            self._bidi_intakes[call_id] = intake_q
+            self._bidi_pumps[call_id] = asyncio.create_task(
+                _pump.drain(intake_q, user_q, _END_SENTINEL)
+            )
+            task = asyncio.create_task(self._run_bidi(call_id, request, user_q))
         else:
             await self._send({
                 "type": F.ERROR, "call_id": call_id,
@@ -204,7 +222,7 @@ class Worker:
             return
         self._calls[call_id] = task
         task.add_done_callback(lambda _t: self._calls.pop(call_id, None))
-        task.add_done_callback(lambda _t: self._bidi_queues.pop(call_id, None))
+        task.add_done_callback(lambda _t, cid=call_id: self._cleanup_bidi(cid))
 
     async def _forward_stream_event(self, call_id: str, event: dict[str, Any]) -> bool:
         """Map a Dispatcher stream/bidi event to its wire frame; return True
@@ -274,26 +292,26 @@ class Worker:
 
     async def _on_bidi_in(self, frame: dict[str, Any]) -> None:
         call_id = frame.get("call_id", "")
-        q = self._bidi_queues.get(call_id)
-        if q is None:
+        intake = self._bidi_intakes.get(call_id)
+        if intake is None:
+            # Late frame after terminal — invariant #2 (terminal-then-quiet).
             return
-        # Drop on QueueFull — if the impl isn't consuming fast enough
-        # (or already exited), blocking here would stall the main read
-        # loop and freeze the worker. Slow-consumer backpressure on bidi
-        # is the caller's problem; the framework picks "lose data" over
-        # "lose the whole worker".
-        try:
-            q.put_nowait(frame.get("item"))
-        except asyncio.QueueFull:
-            logger.warning("worker %r call %s: bidi input queue full, dropping item",
-                           self._package, call_id)
+        # Intake is unbounded; `put_nowait` never raises. Backpressure
+        # happens at `_bidi_pump`'s `await user_q.put(...)` which blocks
+        # on the bounded user queue. The main read loop is never stalled.
+        intake.put_nowait(frame.get("item"))
 
     async def _on_bidi_end_in(self, frame: dict[str, Any]) -> None:
         call_id = frame.get("call_id", "")
-        q = self._bidi_queues.get(call_id)
-        if q is None:
+        intake = self._bidi_intakes.get(call_id)
+        if intake is None:
             return
-        await q.put(_END_SENTINEL)
+        intake.put_nowait(_END_SENTINEL)
+
+    def _cleanup_bidi(self, call_id: str) -> None:
+        self._bidi_queues.pop(call_id, None)
+        self._bidi_intakes.pop(call_id, None)
+        _pump.cancel_if_running(self._bidi_pumps.pop(call_id, None))
 
     def _cancel(self, call_id: str) -> None:
         task = self._calls.get(call_id)
@@ -303,7 +321,8 @@ class Worker:
 
 # Module-level singleton used to signal "end of bidi input" through the
 # input queue. Compared with `is`; the same object reference must be
-# visible from both _on_bidi_end_in (pusher) and _run_bidi (consumer).
+# visible from `_on_bidi_end_in` (pusher), `_pump.drain` (forwarder), and
+# `_run_bidi` (consumer).
 _END_SENTINEL: Any = object()
 
 

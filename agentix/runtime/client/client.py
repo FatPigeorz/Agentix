@@ -31,7 +31,6 @@ from typing import (
     ParamSpec,
     TypeVar,
     get_args,
-    get_origin,
     overload,
 )
 
@@ -39,6 +38,8 @@ import httpx
 import socketio
 from pydantic import TypeAdapter
 
+from agentix.dispatch import detect_shape
+from agentix.rpc import Bidi, Channel, Stream, Unary, is_channel_annotation
 from agentix.runtime.codec import pack, unpack
 from agentix.runtime.events import (
     BIDI_END,
@@ -60,16 +61,13 @@ from agentix.runtime.events import (
     TRACES_UNSUBSCRIBE,
 )
 from agentix.runtime.models import (
-    STREAM_ORIGINS,
     HealthResponse,
     LogRecord,
     NamespaceInfo,
     RemoteError,
-    RemoteRequest,
     RemoteResponse,
     TraceEvent,
 )
-from agentix.dispatch import detect_shape
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -87,7 +85,7 @@ T = TypeVar("T")
 # Both are deterministic in `fn` / `annotation` identity, so a process-
 # wide cache is correct.
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _signature_of(fn: Callable) -> inspect.Signature:
     return inspect.signature(fn, eval_str=True)
 
@@ -163,51 +161,71 @@ class RuntimeClient:
     @overload
     def remote(
         self,
-        fn: Callable[P, AsyncIterator[T]],
-        /,
-        *args: P.args,
-        **kwargs: P.kwargs,
-    ) -> AsyncIterator[T]: ...
-
-    @overload
-    def remote(
-        self,
         fn: Callable[P, AsyncGenerator[T, Any]],
         /,
         *args: P.args,
         **kwargs: P.kwargs,
-    ) -> AsyncIterator[T]: ...
+    ) -> Stream[T] | Bidi[Any, T]: ...
 
     @overload
     def remote(
         self,
-        fn: Callable[P, R],
+        fn: Callable[P, Coroutine[Any, Any, R]],
         /,
         *args: P.args,
         **kwargs: P.kwargs,
-    ) -> Coroutine[Any, Any, R]: ...
+    ) -> Unary[R]: ...
 
     def remote(self, fn, *args, **kwargs):
         """Execute `fn` in the sandbox and return its typed result.
 
-        Dispatch is polymorphic on the stub's signature:
+        Returns a tagged variant whose Python protocol matches the call
+        shape — `await` a `Unary`, `async for` over a `Stream` or `Bidi`.
+        Generic helpers can `match` on the variant for exhaustive
+        dispatch.
 
-          * `-> AsyncIterator[T]` + one `AsyncIterator[U]` parameter
-            → bidi; returns `AsyncIterator[T]`.
-          * `-> AsyncIterator[T]`, no streaming parameters →
-            server-stream; returns `AsyncIterator[T]`.
-          * Otherwise → unary; returns `Coroutine[..., R]`; caller
-            `await`s it.
+          * `async def f(...) -> T`                          → `Unary[T]`
+          * `async def f(...) -> AsyncIterator[T]: yield ...` → `Stream[T]`
+          * `async def f(..., inbox: Channel[I]) -> AsyncIterator[T]: yield ...`
+            → `Bidi[I, T]`; caller pushes inputs via `inbox.send(...)`
         """
         sig = _signature_of(fn)
-        shape = detect_shape(sig)
+        shape = detect_shape(fn, sig)
         if shape == "unary":
-            return self._remote_unary(fn, sig, *args, **kwargs)
+            return Unary(self._remote_unary(fn, sig, args, kwargs))
         if shape == "stream":
-            return self._remote_stream(fn, sig, *args, **kwargs)
-        return self._remote_bidi(fn, sig, *args, **kwargs)
+            return Stream(self._remote_stream(fn, sig, args, kwargs))
+        chan_name, inbox, item_type = self._extract_channel(fn, sig, kwargs)
+        return Bidi(inbox, self._remote_bidi(fn, sig, chan_name, item_type, inbox, args, kwargs))
 
-    async def _remote_unary(self, fn, sig, *args, **kwargs):
+    @staticmethod
+    def _extract_channel(
+        fn, sig: inspect.Signature, kwargs: dict[str, Any],
+    ) -> tuple[str, Channel, Any]:
+        """Locate the `Channel[T]` parameter, pull the user-passed Channel
+        instance from `kwargs`, and recover `T` for item validation.
+
+        Returns `(param_name, channel, item_type)`. Raises if the bidi
+        method has no Channel-typed param, or the user didn't pass a
+        Channel instance for it."""
+        for pname, param in sig.parameters.items():
+            if not is_channel_annotation(param.annotation):
+                continue
+            ch = kwargs.get(pname)
+            if not isinstance(ch, Channel):
+                raise TypeError(
+                    f"{fn.__module__}.{fn.__name__}: bidi parameter "
+                    f"'{pname}' must be an agentix.Channel instance "
+                    f"(got {type(ch).__name__})"
+                )
+            type_args = get_args(param.annotation)
+            return pname, ch, (type_args[0] if type_args else Any)
+        raise TypeError(
+            f"{fn.__module__}.{fn.__name__}: bidi method has no "
+            f"Channel[T] parameter"
+        )
+
+    async def _remote_unary(self, fn, sig, args, kwargs):
         package = fn.__module__
         method = fn.__name__
         body = pack({
@@ -229,7 +247,7 @@ class RuntimeClient:
             return resp.value
         return _adapter_for(return_ann).validate_python(resp.value)
 
-    async def _remote_stream(self, fn, sig, *args, **kwargs):
+    async def _remote_stream(self, fn, sig, args, kwargs):
         package = fn.__module__
         method = fn.__name__
         sio = await self._ensure_sio()
@@ -261,36 +279,26 @@ class RuntimeClient:
             with contextlib.suppress(BaseException):
                 await sio.emit(CANCEL, pack({"call_id": call_id}))
 
-    async def _remote_bidi(self, fn, sig, *args, **kwargs):
+    async def _remote_bidi(
+        self, fn, sig, chan_name: str, in_item_type: Any,
+        inbox: Channel, args, kwargs,
+    ):
         """Bidi over Socket.IO: client emits `bidi:start`, streams inputs as
         `bidi:in`, signals end-of-input with `bidi:end_in`. Server replies via
         `bidi:out` / `bidi:end` / `bidi:error` correlated by `call_id`.
+
+        `chan_name`, `inbox`, and `in_item_type` are already discovered
+        by `_extract_channel` in `remote()`; this method does not
+        re-scan the signature.
         """
         package = fn.__module__
         method = fn.__name__
 
-        # Identify the input-stream param.
-        stream_param: str | None = None
-        in_item_type: Any = Any
-        for pname, param in sig.parameters.items():
-            if get_origin(param.annotation) in STREAM_ORIGINS:
-                stream_param = pname
-                in_args = get_args(param.annotation)
-                in_item_type = in_args[0] if in_args else Any
-                break
-        if stream_param is None:
-            raise TypeError(f"{package}.{method}: signature has no AsyncIterator parameter")
-
         bound = sig.bind(*args, **kwargs)
         bound.apply_defaults()
-        input_iter = bound.arguments.pop(stream_param, None)
-        if input_iter is None or not hasattr(input_iter, "__aiter__"):
-            raise TypeError(
-                f"{package}.{method}: argument '{stream_param}' must be an "
-                f"AsyncIterator (got {type(input_iter).__name__})"
-            )
+        bound.arguments.pop(chan_name, None)
 
-        non_stream_kwargs = _encode_kwargs(sig, dict(bound.arguments))
+        non_channel_kwargs = _encode_kwargs(sig, dict(bound.arguments))
         out_args = get_args(sig.return_annotation)
         out_adapter = _adapter_for(out_args[0] if out_args else Any)
         in_adapter = _adapter_for(in_item_type)
@@ -302,12 +310,12 @@ class RuntimeClient:
 
         await sio.emit(BIDI_START, pack({
             "call_id": call_id, "package": package, "method": method,
-            "args": [], "kwargs": non_stream_kwargs,
+            "args": [], "kwargs": non_channel_kwargs,
         }))
 
         async def _sender() -> None:
             try:
-                async for item in input_iter:
+                async for item in inbox:
                     encoded = in_adapter.dump_python(item, mode="python")
                     await sio.emit(BIDI_IN, pack({"call_id": call_id, "item": encoded}))
                 await sio.emit(BIDI_END_IN, pack({"call_id": call_id}))

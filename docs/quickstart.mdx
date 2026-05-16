@@ -98,9 +98,10 @@ A few things happening here:
    over inheritance. It creates the sandbox on entry and tears it down
    on exit.
 5. **`c.remote(Bash.run, ...)`** reads `Bash.run.__module__`
-   (= `"agentix.bash"`) as the routing key. Unary calls go over
-   `POST /_remote`; methods returning `AsyncIterator[T]` auto-upgrade to
-   Socket.IO.
+   (= `"agentix.bash"`) as the routing key. Returns a tagged variant
+   (`Unary` / `Stream` / `Bidi`) that supports `await` or `async for`
+   directly — call shape is detected from the function. Unary calls
+   ride `POST /_remote`; streaming/bidi auto-upgrade to Socket.IO.
 
 Run it:
 
