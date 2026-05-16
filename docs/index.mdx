@@ -4,59 +4,21 @@ description: The execution, tracing, and integration bridge between agents and y
 ---
 
 **Agentix** is the **execution, tracing, and integration bridge**
-between agents and your LLM serving, RL post-training, and evaluation
-infrastructure. Whether your agent is a CLI binary
-(Claude Code, Codex), a Python framework
-([mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent),
-[swe-agent](https://github.com/SWE-agent/SWE-agent),
-[OpenHands](https://github.com/All-Hands-AI/OpenHands)), or something
-you wrote yourself, Agentix hosts it inside an isolated rollout
-container, captures every LLM call and tool invocation as a
-structured trace, and routes those traces to
-[slime](https://github.com/THUDM/slime), custom serving providers,
+between your agents and your LLM serving, RL post-training, and
+evaluation infrastructure. It hosts agents inside isolated rollout
+containers, captures every LLM call and tool invocation as a
+structured trace, and routes traces to
+[slime](https://github.com/THUDM/slime),
+[verl](https://github.com/volcengine/verl), custom serving providers,
 or benchmark scorers.
 
 Each agent, dataset, or tool is a regular Python project. Call them
-from your trainer or evaluator with typed remote dispatch —
-`c.remote(fn, ...)` reads `fn`'s signature, so Pyright infers every
-return type end-to-end.
-
-## Quickstart
-
-A SWE-bench Verified rollout — clone the repo, run Claude Code, score
-the patch — composed from three integrations:
-
-```python
-from datasets import load_dataset
-from agentix import RuntimeClient, bash, claude_code, swebench
-
-inst = dict(load_dataset("princeton-nlp/SWE-bench_Verified", split="test")[0])
-
-async with RuntimeClient(sandbox.runtime_url) as c:
-    await c.remote(
-        bash.run,
-        command=(
-            f"git clone https://github.com/{inst['repo']}.git /testbed && "
-            f"cd /testbed && git checkout {inst['base_commit']}"
-        ),
-    )
-    cc = await c.remote(
-        claude_code.run,
-        instruction=inst["problem_statement"],
-        workdir="/testbed",
-        env={"ANTHROPIC_API_KEY": api_key},
-    )
-    diff = await c.remote(
-        bash.run, command="cd /testbed && git add -A && git diff --cached",
-    )
-    s = await c.remote(swebench.score, instance=inst, patch=diff.stdout)
-```
+from your trainer or evaluator with typed remote dispatch.
 
 ## Key Features
 
-- **Run any agent in an isolated rollout container** — a CLI binary
-  (Claude Code, Codex), a Python framework (mini-swe-agent,
-  swe-agent, OpenHands), or your own. Built-in recipe:
+- **Run any agent in an isolated rollout container** with its own
+  dependencies. Built-in recipe:
   [Claude Code](https://github.com/Agentiix/agentix-cookbook/tree/main/claude-code).
 - **Score against any benchmark.** Built-in:
   [SWE-bench Verified](https://github.com/Agentiix/agentix-cookbook/tree/main/swebench),
@@ -64,28 +26,35 @@ async with RuntimeClient(sandbox.runtime_url) as c:
   [`swebench`](https://github.com/swe-bench/SWE-bench) harness's test
   specs, log parsers, and grading.
 - **Bridge to RL training and serving.** Every LLM call and tool
-  invocation streams out as a structured trace via
-  [agentix-llm-proxy](https://github.com/Agentiix/agentix-llm-proxy).
-  Destinations: [slime](https://github.com/THUDM/slime) (RL data
-  buffer), custom LLM providers (serving and evaluation).
+  invocation streams out as a structured trace.
+  [abridge](https://github.com/Agentiix/abridge) consumes that stream,
+  correlates events by rollout, and hands them to framework adapters
+  ([slime](https://github.com/THUDM/slime),
+  [verl](https://github.com/volcengine/verl), custom LLM providers for
+  serving / evaluation).
 - **Pluggable execution backends.** `local` (Docker), `daytona`, and
   `e2b` built in; Fly, Modal, Kubernetes via
   `pip install agentix-deployment-<name>`.
-- **Typed remote dispatch.** Call container methods like local
-  functions. Three call shapes (unary / server-streaming /
-  bidirectional) are auto-detected from your function signature.
-- **Trace fan-out.** `agentix.trace.subscribe(fn)` ships every
-  integration's `trace.emit(...)` events into OpenTelemetry, Sentry,
-  or your own bus.
+- **Great IDE typing hints.** Container methods autocomplete like
+  local functions; your editor knows the kwargs and return types
+  end-to-end. Three call shapes (unary / streaming / bidirectional)
+  are auto-detected from your function signature.
+- **Observability as a free lunch.** Every integration's
+  `trace.emit(...)` events fan out to OpenTelemetry, Sentry, or your
+  own bus with one `agentix.trace.subscribe(fn)` call — no
+  per-integration wiring.
 
 ## Supported Integrations
 
 ### Agents
 
 - **Claude Code** — [recipe](https://github.com/Agentiix/agentix-cookbook/tree/main/claude-code)
-- **mini-swe-agent / swe-agent / OpenHands / Codex / Aider / your own** —
-  wrap with the [agent integration guide](/integrate-agent);
-  contributions welcome.
+- CLI binaries (Codex, Aider), Python frameworks
+  ([mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent),
+  [swe-agent](https://github.com/SWE-agent/SWE-agent),
+  [OpenHands](https://github.com/All-Hands-AI/OpenHands)),
+  or your own — wrap with the
+  [agent integration guide](/integrate-agent).
 
 ### Benchmarks
 
@@ -102,13 +71,6 @@ async with RuntimeClient(sandbox.runtime_url) as c:
 
 - `local` (Docker), `daytona`, `e2b` — built in
 - Third-party — `pip install agentix-deployment-<name>`
-
-### RL Frameworks / Serving Providers
-
-- [**slime**](https://github.com/THUDM/slime) — RL post-training
-- **Custom LLM providers** — serving and evaluation
-
-Both via [agentix-llm-proxy](https://github.com/Agentiix/agentix-llm-proxy).
 
 ## Read next
 
