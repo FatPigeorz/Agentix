@@ -1,6 +1,6 @@
 ---
 title: Development
-description: Local setup, daily workflow, and how to add a new closure.
+description: Local setup, daily workflow, and how to add a new namespace to the in-tree primitives.
 ---
 
 ## Prerequisites
@@ -8,14 +8,15 @@ description: Local setup, daily workflow, and how to add a new closure.
 - Python 3.11+
 - [Docker](https://docs.docker.com/get-docker/) — the only host
   requirement. Nix runs inside the builder stage of
-  `tests/closure-docker/Dockerfile`.
+  [`primitives/_template/Dockerfile`](https://github.com/Agentiix/Agentix/tree/master/primitives/_template).
 
 ## Setup
 
 ```bash
 git clone https://github.com/Agentiix/Agentix.git
 cd Agentix
-pip install -e '.[dev]'        # fastapi, uvicorn, httpx, pytest, ruff
+pip install -e '.[dev]'                        # fastapi, uvicorn, httpx, pytest, ruff
+pip install -e primitives/bash primitives/files
 ```
 
 ## Daily workflow
@@ -27,39 +28,42 @@ agentix-server                 # http://localhost:8000
 agentix-server --port 9000
 ```
 
-Without any closures mounted, the server exposes its built-ins
+Without any namespaces installed the server exposes its built-ins only
 (`/health`, `/exec`, `/upload`, `/download`). Useful for iterating on
-the runtime without the Docker round-trip.
+the runtime without the Docker round-trip; `pip install -e primitives/bash`
+makes `agentix.bash:Bash` discoverable on the next start.
 
-### Build closures
+### Build namespace images
 
-The repo's runtime and mock closures share one Dockerfile:
+The runtime image and the in-tree primitives share one Dockerfile:
 
 ```bash
-docker build -t agentix/runtime:dev      -f tests/closure-docker/Dockerfile .
-docker build -t agentix/mock-agent:dev   -f tests/closure-docker/Dockerfile tests/closures/mock-agent
-docker build -t agentix/mock-dataset:dev -f tests/closure-docker/Dockerfile tests/closures/mock-dataset
+agentix build primitives/bash                          # → agentix/bash:0.1.0
+agentix build primitives/files                         # → agentix/files:0.1.0
+docker build -t agentix/runtime:dev -f primitives/_template/Dockerfile .
 ```
 
 ### Smoke-test end-to-end in Docker
 
 ```python
 import asyncio
-from agentix import DockerDeployment, RuntimeClient, SandboxConfig
-from agentix_closures import mock_agent  # typed stubs
+from agentix import RuntimeClient, SandboxConfig
+from agentix.deployment.base import session
+from agentix.deployment.docker import DockerDeployment
+from agentix.bash import Bash
 
 async def main():
     deployment = DockerDeployment()
     config = SandboxConfig(
         image="ubuntu:24.04",
         runtime="agentix/runtime:dev",
-        closures=["agentix/mock-agent:dev"],
+        namespaces=["agentix/bash:0.1.0"],
     )
-    async with deployment.session(config) as sb:
+    async with session(deployment, config) as sb:
         async with RuntimeClient(sb.runtime_url) as c:
             print(await c.run("uname -a"))
-            result = await c.remote(mock_agent.run, instruction="hi")
-            print(result.patch)
+            result = await c.remote(Bash.run, command="echo hi")
+            print(result.stdout)
 
 asyncio.run(main())
 ```
@@ -67,21 +71,22 @@ asyncio.run(main())
 ### Lint & test
 
 ```bash
-ruff check agentix/ tests/
+ruff check agentix/ tests/ primitives/
 pytest                      # unit tests
 pytest -x                   # stop on first failure
 ```
 
-## Adding a new closure
+## Adding a new namespace
 
-Everything inside the sandbox is a closure. Copy a reference and write
-your own Dockerfile:
+A namespace is a normal Python project (whatever `uv init --lib`
+produces) with one entry-point declaration. The fastest path is to
+copy the template:
 
 ```bash
-cp -r tests/closures/mock-agent my-closure
-# edit my-closure/default.nix and the source package for your logic
-# author my-closure/Dockerfile (see tests/closure-docker/Dockerfile for a working reference)
-docker build -t my-closure:0.1.0 ./my-closure
+cp -r primitives/_template my-namespace
+# edit my-namespace/pyproject.toml (name, entry point)
+# edit my-namespace/src/agentix/<name>/__init__.py (your class)
+agentix build my-namespace
 ```
 
 Use it:
@@ -90,9 +95,10 @@ Use it:
 SandboxConfig(
     image="ubuntu:24.04",
     runtime="agentix/runtime:dev",
-    closures={"mine": "my-closure:0.1.0"},
+    namespaces=["my-namespace:0.1.0"],
 )
 ```
 
-See [Namespace protocol](/reference/namespace-protocol) for the closure
-ABI.
+See [Namespace protocol](/reference/namespace-protocol) for the full
+contract, and [`primitives/bash`](https://github.com/Agentiix/Agentix/tree/master/primitives/bash)
+for a working class-based example.

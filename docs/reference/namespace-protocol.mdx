@@ -1,336 +1,278 @@
 ---
 title: Namespace protocol
-description: The wire-format contract between caller and sandbox — useful when porting the client to another language.
+description: The contract between a namespace, the runtime, and the caller — class layout, entry-point declaration, and the wire format.
 ---
 
-A **namespace** is a Docker image that ships a Python package the
-Agentix runtime imports in-process. Calls are typed Python
-(`await c.remote(my_namespace.fn, x=1)`), not arbitrary HTTP — the
-runtime exposes a single dispatch endpoint and routes by Python module
-path.
+A **namespace** is a normal Python distribution that contributes a class
+to the `agentix.*` import namespace and declares one
+`agentix.namespace` entry point. Callers invoke its methods via
+`await c.remote(MyClass.method, x=1)` — the runtime resolves the
+routing key from `method.__module__`, imports the class lazily, and
+runs the real method body inside the sandbox.
 
-## Image convention
+## Package layout
 
-A namespace image MUST:
-
-1. Declare `VOLUME /nix` (so Docker's volume-init-from-image rule
-   populates a named volume on first attach).
-2. Contain `/nix/store/<hash>-*/` — the content-addressed Nix
-   dependencies (native binaries + the namespace's Python wheel
-   contents).
-3. Contain `/nix/entry/python/<package-tree>/` — the namespace's Python
-   package, drop-importable when the runtime adds `entry/python` to
-   `sys.path`.
-4. Contain `/nix/entry/manifest.json` — a `NamespaceManifest` JSON file
-   with `abi == AGENTIX_CLOSURE_ABI` and
-   `package = "agentix_namespaces.<name>"`.
-5. Optionally contain `/nix/entry/bin/...` — native binaries the impl
-   shells out to (claude, git, …). Exposed to `/exec` via
-   `paths_from=["agentix_namespaces.<name>"]`.
-
-There is no `bin/start`. The runtime is a single process; namespaces
-contribute Python modules to it, not separate binaries.
-
-## Python package layout
-
-The namespace's Python package must declare three things:
+A namespace is whatever `uv init --lib` produces, with one convention —
+contribute to the `agentix.*` import namespace:
 
 ```text
-agentix_namespaces/
-└── <name>/
-    ├── __init__.py        # caller-facing stubs
-    ├── _impl.py           # real implementation
-    └── _register.py       # def register() -> Dispatcher
+agentix-myagent/
+├── pyproject.toml
+└── src/
+    └── agentix/              # PEP 420 namespace package — no __init__.py
+        └── myagent/
+            └── __init__.py   # class MyAgent(Namespace): ...
 ```
 
-### `__init__.py` — typed stubs
+Why PEP 420: the framework's own `agentix/__init__.py` extends its
+`__path__` via `pkgutil.extend_path`, so any wheel that installs files
+at `<site-packages>/agentix/myagent/` becomes importable as
+`from agentix.myagent import MyAgent`. Multiple namespace distributions
+install peer entries under `agentix/` without colliding — the wheel's
+own metadata, surfaced through `importlib.metadata`, is the only
+discovery channel.
 
-```python
-from dataclasses import dataclass
+**Reserved framework subpackages** — namespace dists may not shadow:
+`agentix.cli`, `agentix.deployment`, `agentix.dispatch`, `agentix.idents`,
+`agentix.models`, `agentix.namespace`, `agentix.rollout`,
+`agentix.runtime`, `agentix.trace`, `agentix.wire`. Everything else
+under `agentix.*` is fair game.
 
-@dataclass
-class RunResult:
-    exit_code: int
-    patch: str
+## The class IS the namespace
 
-def run(instruction: str, workdir: str = "/testbed") -> RunResult:
-    """Run against an instruction; returns a fake patch echoing the input."""
-    raise NotImplementedError("call via RuntimeClient.remote(my_namespace.run, ...)")
+```python src/agentix/myagent/__init__.py
+from agentix.namespace import Namespace
+
+class MyAgent(Namespace):
+    """Optional docstring — surfaces in /namespaces output."""
+
+    @staticmethod
+    async def run(instruction: str) -> str:
+        # real implementation — runs inside the sandbox
+        return f"did: {instruction}"
 ```
 
-Signature is the contract. Body raises so a caller who accidentally
-invokes `run(...)` locally fails fast.
+- `class MyAgent(Namespace)` declares the namespace.
+- Methods are `@staticmethod` — no `self`, no instance state.
+- **Method bodies are the real implementation.** There is no stub vs
+  impl split; no `_impl.py`, no `_register.py`, no
+  `<Name>Impl` convention.
+- Namespaces with heavy native dependencies should use **lazy imports
+  inside method bodies** so caller-side `from agentix.myagent import MyAgent`
+  stays cheap.
 
-### `_impl.py` — real bodies
+## Entry-point declaration
 
-```python
-from . import RunResult
+```toml pyproject.toml
+[project]
+name = "agentix-myagent"
+version = "0.1.0"
+requires-python = ">=3.11"
 
-def run(instruction: str, workdir: str = "/testbed") -> RunResult:
-    # actually do work
-    return RunResult(exit_code=0, patch="...")
+[project.entry-points."agentix.namespace"]
+myagent = "agentix.myagent:MyAgent"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentix"]
 ```
 
-Plain functions; no decorators, no FastAPI, no socket binding. May be
-`async def`.
+The key on the left (`myagent`) is the short name used in
+`agentix install ... -o my-bundle:0.1.0` and shown by `agentix check`.
+The value on the right (`agentix.myagent:MyAgent`) is what the runtime
+imports.
 
-### `_register.py` — bind stubs to impls
+## Sandbox-side runtime
 
-```python
-from agentix.dispatch import Dispatcher
-from . import run
-from ._impl import run as _run
+Inside the sandbox, the runtime walks
+`importlib.metadata.entry_points(group="agentix.namespace")` at startup
+and records each `(name, module:class)` pair. **Nothing is imported
+yet.** The first `POST /_remote` for a given namespace triggers
+`ep.load()` under a per-namespace async lock, and the class becomes
+live for the rest of the runtime's life. Subsequent dispatches reuse
+the loaded class.
 
-def register() -> Dispatcher:
-    d = Dispatcher()
-    d.bind(run, _run)
-    return d
-```
+Import errors are cached on the registry entry — a broken namespace
+fails calls to itself but never blocks boot or siblings. There is no
+on-disk manifest the runtime inspects; the wheel's installed metadata
+(visible through `importlib.metadata`) is the entire discovery
+contract.
 
-Runtime calls `register()` once on startup. Pure function, no globals.
-
-## Manifest
-
-`/nix/entry/manifest.json` is the marker that identifies a `/mnt/<dir>`
-mount as an Agentix namespace. The runtime ignores any mount whose
-manifest is missing, malformed, or carries an incompatible abi.
-
-```json
-{
-  "abi": 1,
-  "name": "my-namespace",
-  "version": "1.0.0",
-  "package": "agentix_namespaces.my_namespace",
-  "kind": "agent",
-  "description": "Short blurb"
-}
-```
-
-| Field         | Required | Purpose                                                                                                  |
-| ------------- | -------- | -------------------------------------------------------------------------------------------------------- |
-| `abi`         | yes      | Must equal `AGENTIX_CLOSURE_ABI` (currently `1`). Runtime skips mismatches with a warning.               |
-| `name`        | yes      | Human-readable name (for logs).                                                                          |
-| `version`     | yes      | Semantic version.                                                                                        |
-| `package`     | yes      | Python import path (`agentix_namespaces.<name>`). **Routing key.**                                       |
-| `description` | no       | Short description.                                                                                       |
-| `kind`        | no       | Free-form tag for tooling; runtime ignores.                                                              |
-
-Extra fields are allowed and preserved.
-
-## Sandbox-side placement
-
-After the deployment puts each namespace's content into a per-image
-named volume and mounts each at `/mnt/c<digest>:ro`, a sandbox sees:
-
-```text
-/mnt/c<digest>/
-├── store/<hash>-*/                         ← Nix deps (used by the symlink forest)
-└── entry/
-    ├── python/
-    │   └── agentix_namespaces/<name>/      ← runtime imports this
-    │       ├── __init__.py
-    │       ├── _impl.py
-    │       └── _register.py
-    ├── bin/<cli>                           ← optional native binaries
-    └── manifest.json                       ← NamespaceManifest
-```
-
-and
-
-```text
-/nix/
-└── store/<hash>-*/                         ← tmpfs, symlinked from /mnt/*/store/*
-```
-
-Every Nix binary's absolute `/nix/store/<hash>` reference resolves
-through the symlink forest. Mount dir names (`/mnt/c<digest>`) are
-deployment-internal; the runtime indexes namespaces by
-`manifest.package`, not by directory.
-
-## Runtime lifecycle
-
-```text
-Sandbox boot
-    │
-    ├─ tmpfs /nix
-    ├─ mkdir /nix/store
-    ├─ ln -sfn /mnt/*/store/*  /nix/store/
-    └─ exec /mnt/runtime/entry/bin/start
-           │
-           └─ lifespan: scan /mnt/* (skip 'runtime')
-                for each /mnt/<dir>/entry/manifest.json (valid + matching abi):
-                    sys.path.insert(0, /mnt/<dir>/entry/python)
-                    registry.register(pending=manifest)        # no import yet
-
-First POST /_remote for <pkg>:
-    registry.get_or_load(<pkg>):
-        async with per-pkg lock:
-            importlib.import_module(<pkg>)
-            dispatcher = importlib.import_module("<pkg>._register").register()
-            entry.dispatcher = dispatcher
-    dispatcher.dispatch(request)
-```
-
-Namespaces are **fixed at sandbox create time** (the set is discovered
-at boot); import is **lazy** (deferred until first call per namespace).
-Change the set by recreating the sandbox.
+See [Architecture](/reference/architecture) for the full sandbox layout
+(`/mnt/runtime`, `/mnt/c<digest>`, the `/nix/store` symlink forest) and
+how `agentix install` bundles multiple namespaces into a single
+deployable image.
 
 ## Wire
 
-A single endpoint serves all remote calls.
+### Unary — `POST /_remote`
 
 ```text
 POST /_remote
-  { "package": "agentix_namespaces.my_namespace",
+  { "package": "agentix.myagent",
     "method":  "run",
     "args":    [],
     "kwargs":  { "instruction": "fix the bug" } }
 ```
 
-Success:
+Success — always 200:
 
 ```json
-{ "ok": true, "value": { "exit_code": 0, "patch": "..." } }
+{ "ok": true, "value": "did: fix the bug" }
 ```
 
-Failure (validation, impl raises, serialization):
+Failure — also 200, with the exception class name in the payload:
 
 ```json
 { "ok": false, "error": { "type": "ValueError", "message": "...", "traceback": "..." } }
 ```
 
-The wire stays 200 even for impl failures — `error.type` carries the
-exception class name. Only "package not loaded" returns 404.
+Only "package not found in registry" returns 404. W3C `traceparent`
+and `tracestate` headers pass through.
 
-W3C `traceparent` / `tracestate` headers pass through.
+### Streaming, bidirectional, log subscription — Socket.IO
+
+`/socket.io/` carries every non-unary call. One persistent Socket.IO
+connection per `RuntimeClient` multiplexes everything, demultiplexed by
+a caller-generated `call_id`:
+
+```text
+stream            { call_id, package, method, args, kwargs }
+stream:item       { call_id, value }
+stream:end        { call_id }
+stream:error      { call_id, error }
+
+bidi:start        { call_id, package, method, args, kwargs }
+bidi:in           { call_id, item }
+bidi:end_in       { call_id }
+bidi:out          { call_id, value }
+bidi:end          { call_id }
+bidi:error        { call_id, error }
+
+logs:subscribe    { filter?: <logger-name prefix> }
+log               { level, name, message, timestamp }
+logs:unsubscribe  {}
+```
+
+`RuntimeClient.remote` picks the wire automatically by inspecting the
+method's return annotation: plain return → unary HTTP;
+`AsyncIterator[T]` → server-streaming Socket.IO; `AsyncIterator[U]`
+parameter + `AsyncIterator[V]` return → bidi.
 
 ## Caller side
 
 ```python
 from agentix import RuntimeClient
-from agentix_namespaces import my_namespace
+from agentix.myagent import MyAgent
 
 async with RuntimeClient(sandbox.runtime_url) as c:
-    result = await c.remote(my_namespace.run, instruction="...")
-    # result is my_namespace.RunResult — IDE / mypy fully informed
+    result = await c.remote(MyAgent.run, instruction="…")
+    # result: str — pyright infers from MyAgent.run's return type
 ```
 
 `RuntimeClient.remote(fn, *args, **kwargs)`:
 
-- Reads `fn.__module__` → routing key
-- Reads `fn.__name__` → method
-- Serialises args/kwargs via pydantic `TypeAdapter` from
-  `inspect.signature(fn)`
-- Decodes the response value into `fn`'s return type
+- Reads `fn.__module__` → routing key (the entry-point value's left side).
+- Reads `fn.__name__` → method.
+- Serialises args/kwargs via pydantic `TypeAdapter` driven by
+  `inspect.signature(fn)`.
+- Decodes the response into `fn`'s return type.
 
-No magic registration, no decorators on the stubs. The function
+No magic registration, no decorators on the class. The function
 reference and its signature carry everything the wire needs.
 
-## Streaming returns
+## Streaming methods
 
-A stub annotated `-> AsyncIterator[T]` (or `AsyncGenerator[T, ...]`)
-opts into streaming. The impl is an `async def` generator:
+A method annotated `-> AsyncIterator[T]` (or `AsyncGenerator[T, ...]`)
+opts into the streaming wire.
+
+```python src/agentix/chatbot/__init__.py
+from collections.abc import AsyncIterator
+from agentix.namespace import Namespace
+
+class Chatbot(Namespace):
+    @staticmethod
+    async def chat(prompt: str) -> AsyncIterator[str]:
+        proc = await asyncio.create_subprocess_exec("claude", "-p", prompt, ...)
+        async for line in proc.stdout:
+            yield line.decode()
+```
+
+Caller iterates directly — **no `await` on the call site**:
 
 ```python
-# __init__.py
-from typing import AsyncIterator
-
-def chat(prompt: str) -> AsyncIterator[Token]:
-    raise NotImplementedError("call via RuntimeClient.remote(chat, ...)")
-
-# _impl.py
-async def chat(prompt: str) -> AsyncIterator[Token]:
-    proc = await asyncio.create_subprocess_exec("claude", "-p", prompt, ...)
-    async for line in proc.stdout:
-        yield Token(text=line.decode())
+async for token in c.remote(Chatbot.chat, prompt="…"):
+    print(token, end="")
 ```
 
-Caller iterates directly — **no `await`**:
-
-```python
-async for token in c.remote(my_namespace.chat, prompt="..."):
-    print(token.text)
-```
-
-`RuntimeClient.remote` picks the streaming or unary code path by
-inspecting the stub's return annotation. The wire stays at
-`POST /_remote`, but the response becomes `application/x-ndjson` —
-one JSON event per line:
-
-```jsonl
-{"item": {"text": "Hello", ...}}
-{"item": {"text": " world", ...}}
-{"end": true}
-```
-
-If the impl raises mid-stream, the next line is `{"error": {...}}` and
-the client raises `RemoteCallError`. Already-yielded items are observed
+Items flow over the Socket.IO `stream:item` event. The stream closes
+with `stream:end`; impl exceptions arrive as `stream:error` and the
+client raises `RemoteCallError`. Already-yielded items are observed
 before the raise.
 
-<Note>
-  **Not supported in v1**: streaming inputs (chunked request body),
-  bidirectional streaming, automatic back-pressure tuning. Items are
-  consumed by the HTTP/1.1 chunked-transfer stream; slow consumers
-  will TCP-block the impl's `yield`.
-</Note>
+## Bidirectional methods
+
+A method whose **first parameter** is `AsyncIterator[U]` and whose
+**return type** is `AsyncIterator[V]` opts into bidi:
+
+```python
+async def echo(messages: AsyncIterator[str]) -> AsyncIterator[str]:
+    async for msg in messages:
+        yield f"echo: {msg}"
+```
+
+The caller passes an async iterable of inputs and consumes another
+async iterable of outputs over the same `call_id`. Inputs flow as
+`bidi:in` events; outputs as `bidi:out`. See `agentix.wire.BidiPattern`
+for the framing details.
 
 ## Runtime built-ins
 
-Independent of any namespace, the runtime exposes:
+Independent of any namespace, the runtime exposes these endpoints —
+useful when you need raw sandbox I/O without going through a namespace.
 
 | Endpoint              | Purpose                                                                                                                                              |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /health`         | Liveness                                                                                                                                             |
+| `GET /health`         | Liveness.                                                                                                                                            |
 | `POST /exec`          | Run a shell command in the sandbox. Body `{command, cwd?, env?, timeout?, paths_from?}`. SSE when `Accept: text/event-stream`; else JSON `{exit_code, stdout, stderr}`. |
 | `POST /upload`        | Multipart upload into `AGENTIX_UPLOAD_ROOT` (default `/workspace`).                                                                                  |
 | `GET /download?path=` | Stream a file back.                                                                                                                                  |
-| `GET /namespaces`     | List loaded namespaces and their manifests.                                                                                                          |
+| `GET /namespaces`     | List loaded namespaces.                                                                                                                              |
 
 `RuntimeClient.run / upload / download / namespaces` are typed Python
-helpers. Directory listing and other file inspection go through `/exec`
-(`ls -la`, `find`, `stat`).
+helpers over these. Directory listing and file inspection go through
+`/exec` (`ls -la`, `find`, `stat`).
 
-### `/exec` env and PATH
+### `/exec` env and PATH policy
 
 Subprocesses run with a scrubbed env:
 
-- Stripped: `LD_LIBRARY_PATH`, `LD_PRELOAD`, `PYTHONPATH`, `PYTHONHOME`,
-  `LOCALE_ARCHIVE`, `FONTCONFIG_*`, `SSL_CERT_FILE`, anything prefixed
-  `NIX_`.
-- Default PATH: the task image's (`/usr/local/bin:/usr/bin:/bin`).
+- **Stripped:** `LD_LIBRARY_PATH`, `LD_PRELOAD`, `PYTHONPATH`,
+  `PYTHONHOME`, `LOCALE_ARCHIVE`, `FONTCONFIG_*`, `SSL_CERT_FILE`,
+  anything prefixed `NIX_`. The runtime is a Nix-built binary; leaking
+  those into a task-image subprocess causes glibc ABI mismatches.
+- **Default PATH:** the task image's `/usr/local/bin:/usr/bin:/bin`.
   Task-image tools take precedence over namespace-bundled tools of the
   same name.
-- Opt-in to a namespace's bins with
-  `paths_from=["agentix_namespaces.<name>"]` — prepends that
-  namespace's `entry/bin`. `["*"]` includes every loaded namespace.
+- **Opt-in namespace bins:** `paths_from=["agentix.<name>"]` prepends
+  that namespace's `entry/bin`. `["*"]` includes every loaded
+  namespace.
 
-## Writing a namespace (minimal recipe)
+## Minimal recipe
 
 ```text
 my-namespace/
-├── pyproject.toml          # [project] name = "agentix-namespace-my-namespace"; packages = ["agentix_namespaces/my_namespace"]
-├── agentix_namespaces/
-│   └── my_namespace/
-│       ├── __init__.py     # stub: typed signatures, body raises NotImplementedError
-│       ├── _impl.py        # real bodies
-│       └── _register.py    # def register() -> Dispatcher: ...
-├── manifest.json           # { "abi": 1, "package": "agentix_namespaces.my_namespace", ... }
-├── default.nix             # buildPythonPackage + symlinkJoin into /entry/python + /entry/manifest.json
-└── Dockerfile              # nix-build → copy /export into final image
+├── pyproject.toml          # [project.entry-points."agentix.namespace"]
+└── src/agentix/<name>/
+    └── __init__.py         # class MyClass(Namespace) with @staticmethod methods
 ```
 
-Build the image with a Dockerfile that runs `nix-build` in a builder
-stage and copies `/export` into a `VOLUME /nix` final layer.
-`tests/namespace-docker/Dockerfile` in this repo is a working
-reference, as are `tests/namespaces/mock-agent/` and
-`tests/namespaces/mock-dataset/`.
+That's it. `pip install ./my-namespace` makes it discoverable; `pytest`,
+`pyright`, `ruff`, `uv build` all work against the source directory
+without further configuration.
 
-Use it:
-
-```python
-SandboxConfig(
-    image="ubuntu:24.04",
-    runtime="agentix/runtime:0.1.0",
-    namespaces=["my-namespace:1.0"],
-)
-```
+To ship a deployable image, drop in the shared
+[`primitives/_template/Dockerfile`](https://github.com/Agentiix/Agentix/tree/master/primitives/_template)
+and
+[`primitives/_template/default.nix`](https://github.com/Agentiix/Agentix/tree/master/primitives/_template),
+then `agentix build ./my-namespace`. `primitives/bash` and
+`primitives/files` are working in-tree examples.

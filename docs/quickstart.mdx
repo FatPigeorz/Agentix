@@ -75,7 +75,7 @@ async def main():
     config = SandboxConfig(
         image="ubuntu:24.04",
         runtime="agentix/runtime:latest",
-        closures=["agentix/bash:0.1.0"],
+        namespaces=["agentix/bash:0.1.0"],
     )
     async with session(deployment, config) as sandbox:
         async with RuntimeClient(sandbox.runtime_url) as c:
@@ -94,8 +94,8 @@ A few things happening here:
 2. **`DockerDeployment()`** is the built-in `local` deployment. Swap in
    another backend with `load_deployment("daytona")` or
    `load_deployment("e2b")`.
-3. **`closures=["agentix/bash:0.1.0"]`** — one closure image per
-   namespace, pre-built by `agentix build`.
+3. **`namespaces=["agentix/bash:0.1.0"]`** — one image per namespace,
+   pre-built by `agentix build`.
 4. **`session(deployment, config)`** is a free function — composition
    over inheritance. It creates the sandbox on entry and tears it down
    on exit.
