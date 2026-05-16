@@ -26,11 +26,7 @@ ships three built-ins — `local` (Docker), `daytona`, `e2b` — and any
     from agentix.deployment.docker import DockerDeployment
 
     deployment = DockerDeployment()
-    config = SandboxConfig(
-        image="ubuntu:24.04",
-        runtime="agentix/runtime:latest",
-        namespaces=["agentix/bash:0.1.0"],
-    )
+    config = SandboxConfig(image="my-agent:0.1.0")
     async with session(deployment, config) as sandbox:
         async with RuntimeClient(sandbox.runtime_url) as c:
             ...

@@ -171,7 +171,7 @@ app.sio = _sio  # type: ignore[attr-defined]
 install_trace_bridge(_sio)
 
 
-# ── Entry point (invoked as /mnt/runtime/entry/bin/start) ───────
+# ── Entry point (the bundle image's Docker ENTRYPOINT) ─────────
 
 
 def main() -> None:

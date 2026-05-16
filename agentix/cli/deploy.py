@@ -3,13 +3,17 @@
 Usage:
 
     agentix deploy local   --image my-agent:0.1.0
-    agentix deploy local   --image my-agent:0.1.0 --base ubuntu:24.04 --detach
+    agentix deploy local   --image my-agent:0.1.0 --detach
     agentix deploy daytona --image docker.io/me/my-agent:0.1.0    # stub
     agentix deploy e2b     --image docker.io/me/my-agent:0.1.0    # stub
 
 `local` is the only backend fully wired today. `daytona` and `e2b` are
 defined so the CLI surface stabilizes; calling them surfaces a clear
 NotImplementedError pointing at the deploy roadmap.
+
+The `--image` is a deploy-ready bundle produced by `agentix build` —
+it carries the runtime + every namespace + any system deps in one
+image. The deployment just runs it.
 
 By default the command stays in the foreground, prints the sandbox's
 runtime URL, and tears the sandbox down on Ctrl-C. `--detach` exits
@@ -31,10 +35,6 @@ from agentix.models import SandboxConfig
 
 logger = logging.getLogger("agentix.cli.deploy")
 
-# Default base + runtime images. Override with `--base` / `--runtime`.
-DEFAULT_BASE_IMAGE = "ubuntu:24.04"
-DEFAULT_RUNTIME_IMAGE = "agentix/runtime:latest"
-
 
 def _make_deployment(backend: str) -> Deployment:
     """Look up the deployment class via the `agentix.deployment` entry-point
@@ -51,18 +51,12 @@ def _make_deployment(backend: str) -> Deployment:
 
 async def _run_async(backend: str, args: argparse.Namespace) -> int:
     deployment = _make_deployment(backend)
-    config = SandboxConfig(
-        image=args.base,
-        runtime=args.runtime,
-        namespaces=[args.image],
-    )
+    config = SandboxConfig(image=args.image)
     if args.detach:
         sandbox = await deployment.create(config)
         print(sandbox.sandbox_id)
         print(f"  runtime_url: {sandbox.runtime_url}")
         print(f"  status:      {sandbox.status}")
-        print(f"# stop with `python -c \"...\" {sandbox.sandbox_id}` "
-              f"(no `agentix stop` yet — TODO)")
         return 0
 
     # Foreground mode: stay alive until SIGINT, then tear down.
@@ -96,15 +90,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--image", required=True,
-        help="namespace or bundle image tag (e.g. my-agent:0.1.0)",
-    )
-    parser.add_argument(
-        "--base", default=DEFAULT_BASE_IMAGE,
-        help=f"base task image (default: {DEFAULT_BASE_IMAGE})",
-    )
-    parser.add_argument(
-        "--runtime", default=DEFAULT_RUNTIME_IMAGE,
-        help=f"runtime image ref (default: {DEFAULT_RUNTIME_IMAGE})",
+        help="deploy-ready bundle image tag (e.g. my-agent:0.1.0)",
     )
     parser.add_argument(
         "--detach", action="store_true",

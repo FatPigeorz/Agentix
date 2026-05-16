@@ -1,30 +1,23 @@
-# Canonical agentix Dockerfile.
+# Runtime image — Python slim + framework wheel.
 #
-# Used by the runtime image build (`docker build -f primitives/_template/Dockerfile .`
-# from the repo root). `agentix build` generates its own equivalent Dockerfile
-# programmatically for namespace bundles, but the runtime image — which provides
-# `/mnt/runtime/entry/bin/start` to every sandbox — is built directly from this
-# file.
+# Built from the repo root:
+#   docker build -t agentix/runtime:<version> -f primitives/_template/Dockerfile .
 #
-# Build context must contain `pyproject.toml` + `default.nix` (or a sibling that
-# `default.nix` reads) so the nix derivation can pick up name + version.
-ARG NIX_IMAGE=nixos/nix:latest
+# Namespace bundles extend this with their own Python packages
+# (pip-installed alongside `agentix`) and any system deps from Nix.
+# At deploy time the bundle image runs directly — no mount-and-merge,
+# no volume populate.
 
-FROM ${NIX_IMAGE} AS builder
-RUN mkdir -p ~/.config/nix && \
-    echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf && \
-    nix-channel --update 2>/dev/null || true
-WORKDIR /src
-COPY . .
-RUN nix-build --no-out-link default.nix -o ./result && \
-    STORE_PATH=$(readlink -f ./result) && \
-    mkdir -p /export/nix/store && \
-    for p in $(nix-store -qR "$STORE_PATH"); do cp -a "$p" /export/nix/store/; done && \
-    ln -s "$STORE_PATH" /export/nix/entry
+FROM python:3.11-slim AS builder
+WORKDIR /build
+RUN pip install --no-cache-dir build
+COPY pyproject.toml README.md ./
+COPY agentix ./agentix
+RUN python -m build --wheel --outdir /dist
 
-FROM busybox:stable
-COPY --from=builder /export /
-VOLUME /nix
-ARG NAMESPACE_NAME=unknown
-LABEL org.agentix.namespace=1
-LABEL org.agentix.namespace.name=${NAMESPACE_NAME}
+FROM python:3.11-slim
+COPY --from=builder /dist/*.whl /tmp/
+RUN pip install --no-cache-dir /tmp/agentix-*.whl && rm /tmp/agentix-*.whl
+EXPOSE 8000
+ENV AGENTIX_BIND_PORT=8000
+ENTRYPOINT ["agentix-server"]

@@ -72,11 +72,8 @@ from agentix.bash import Bash
 
 async def main():
     deployment = DockerDeployment()
-    config = SandboxConfig(
-        image="ubuntu:24.04",
-        runtime="agentix/runtime:latest",
-        namespaces=["agentix/bash:0.1.0"],
-    )
+    # `agentix build bash -o my-bash:0.1.0` produces this image.
+    config = SandboxConfig(image="my-bash:0.1.0")
     async with session(deployment, config) as sandbox:
         async with RuntimeClient(sandbox.runtime_url) as c:
             result = await c.remote(Bash.run, command="echo hi")
@@ -94,8 +91,9 @@ A few things happening here:
 2. **`DockerDeployment()`** is the built-in `local` deployment. Swap in
    another backend with `load_deployment("daytona")` or
    `load_deployment("e2b")`.
-3. **`namespaces=["agentix/bash:0.1.0"]`** — one image per namespace,
-   pre-built by `agentix build`.
+3. **`SandboxConfig(image="my-bash:0.1.0")`** — one deploy-ready bundle
+   image, built by `agentix build`. Contains the runtime + every namespace's
+   Python package, plus any system deps.
 4. **`session(deployment, config)`** is a free function — composition
    over inheritance. It creates the sandbox on entry and tears it down
    on exit.
@@ -111,7 +109,7 @@ python hello_sandbox.py
 # → hi
 ```
 
-The first run pulls the runtime and namespace images (≈ 30 s).
+The first run pulls the bundle image (≈ 30 s).
 Subsequent sandboxes start in about 100 ms.
 
 ## Write your own namespace

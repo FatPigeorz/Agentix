@@ -47,45 +47,17 @@ def test_remote_response_error_shape():
     assert resp.error.type == "ValueError"
 
 
-def test_sandbox_config_namespaces_is_list():
-    cfg = SandboxConfig(
-        image="ubuntu:24.04",
-        runtime="agentix/runtime:0.1.0",
-        namespaces=["agentix/claude-code:1.0.0", "agentix/swebench:1.0.0"],
-    )
-    assert cfg.namespaces == ["agentix/claude-code:1.0.0", "agentix/swebench:1.0.0"]
+def test_sandbox_config_image_only():
+    cfg = SandboxConfig(image="my-agent:0.1.0")
+    assert cfg.image == "my-agent:0.1.0"
     assert cfg.env is None
 
 
-def test_sandbox_config_default_namespaces_empty():
-    cfg = SandboxConfig(image="ubuntu:24.04", runtime="agentix/runtime:0.1.0")
-    assert cfg.namespaces == []
+def test_sandbox_config_with_env():
+    cfg = SandboxConfig(image="my-agent:0.1.0", env={"FOO": "bar"})
+    assert cfg.env == {"FOO": "bar"}
 
 
-def test_sandbox_config_requires_runtime():
+def test_sandbox_config_requires_image():
     with pytest.raises(Exception):
-        SandboxConfig(image="ubuntu:24.04")  # type: ignore[call-arg]
-
-
-def test_sandbox_config_resolves_namespaces_from_module():
-    """Modules with __image__ get resolved to their image ref string."""
-    import types
-
-    mod = types.ModuleType("agentix.fake")
-    mod.__image__ = "fake/img:1.0"
-    cfg = SandboxConfig(
-        image="ubuntu:24.04",
-        runtime="agentix/runtime:0.1.0",
-        namespaces=[mod, "raw/img:1.0"],
-    )
-    assert cfg.namespaces == ["fake/img:1.0", "raw/img:1.0"]
-
-
-def test_sandbox_config_rejects_unknown_namespace_spec():
-    """A spec that is neither a str nor has __image__ is rejected."""
-    with pytest.raises(Exception):
-        SandboxConfig(
-            image="ubuntu:24.04",
-            runtime="agentix/runtime:0.1.0",
-            namespaces=[42],  # type: ignore[list-item]
-        )
+        SandboxConfig()  # type: ignore[call-arg]

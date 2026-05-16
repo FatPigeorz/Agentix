@@ -120,42 +120,45 @@ Foreground by default: prints `runtime_url`, holds the sandbox alive until Ctrl-
 
 **`agentix check`** — list installed namespaces and smoke-import each one. Drift detection is a non-concern since one class can't drift from itself.
 
+### Build + deploy pipeline
+
+A namespace's Python deps are uniform: every namespace gets `pip install`ed into the runtime image's venv. System deps are optional — a namespace that needs native binaries (`claude` CLI, git, libffi, …) ships a `default.nix` next to its `pyproject.toml`. `agentix build` collapses the two-tier story:
+
+1. **Runtime image** (`agentix/runtime:<version>`): `FROM python:3.11-slim` + framework wheel + the `agentix-server` console script as ENTRYPOINT. Built once via `docker build -f primitives/_template/Dockerfile .` from the repo root.
+2. **Bundle image** (`agentix build a b c -o tag`): extends the runtime image. If any spec ships `default.nix`, a Nix builder stage runs first; the resulting `/nix/store` is COPY'd into the final image so its binaries resolve at their content-addressed paths. The final stage `pip install`s every spec's source dir. Bundles with no system deps anywhere skip Nix entirely.
+
+The bundle is deploy-ready — there are no per-namespace volume mounts, no `/mnt/*` symlink farms, no custom entrypoints. The deployment just `docker run`s the bundle image.
+
 ### Sandbox layout at runtime
 
 ```
-/nix/                            — tmpfs (writable by entrypoint only)
-  store/                         — symlink forest: each /mnt/*/store/<hash> linked here
-/mnt/
-  runtime/                       — runtime image's /nix slice
-    store/<hash>-*/
-    entry/bin/start              — agentix-server
-  c<digest>/                     — namespace image's /nix slice (dir name is internal)
-    store/<hash>-*/              — content-addressed Nix store; includes the namespace's
-                                   site-packages dir, made visible to the runtime's Python
-                                   via the symlink farm in /nix/store
+/                                — bundle image rootfs
+  usr/local/lib/python3.11/site-packages/
+    agentix/                     — framework
+    agentix/bash/                — namespace (pip-installed alongside)
+    agentix/files/               — namespace
+    agentix_bash-<v>.dist-info/  — entry_points.txt, picked up by importlib.metadata
+    …
+  nix/                           — optional, only present if a namespace shipped default.nix
+    store/<hash>-claude-*/bin/claude
+    store/<hash>-git-*/bin/git
+    …
 ```
 
-Sandbox entrypoint (inlined into the `docker run` command):
-```sh
-mkdir -p /nix/store
-for d in /mnt/*/store; do ln -sfn "$d"/* /nix/store/; done
-exec /mnt/runtime/entry/bin/start
-```
+The runtime ENTRYPOINT is `agentix-server`. It binds to `AGENTIX_BIND_PORT` (env, default 8000) and starts serving immediately — no mount-and-merge step.
 
 ### Runtime startup (lazy)
 
 On lifespan startup, the runtime:
 
-1. Walks `importlib.metadata.entry_points(group="agentix.namespace")`. Because the namespaces' wheels installed into the same Nix-managed Python environment, every namespace's `dist-info/entry_points.txt` is visible to `importlib.metadata`.
+1. Walks `importlib.metadata.entry_points(group="agentix.namespace")`. Because every namespace's wheel was pip-installed into the same venv at bundle build time, every `dist-info/entry_points.txt` is visible.
 2. For each entry point, **registers a pending entry** in the global `Registry`. **No imports run.**
 3. The namespace's class is `ep.load()`ed on **first `/_remote` request** for that package (`Registry.get_or_load`), under a per-package async lock so concurrent first-calls share one import.
 4. Import failures are cached on the entry; every subsequent call returns the same error without retrying.
 
-There is no on-disk `manifest.json` or `/mnt/*` scan — discovery is purely the entry-point walk.
+There is no on-disk `manifest.json` and no `/mnt/*` scan — discovery is purely the entry-point walk over the venv.
 
-Two images shipping the same `package` collide — second is skipped with a warning. There are **no caller-chosen namespaces**; the Python import path is the identity.
-
-This means: a broken namespace does not block sandbox boot; an unused namespace costs nothing to mount; first-call latency for a namespace includes its one-time import cost (typically tens of ms).
+Two dists registering the same entry-point name collide — `PluginConflictError` surfaces on first lookup. There are **no caller-chosen namespaces**; the Python import path is the identity.
 
 ### Wire
 
@@ -218,12 +221,13 @@ async with RuntimeClient(sandbox.runtime_url) as c:
 
 Shell exec is the `bash` primitive namespace (`primitives/bash/`), not a runtime built-in. Invoke via `c.remote(Bash.run, command=...)`.
 
-User subprocess default `PATH=/usr/local/bin:/usr/bin:/bin` (task image's). Nix env vars (`LD_LIBRARY_PATH`, `NIX_*`, `PYTHONPATH`, etc.) scrubbed to avoid ABI clash. `paths_from=["<package>"]` prepends that namespace's `entry/bin` to PATH.
+User subprocess default `PATH=/usr/local/bin:/usr/bin:/bin`. Namespaces that ship native binaries via `default.nix` reference them by their absolute `/nix/store/<hash>/bin/<name>` path inside the impl — content-addressed paths are stable across the bundle's lifetime.
 
-### What Nix buys us
+### What Nix buys us (when used)
 
-- Content-addressed `/nix/store` paths → multiple namespaces' deps never collide, so the symlink forest is trivially safe.
+- Content-addressed `/nix/store` paths → multiple namespaces' system deps never collide.
 - Hermetic native binaries per namespace (claude, git, …) referenced via Nix-absolute shebangs + RPATH.
+- Optional opt-in — a namespace with only Python deps doesn't ship a `default.nix` and `agentix build` skips Nix entirely.
 
 ### Deliberate non-choices
 
@@ -235,7 +239,7 @@ User subprocess default `PATH=/usr/local/bin:/usr/bin:/bin` (task image's). Nix 
 
 ## Implementation notes
 
-- **Hash paths are internal.** Users pass docker image refs in `SandboxConfig.namespaces` — either as strings or as the namespace's imported Python package (which exposes `__image__` for resolution). Mount-dir names are deployment-internal (`/mnt/c<digest>`); the runtime indexes by `manifest.package`.
+- **One image at deploy.** `SandboxConfig.image` is the deploy-ready bundle produced by `agentix build`. The deployment just runs it; there are no per-namespace mounts or volumes to coordinate.
 - **No local Nix required.** Namespace authors do `docker build`; Nix lives in the builder stage of their Dockerfile.
 - **Namespace Python deps stay thin.** Namespaces share the runtime's Python interpreter — Python wrappers should depend on stdlib + the `agentix` package itself (which already brings pydantic). Heavy deps belong in Nix-bundled native binaries, not in `pyproject.toml`.
 - **Sandbox starts fast.** Warm sandbox is `-v` mounts + tmpfs + symlink loop (shell-time, ~100 ms) + import of each namespace package (typically tens of ms each).

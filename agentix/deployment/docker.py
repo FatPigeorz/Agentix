@@ -2,34 +2,20 @@
 
 Design:
 
-  Every namespace image declares `VOLUME /nix` and ships under `/nix/store`
-  a content-addressed Nix store containing the namespace's Python wheel.
-  The runtime image additionally ships `/nix/entry/bin/start` — the
-  entrypoint script the sandbox execs after mounting.
-
-  Per unique namespace image (cached in-process):
-      docker run --rm -v agentix-namespace-<digest>:/nix <image> true
-      A fresh named volume mounted at /nix is auto-populated by Docker
-      from the image's /nix layer on first attach (volume-init-from-image
-      rule); subsequent calls are no-ops.
+  Bundle images are produced by `agentix build` and are self-contained:
+  they ship the runtime + every namespace's Python package in one venv,
+  plus any system deps under `/nix`. The deployment runs the bundle
+  image directly — no volume populate, no mount-and-merge, no custom
+  entrypoint.
 
   Sandbox create:
-      docker run --name <sid> \\
-         -v agentix-namespace-<runtime-digest>:/mnt/runtime:ro \\
-         -v agentix-namespace-<namespace-digest>:/mnt/c<digest>:ro \\  (per namespace)
-         --tmpfs /nix:exec,mode=755 \\
-         <task-image> sh -c '<entrypoint>'
+      docker run -d --name <sid> --network host \\
+         -e AGENTIX_BIND_PORT=<port> \\
+         <bundle-image>
 
-  Sandbox entrypoint (inlined):
-      mkdir -p /nix/store
-      for d in /mnt/*/store; do ln -sfn "$d"/* /nix/store/; done
-      exec /mnt/runtime/entry/bin/start
-
-  Mount-dir names are internal. The runtime's Python sees each mounted
-  namespace's `site-packages` via the symlink farm in /nix/store, and
-  walks `importlib.metadata.entry_points(group="agentix.namespace")` to
-  discover them. No subprocesses, no UDS, no reverse proxy. Sandbox
-  contents are fixed at create time.
+  The container's `ENTRYPOINT` is `agentix-server`, which binds to the
+  port from the env var. We pick a free host port, pass it through, and
+  health-check `/health` on it.
 """
 
 from __future__ import annotations
@@ -66,10 +52,6 @@ class DockerDeployment(Deployment):
 
     def __init__(self):
         self._ports: dict[SandboxId, int] = {}  # sandbox_id → host port
-        self._populated: dict[str, str] = {}  # image ref → named volume
-        self._populate_lock = asyncio.Lock()
-
-    # ── port ─────────────────────────────────────────────────────
 
     @staticmethod
     def _allocate_port() -> int:
@@ -80,94 +62,21 @@ class DockerDeployment(Deployment):
             s.bind(("127.0.0.1", 0))
             return s.getsockname()[1]
 
-    # ── populate one namespace image into its named volume ────────
-
-    @staticmethod
-    async def _image_digest(image: str) -> str:
-        """Resolve a Docker image ref to its content digest (sha256 of the
-        image config). Content-addressed, so two refs pointing to identical
-        bytes yield the same digest.
-        """
-        _, stdout, _ = await _docker("inspect", image, "--format", "{{.Id}}")
-        raw = stdout.decode().strip()
-        # `.Id` is "sha256:<hex>" — keep the hex only.
-        return raw.removeprefix("sha256:")[:16]
-
-    async def _mount_dir_for(self, image: str) -> str:
-        """Internal mount-dir name. Anything unique + short works; the
-        runtime indexes namespaces by manifest.package, not by mount dir.
-        """
-        digest = await self._image_digest(image)
-        return f"c{digest[:12]}"
-
-    async def _ensure_populated(self, image: str) -> str:
-        """Ensure the per-content volume `agentix-namespace-<digest>` is
-        populated from `image`'s /nix. Keyed by image digest (not ref), so:
-
-          * rebuilding an image under the same tag → new digest → new volume
-            (no stale content)
-          * two refs pointing at the same bytes → same digest → one volume
-            (no duplication)
-
-        Docker's volume-init-from-image rule fills a fresh volume from the
-        image layer on first attach; if the volume already has content it
-        skips — idempotent and cross-process-safe.
-        """
-        digest = await self._image_digest(image)
-        vol = f"agentix-namespace-{digest}"
-
-        if self._populated.get(image) == vol:
-            return vol
-
-        async with self._populate_lock:
-            if self._populated.get(image) == vol:
-                return vol
-            await _docker("run", "--rm", "-v", f"{vol}:/nix", image, "true")
-            self._populated[image] = vol
-            logger.info("Populated namespace volume '%s' from '%s'", vol, image)
-            return vol
-
-    # ── create ───────────────────────────────────────────────────
-
     async def create(self, config: SandboxConfig) -> Sandbox:
         sandbox_id = SandboxId(f"agentix-{uuid4().hex[:8]}")
         port = self._allocate_port()
-
-        # Populate all namespaces in parallel (cached after first). Mount-dir
-        # names are internal — runtime indexes namespaces by manifest.package,
-        # not by directory. We use 'runtime' for the runtime itself (the
-        # entrypoint hardcodes /mnt/runtime/entry/bin/start) and short
-        # digest-derived names for the rest.
-        pairs: list[tuple[str, str]] = [("runtime", config.runtime)]
-        for img in config.namespaces:
-            pairs.append((await self._mount_dir_for(img), img))
-        vols = await asyncio.gather(*(self._ensure_populated(img) for _, img in pairs))
-
-        mount_args: list[str] = []
-        for (mdir, _image), vol in zip(pairs, vols):
-            mount_args.extend(["-v", f"{vol}:/mnt/{mdir}:ro"])
 
         env_args: list[str] = ["-e", f"AGENTIX_BIND_PORT={port}"]
         if config.env:
             for k, v in config.env.items():
                 env_args.extend(["-e", f"{k}={v}"])
 
-        entrypoint = (
-            "set -e; "
-            "mkdir -p /nix/store; "
-            "for d in /mnt/*/store; do ln -sfn \"$d\"/* /nix/store/; done; "
-            "exec /mnt/runtime/entry/bin/start"
-        )
-
         await _docker(
             "run", "-d",
             "--name", sandbox_id,
             "--network", "host",
-            *mount_args,
-            "--tmpfs", "/nix:exec,mode=755",
             *env_args,
             config.image,
-            "sh", "-c", entrypoint,
         )
 
         self._ports[sandbox_id] = port
@@ -192,8 +101,6 @@ class DockerDeployment(Deployment):
                     pass
                 await asyncio.sleep(0.5)
         raise TimeoutError(f"Runtime server not alive at {base_url}")
-
-    # ── get / delete ─────────────────────────────────────────────
 
     async def get(self, sandbox_id: SandboxId) -> SandboxInfo:
         port = self._ports.get(sandbox_id)

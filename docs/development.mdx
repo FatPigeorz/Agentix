@@ -33,15 +33,25 @@ Without any namespaces installed the server exposes its built-ins only
 the runtime without the Docker round-trip; `pip install -e primitives/bash`
 makes `agentix.bash:Bash` discoverable on the next start.
 
-### Build namespace images
-
-The runtime image and the in-tree primitives share one Dockerfile:
+### Build the runtime image (once)
 
 ```bash
-agentix build primitives/bash                          # → agentix/bash:0.1.0
-agentix build primitives/files                         # → agentix/files:0.1.0
-docker build -t agentix/runtime:dev -f primitives/_template/Dockerfile .
+docker build -t agentix/runtime:0.1.0 -f primitives/_template/Dockerfile .
 ```
+
+This produces the base image every namespace bundle extends. Rebuild
+whenever the framework version bumps.
+
+### Build a namespace bundle
+
+```bash
+agentix build primitives/bash                              # → agentix/bash:0.1.0
+agentix build primitives/bash primitives/files -o my-sandbox:dev   # → bundle of both
+```
+
+A bundle image extends the runtime, pip-installs each namespace, and
+(optionally) layers in any system deps from per-namespace `default.nix`.
+It's deploy-ready — no further composition needed.
 
 ### Smoke-test end-to-end in Docker
 
@@ -54,14 +64,9 @@ from agentix.bash import Bash
 
 async def main():
     deployment = DockerDeployment()
-    config = SandboxConfig(
-        image="ubuntu:24.04",
-        runtime="agentix/runtime:dev",
-        namespaces=["agentix/bash:0.1.0"],
-    )
+    config = SandboxConfig(image="my-sandbox:dev")
     async with session(deployment, config) as sb:
         async with RuntimeClient(sb.runtime_url) as c:
-            print(await c.run("uname -a"))
             result = await c.remote(Bash.run, command="echo hi")
             print(result.stdout)
 
@@ -92,12 +97,12 @@ agentix build my-namespace
 Use it:
 
 ```python
-SandboxConfig(
-    image="ubuntu:24.04",
-    runtime="agentix/runtime:dev",
-    namespaces=["my-namespace:0.1.0"],
-)
+SandboxConfig(image="my-namespace:0.1.0")
 ```
+
+If your namespace needs native binaries (claude CLI, git, libffi, …),
+drop a `default.nix` next to its `pyproject.toml` declaring those deps;
+`agentix build` will splice in a Nix builder stage automatically.
 
 See [Namespace protocol](/reference/namespace-protocol) for the full
 contract, and [`primitives/bash`](https://github.com/Agentiix/Agentix/tree/master/primitives/bash)

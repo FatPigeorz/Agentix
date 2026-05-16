@@ -46,114 +46,109 @@ for what comes later.
 │    importlib.metadata.entry_points(group="agentix.namespace");  │
 │    ep.load() deferred to first /_remote call per namespace.     │
 │                                                                 │
-│  /nix/store — tmpfs with a symlink forest merged from every     │
-│  /mnt/<dir>/store content-addressed directory                   │
+│  /nix/store — only present if a namespace shipped default.nix;  │
+│  baked into the bundle image at build time                      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-The runtime's lifespan scans `/mnt` at startup and imports each
-namespace's Python package. Namespaces are fixed for the sandbox's
-lifetime; change the set by recreating the sandbox.
+The runtime walks `importlib.metadata.entry_points` at startup and
+registers each pending entry; first dispatch triggers the actual import.
+Namespaces are fixed for the sandbox's lifetime — change the set by
+rebuilding the bundle image and recreating the sandbox.
 
 ## Namespace convention
 
-A namespace is a Python distribution that contributes a class to the
-`agentix.*` import namespace and declares one entry point under
-`agentix.namespace`. The image that ships it is a thin wrapper: a
-Docker image that declares `VOLUME /nix` and carries:
+A namespace is a Python distribution that contributes a class under
+`agentix.<short>` and declares one entry point under `agentix.namespace`.
+Layout:
 
-- `/nix/store/<hash>-*/` — content-addressed Nix store, includes the
-  namespace's wheel under `<hash>-agentix-<name>/lib/python.../site-packages/`
-- The site-packages dir is what `importlib.metadata` walks; no
-  on-disk manifest file is needed, and the runtime indexes namespaces
-  by the entry point's `module:class` target.
+```text
+my-namespace/
+├── pyproject.toml            # name = "agentix-<short>", entry-point block
+├── src/agentix/<short>/      # PEP 420 namespace package
+│   └── __init__.py           # class <Name>(Namespace) with @staticmethod methods
+└── default.nix               # OPTIONAL — only when the namespace needs
+                              #   system deps (claude CLI, git, libffi, …)
+```
 
-Routing is by Python module path. `pip install agentix-bash` followed by
-`from agentix.bash import Bash` and `c.remote(Bash.run, ...)` is all
-the contract. Two distributions registering the same entry-point name
-collide — the second is skipped with a warning.
+Routing is by Python module path. After bundling, `from agentix.<short> import Cls`
+on the caller side and `c.remote(Cls.method, ...)` is all the contract.
+Two distributions registering the same entry-point name raise
+`PluginConflictError` on first lookup.
 
 See [Namespace protocol](/reference/namespace-protocol) for the full ABI.
+
+## Build pipeline
+
+`agentix build <specs...> -o <tag>` produces a single deploy-ready
+bundle image:
+
+1. **Stage 1 (optional Nix):** if any spec ships `default.nix`, a
+   `nixos/nix` builder stage runs first. Each spec's derivation is
+   built; the full closure is copied to `/export/nix/store`. Bundles
+   with no system deps anywhere skip this stage entirely.
+2. **Stage 2 (Python venv):** `FROM agentix/runtime:<version>` (which
+   is Python 3.11-slim + framework wheel installed). If stage 1 ran,
+   `COPY --from=sys-builder /export/nix /nix`. Then for each spec,
+   `pip install` its source dir into the runtime's venv.
+3. **Output:** a single image carrying runtime + every namespace +
+   any system deps. Sandbox runs it directly — no mount-and-merge.
+
+The runtime image (`agentix/runtime:<version>`) is built once via
+`docker build -f primitives/_template/Dockerfile .` from the repo root.
 
 ## Sandbox layout
 
 ```text
-/
-├── mnt/
-│   ├── runtime/       ← -v agentix-namespace-<digest>:/mnt/runtime:ro
-│   │   ├── store/<hash>-*/
-│   │   └── entry/
-│   │       └── bin/start   ← the agentix-server binary
-│   └── c<digest>/     ← one mount per namespace, ro; dir name is internal
-│       └── store/<hash>-*/   ← content-addressed Nix store; includes the namespace's
-│                               site-packages, visible to the runtime's Python after
-│                               the /nix/store symlink-merge in the entrypoint
-│
-├── nix/
-│   └── store/         ← --tmpfs /nix (writable),
-│                        populated at entrypoint-time with
-│                        `ln -sfn /mnt/*/store/* /nix/store/`
-│
-└── (task image rootfs — /usr, /bin, /etc, /testbed, ...)
+/                                  ← bundle image rootfs
+├── usr/local/lib/python3.11/site-packages/
+│   ├── agentix/                   ← framework
+│   ├── agentix/bash/              ← namespace (pip-installed alongside)
+│   ├── agentix/files/             ← namespace
+│   ├── agentix_bash-<v>.dist-info/  ← entry_points.txt — picked up by
+│   │                                  importlib.metadata
+│   └── …
+└── nix/                           ← optional, only present if a namespace
+    └── store/                       had default.nix
+        ├── <hash>-claude-*/bin/claude
+        └── <hash>-git-*/bin/git
 ```
 
-Sandbox entrypoint (inlined into `docker run`):
-
-```sh
-set -e
-mkdir -p /nix/store
-for d in /mnt/*/store; do ln -sfn "$d"/* /nix/store/; done
-exec /mnt/runtime/entry/bin/start
-```
-
-Why the symlink forest: Nix binaries have `/nix/store/<hash>` hard-coded
-in shebangs and RPATH. They only work if `/nix/store/<hash>` resolves.
-Symlinking each namespace's `store/<hash>` into a shared `/nix/store`
-merges them cheaply — content-addressed paths can't collide, and the
-task image sees one unified `/nix/store`.
+The sandbox container's `ENTRYPOINT` is `agentix-server`. It binds to
+`AGENTIX_BIND_PORT` (env, picked by the deployment at create time) and
+starts serving immediately.
 
 ## Environment & PATH policy
 
-Rules at every `/exec` invocation:
+Rules at every `Bash.run` invocation:
 
 1. **Strip Nix-host-only env vars** — `LD_LIBRARY_PATH`, `LD_PRELOAD`,
    `PYTHONPATH`, `PYTHONHOME`, `LOCALE_ARCHIVE`, `FONTCONFIG_*`,
    `SSL_CERT_FILE`, anything prefixed `NIX_`.
-2. **PATH defaults to the task image's default**
-   (`/usr/local/bin:/usr/bin:/bin`). Task-image tools take precedence
-   over namespace-bundled tools of the same name.
-3. **Opt-in namespace bins** —
-   `paths_from=["agentix.<name>"]` prepends that namespace's
-   `entry/bin`. `["*"]` includes all loaded.
-4. **Namespace Python impls run in the runtime's interpreter** — they
-   invoke native tools via `subprocess` with absolute `/nix/store`
-   paths, which resolve via the symlink forest.
+2. **PATH defaults to** `/usr/local/bin:/usr/bin:/bin`.
+3. **Namespace native tools** ship at content-addressed
+   `/nix/store/<hash>/bin/<tool>` paths and are invoked by their
+   absolute path from Python impls.
+4. **Namespace Python impls run in the runtime's interpreter** —
+   they invoke native tools via `subprocess` with `/nix/store` paths,
+   which resolve directly since the store is baked into the image.
 
 ## Deployment (Docker)
 
-Per unique namespace image (cached in process):
-
-```bash
-docker run --rm -v agentix-namespace-<digest>:/nix <image> true
-```
-
-Docker's volume-init-from-image rule auto-populates the named volume
-from the image's `/nix` layer on first attach; skips if already
-populated. The volume key is the image's SHA256 digest, so rebuilds
-produce a fresh volume automatically.
-
-Sandbox create:
+Sandbox create reduces to one `docker run`:
 
 ```bash
 docker run -d \
   --name <sandbox-id> \
   --network host \
-  -v agentix-namespace-<runtime-digest>:/mnt/runtime:ro \
-  -v agentix-namespace-<digest>:/mnt/c<digest>:ro   (per namespace) \
-  --tmpfs /nix:exec,mode=755 \
   -e AGENTIX_BIND_PORT=<port> \
-  <task-image> sh -c '<entrypoint>'
+  <bundle-image>
 ```
+
+The deployment picks a free host port, passes it via env, and
+health-checks `/health` on it before returning. No volume-populate
+dance, no mount-and-merge, no custom entrypoint — the bundle image
+carries everything.
 
 ## Design decisions
 
@@ -173,7 +168,10 @@ docker run -d \
   always available, independent of any namespace.
 - **Namespaces share the runtime's Python interpreter** — Python
   wrappers stay thin (stdlib + pydantic, which the runtime already
-  ships). Heavy deps belong in Nix-bundled native binaries.
+  ships). Heavy native deps belong in `default.nix`, not Python deps.
+- **Nix is opt-in.** Pure-Python namespaces ship no `default.nix` and
+  the build skips Nix entirely — `FROM python:slim` end-to-end, seconds
+  to build instead of minutes.
 
 ## Out of scope (v0.1.0)
 

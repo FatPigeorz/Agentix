@@ -22,13 +22,11 @@ dev = [
     "pyright>=1.1.380",
 ]
 [project.scripts]
-# Dev-side CLI: `agentix build`, `agentix check`. Subcommands live in
-# `agentix.cli`. The CLI is intentionally thin — most logic is in the
-# submodules so they can also be imported directly.
+# Dev-side CLI: `agentix build`, `agentix deploy`, `agentix check`.
+# Subcommands live in `agentix.cli`. The CLI is intentionally thin —
+# most logic is in the submodules so they can also be imported directly.
 agentix = "agentix.cli:main"
-# Runtime server entrypoint, invoked from inside the sandbox at
-# /mnt/runtime/entry/bin/start; `agentix-server` is an alias for dev ergonomics.
-start = "agentix.runtime.server:main"
+# Runtime server entrypoint — the bundle image's Docker ENTRYPOINT.
 agentix-server = "agentix.runtime.server:main"
 
 # Builtin deployments. Downstream backends declare additional entries

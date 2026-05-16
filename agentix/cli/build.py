@@ -1,31 +1,34 @@
-"""`agentix build` — build a namespace image (one spec) or bundle (many).
+"""`agentix build` — build a deploy-ready bundle image.
 
 Usage:
 
     agentix build primitives/bash                              # one namespace, auto-tag
     agentix build bash                                         # short name → primitives/bash
-    agentix build primitives/bash --tag my-bash:dev            # one namespace, explicit tag
+    agentix build primitives/bash -o my-bash:dev               # explicit tag
     agentix build bash files claude-code -o my-agent:0.1.0     # bundle several namespaces
-    agentix build bash files --dry-run                         # stage to ./build/<tag>/
+    agentix build bash files --dry-run -o sandbox:dev          # stage to ./build/<tag>/
 
 Each spec is one of:
 
-  1. **Path:** a directory containing `pyproject.toml` and an
-     `src/agentix/<name>/` Python package — used as-is.
-  2. **Image ref:** a string with a `:` AND a `/` — treated as a
-     pre-built namespace image and pulled at bundle build time.
-  3. **Short name:** searched against `primitives/<name>/` (relative
-     to the repo root). If none match, falls back to PyPI as
-     `agentix-<name>` (currently stubbed).
+  1. **Path:** a directory containing `pyproject.toml` and the namespace's
+     Python package under `src/agentix/<name>/`.
+  2. **Image ref:** a string with a `:` AND a `/` — pre-built (not yet wired).
+  3. **Short name:** searched against `primitives/<name>/` in the repo,
+     falling back to PyPI `agentix-<name>` (currently stubbed).
 
-Image-ref and PyPI paths aren't fully wired yet — they raise
-NotImplementedError with a clear message. The local-path / short-name
-case works end-to-end today, which covers the in-repo dev flow.
+Build shape:
 
-With one spec and no `--output / --tag`, the output image tag is
-auto-derived from the namespace's pyproject (`agentix-<short>:<version>`
-→ `agentix/<short>:<version>`). With multiple specs `--output` is
-required.
+  Python deps are uniform: every namespace gets `pip install`ed into the
+  runtime image's venv. System deps are optional — a namespace that needs
+  native binaries (`claude` CLI, git, …) ships a `default.nix` next to its
+  `pyproject.toml`. If any spec ships one, a Nix builder stage runs first;
+  the resulting `/nix/store` is COPY'd into the final image so its binaries
+  resolve at their content-addressed paths. Bundles with no `default.nix`
+  files anywhere skip Nix entirely — `FROM python:slim` end to end.
+
+  The output image extends `agentix/runtime:<framework-version>` (override
+  via `--runtime-image`). The runtime image is built once from
+  `primitives/_template/Dockerfile`; subsequent bundles reuse it.
 """
 
 from __future__ import annotations
@@ -38,9 +41,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+from agentix import __version__ as FRAMEWORK_VERSION
 from agentix.cli._resolve import REPO_ROOT, NamespaceSpec, read_pyproject, resolve_spec
-
-TEMPLATE_DIR = REPO_ROOT / "primitives" / "_template"
 
 _SOURCE_SKIP = {
     "__pycache__", ".venv", "build", "dist", ".git",
@@ -63,15 +65,15 @@ def _derive_tag_from_pyproject(pyproject: dict) -> str:
 
 
 def _resolve_path(spec: NamespaceSpec) -> Path:
-    """Return the on-disk source dir for a spec, raising on unsupported kinds."""
+    """Return the on-disk source dir for a spec; raise on unsupported kinds."""
     if spec.kind == "path":
         assert spec.path is not None
         return spec.path
     if spec.kind == "pypi":
         raise NotImplementedError(
             f"`agentix build {spec.short}`: PyPI sourcing not wired yet. "
-            f"Needs a `pip download {spec.pypi_dist}` + wheel unpack step "
-            f"before the source dir is ready. Use a local path instead."
+            f"Needs a `pip download {spec.pypi_dist}` step before the source "
+            f"dir is ready. Use a local path instead."
         )
     raise SystemExit(
         f"`agentix build {spec.short}`: image refs aren't a valid input — "
@@ -79,16 +81,17 @@ def _resolve_path(spec: NamespaceSpec) -> Path:
     )
 
 
-def _stage(specs: list[tuple[NamespaceSpec, Path]], build_dir: Path) -> None:
-    """Stage one or many namespaces into a docker build context.
+def _has_system_deps(src: Path) -> bool:
+    """True if the namespace ships a `default.nix` next to its pyproject."""
+    return (src / "default.nix").is_file()
 
-    Layout:
-      build_dir/
-      ├── Dockerfile         # generated; same shape for N=1 and N>1
-      ├── default.nix        # shared nix derivation
-      └── <short>/           # one per spec — the namespace project as-is
-          ├── pyproject.toml
-          └── src/...
+
+def _stage(specs: list[tuple[NamespaceSpec, Path]], build_dir: Path) -> None:
+    """Stage each namespace's project tree into `build_dir/<short>/`.
+
+    The whole project dir is copied so pip can find pyproject.toml + src/,
+    and Nix can find default.nix when it's present. Common dev artifacts
+    (__pycache__, .venv, etc.) are skipped.
     """
     for spec, src in specs:
         dest = build_dir / spec.short
@@ -101,49 +104,58 @@ def _stage(specs: list[tuple[NamespaceSpec, Path]], build_dir: Path) -> None:
                 shutil.copytree(item, d, ignore=shutil.ignore_patterns(*_SOURCE_SKIP))
             else:
                 shutil.copy2(item, d)
-    shutil.copy2(TEMPLATE_DIR / "default.nix", build_dir / "default.nix")
-    (build_dir / "Dockerfile").write_text(_render_dockerfile([s for s, _ in specs]))
 
 
-def _render_dockerfile(specs: list[NamespaceSpec]) -> str:
-    """Multi-stage Dockerfile: build each namespace's nix derivation in a
-    builder stage, copy each derivation's full store-path closure into
-    /nix/store, ship a thin busybox image with VOLUME /nix.
+def _render_dockerfile(
+    specs: list[tuple[NamespaceSpec, Path]],
+    runtime_image: str,
+) -> str:
+    """Multi-stage Dockerfile: optional Nix system-deps builder, then a
+    final stage that extends the runtime image and pip-installs each
+    staged namespace project.
 
-    Works uniformly for N=1 and N>1 — there's no separate "bundle" shape.
-    The runtime discovers every namespace via `importlib.metadata` at
-    startup once the Nix store is symlink-merged into /nix/store.
+    The Nix builder stage is omitted entirely when no namespace ships a
+    `default.nix` — Python-only bundles skip nixos/nix altogether.
     """
-    builder_steps = "\n".join(
-        f"WORKDIR /src/{spec.short}\n"
-        f"COPY {spec.short}/ ./\n"
-        f"COPY default.nix ./\n"
-        f"RUN nix-build --no-out-link default.nix -o ./result && \\\n"
-        f"    STORE_PATH=$(readlink -f ./result) && \\\n"
-        f"    for p in $(nix-store -qR \"$STORE_PATH\"); do \\\n"
-        f"        cp -a \"$p\" /export/nix/store/; \\\n"
-        f"    done"
-        for spec in specs
-    )
-    shorts = " ".join(spec.short for spec in specs)
-    return f"""\
-# Generated by `agentix build`. Do not hand-edit.
-ARG NIX_IMAGE=nixos/nix:latest
+    nix_specs = [(s, p) for s, p in specs if _has_system_deps(p)]
 
-FROM ${{NIX_IMAGE}} AS builder
-RUN mkdir -p ~/.config/nix && \\
-    echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf && \\
-    nix-channel --update 2>/dev/null || true
-RUN mkdir -p /export/nix/store
+    parts: list[str] = ["# Generated by `agentix build`. Do not hand-edit."]
 
-{builder_steps}
+    if nix_specs:
+        parts += [
+            "ARG NIX_IMAGE=nixos/nix:latest",
+            "",
+            "FROM ${NIX_IMAGE} AS sys-builder",
+            "RUN mkdir -p ~/.config/nix && \\",
+            "    echo 'experimental-features = nix-command flakes' >> ~/.config/nix/nix.conf && \\",
+            "    nix-channel --update 2>/dev/null || true",
+            "RUN mkdir -p /export/nix/store",
+        ]
+        for spec, _ in nix_specs:
+            parts += [
+                "",
+                f"WORKDIR /src/{spec.short}",
+                f"COPY {spec.short}/ ./",
+                "RUN nix-build --no-out-link default.nix -o ./result && \\",
+                "    STORE_PATH=$(readlink -f ./result) && \\",
+                "    for p in $(nix-store -qR \"$STORE_PATH\"); do \\",
+                "        cp -a \"$p\" /export/nix/store/ || true; \\",
+                "    done",
+            ]
 
-FROM busybox:stable
-COPY --from=builder /export /
-VOLUME /nix
-LABEL org.agentix.namespace=1
-LABEL org.agentix.namespace.names="{shorts}"
-"""
+    parts += ["", f"FROM {runtime_image}"]
+    if nix_specs:
+        parts.append("COPY --from=sys-builder /export/nix /nix")
+
+    for spec, _ in specs:
+        parts.append(f"COPY {spec.short}/ /src/{spec.short}/")
+    install_paths = " ".join(f"/src/{s.short}" for s, _ in specs)
+    parts.append(f"RUN pip install --no-cache-dir {install_paths}")
+
+    short_names = " ".join(s.short for s, _ in specs)
+    parts.append(f'LABEL org.agentix.bundle.namespaces="{short_names}"')
+
+    return "\n".join(parts) + "\n"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -162,6 +174,11 @@ def main(argv: Sequence[str] | None = None) -> int:
              "auto-derived from pyproject for a single namespace.",
     )
     parser.add_argument(
+        "--runtime-image", default=f"agentix/runtime:{FRAMEWORK_VERSION}",
+        help="base runtime image the bundle extends (default: "
+             f"agentix/runtime:{FRAMEWORK_VERSION})",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="stage to ./build/<tag>/ and print path; do NOT invoke docker",
     )
@@ -169,21 +186,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     try:
         specs = [resolve_spec(s) for s in args.specs]
-        # Disallow duplicate short names — would collide both in build_dir
-        # and at runtime registration.
         shorts = [s.short for s in specs]
         dupes = {n for n in shorts if shorts.count(n) > 1}
         if dupes:
             raise SystemExit(f"duplicate namespace short names: {sorted(dupes)}")
-
-        resolved: list[tuple[NamespaceSpec, Path]] = [
-            (spec, _resolve_path(spec)) for spec in specs
-        ]
+        resolved = [(spec, _resolve_path(spec)) for spec in specs]
     except NotImplementedError as exc:
         raise SystemExit(f"error: {exc}") from exc
 
-    # Tag resolution. One spec → derive from pyproject if -o omitted.
-    # Multi-spec → -o is required.
     if args.output:
         tag = args.output
     elif len(specs) == 1:
@@ -200,8 +210,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             shutil.rmtree(out)
         out.mkdir(parents=True)
         _stage(resolved, out)
+        (out / "Dockerfile").write_text(_render_dockerfile(resolved, args.runtime_image))
         print(f"staged build context → {out}")
         print(f"would build → {tag}")
+        print(f"  extends → {args.runtime_image}")
         if len(specs) > 1:
             print(f"  namespaces: {', '.join(shorts)}")
         return 0
@@ -209,7 +221,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     with TemporaryDirectory(prefix="agentix-build-") as tmp:
         build_dir = Path(tmp)
         _stage(resolved, build_dir)
-        print(f"building {tag} ({len(specs)} namespace{'s' if len(specs) > 1 else ''})…", file=sys.stderr)
+        (build_dir / "Dockerfile").write_text(_render_dockerfile(resolved, args.runtime_image))
+        ns_count = len(specs)
+        print(
+            f"building {tag} ({ns_count} namespace{'s' if ns_count > 1 else ''} "
+            f"extending {args.runtime_image})…",
+            file=sys.stderr,
+        )
         proc = subprocess.run(
             ["docker", "build", "-t", tag, str(build_dir)],
             check=False,

@@ -236,7 +236,7 @@ async def test_rollout_pool_maps_and_returns_results(
     from agentix.rollout import RolloutPool
 
     deployment = _StubDeployment(base_url)
-    config = SandboxConfig(image="x", runtime="y")
+    config = SandboxConfig(image="x")
 
     async def _run_one(client, task: str):
         r = await client.remote(EchoNs.echo, msg=task)
@@ -283,7 +283,7 @@ async def test_rollout_pool_surfaces_per_task_errors(
         return await client.remote(Splody.explode_on, label=task)
 
     async with RolloutPool(
-        _StubDeployment(), SandboxConfig(image="x", runtime="y"), parallelism=2,
+        _StubDeployment(), SandboxConfig(image="x"), parallelism=2,
     ) as pool:
         ok = []
         errors = []

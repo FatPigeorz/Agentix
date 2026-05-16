@@ -98,9 +98,8 @@ on-disk manifest the runtime inspects; the wheel's installed metadata
 contract.
 
 See [Architecture](/reference/architecture) for the full sandbox layout
-(`/mnt/runtime`, `/mnt/c<digest>`, the `/nix/store` symlink forest) and
-how `agentix build` bundles multiple namespaces into a single
-deployable image.
+(runtime + venv + optional `/nix/store`) and how `agentix build`
+bundles multiple namespaces into a single deployable image.
 
 ## Wire
 
@@ -233,7 +232,7 @@ useful when you need raw sandbox I/O without going through a namespace.
 | Endpoint              | Purpose                                                                                                                                              |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET /health`         | Liveness.                                                                                                                                            |
-| `POST /exec`          | Run a shell command in the sandbox. Body `{command, cwd?, env?, timeout?, paths_from?}`. SSE when `Accept: text/event-stream`; else JSON `{exit_code, stdout, stderr}`. |
+| `POST /exec`          | Run a shell command in the sandbox. Body `{command, cwd?, env?, timeout?}`. SSE when `Accept: text/event-stream`; else JSON `{exit_code, stdout, stderr}`. |
 | `POST /upload`        | Multipart upload into `AGENTIX_UPLOAD_ROOT` (default `/workspace`).                                                                                  |
 | `GET /download?path=` | Stream a file back.                                                                                                                                  |
 | `GET /namespaces`     | List loaded namespaces.                                                                                                                              |
@@ -253,9 +252,10 @@ Subprocesses run with a scrubbed env:
 - **Default PATH:** the task image's `/usr/local/bin:/usr/bin:/bin`.
   Task-image tools take precedence over namespace-bundled tools of the
   same name.
-- **Opt-in namespace bins:** `paths_from=["agentix.<name>"]` prepends
-  that namespace's `entry/bin`. `["*"]` includes every loaded
-  namespace.
+- **Namespace native tools:** ship at content-addressed
+  `/nix/store/<hash>/bin/<tool>` paths and are invoked by their absolute
+  path from Python impls. Content-addressed paths are stable across the
+  bundle's lifetime.
 
 ## Minimal recipe
 

@@ -4,16 +4,12 @@ many tasks. Bounds concurrency by sandbox slot, not by task count.
 Typical use for an RL training loop:
 
     from agentix import DockerDeployment, RolloutPool, SandboxConfig
-    from agentix_namespaces import claude_code
+    from agentix.claude_code import ClaudeCode
 
-    config = SandboxConfig(
-        image="ubuntu:24.04",
-        runtime="agentix/runtime:0.1.0",
-        namespaces=[claude_code],
-    )
+    config = SandboxConfig(image="my-agent:0.1.0")
 
     async def rollout(client, task):
-        return await client.remote(claude_code.run, instruction=task)
+        return await client.remote(ClaudeCode.run, instruction=task)
 
     async with RolloutPool(DockerDeployment(), config, parallelism=16) as pool:
         async for task, result in pool.map(rollout, tasks):
