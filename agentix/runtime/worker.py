@@ -64,17 +64,30 @@ def _err(exc: BaseException) -> dict[str, Any]:
 
 
 class Worker:
-    """One worker, one namespace. Owns stdio + a Dispatcher."""
+    """One worker, one namespace. Owns stdio + a Dispatcher.
+
+    All outbound frames (result, stream item/end, trace, error, ready)
+    funnel through `_outbound_q` and are serialized by a single drainer
+    task. This gives us:
+      - **FIFO ordering** across trace + result frames (observers see
+        traces in the order the impl emitted them)
+      - **No GC of fire-and-forget tasks** for sync `trace.emit` paths
+      - **No send lock** — one writer, no contention
+    """
 
     def __init__(self, dispatcher: Dispatcher, package: str) -> None:
         self._dispatcher = dispatcher
         self._package = package
-        self._send_lock = asyncio.Lock()
         self._calls: dict[str, asyncio.Task] = {}
         self._bidi_queues: dict[str, asyncio.Queue] = {}
         self._writer: asyncio.StreamWriter | None = None
         self._reader: asyncio.StreamReader | None = None
         self._shutdown = asyncio.Event()
+        # Single FIFO that every outbound frame passes through. Unbounded
+        # by default — back-pressure on the writer is sufficient; we
+        # don't want sync trace.emit() to block on a full queue.
+        self._outbound_q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._drainer: asyncio.Task | None = None
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -88,8 +101,9 @@ class Worker:
         writer = asyncio.StreamWriter(transport, protocol, None, loop)
         self._reader, self._writer = reader, writer
 
-        # Subscribe trace forwarder before we say "ready" — any boot-time
-        # trace events get captured.
+        # Spin up the single outbound drainer + subscribe trace forwarder
+        # before saying "ready" — any boot-time trace events get captured.
+        self._drainer = loop.create_task(self._drain_outbound())
         trace.subscribe(self._trace_handler)
 
         await self._send({"type": F.READY, "package": self._package})
@@ -108,26 +122,43 @@ class Worker:
             task.cancel()
         if self._calls:
             await asyncio.gather(*self._calls.values(), return_exceptions=True)
+        # Flush any remaining outbound frames, then stop the drainer.
+        await self._outbound_q.join()
+        if self._drainer is not None:
+            self._drainer.cancel()
+
+    async def _drain_outbound(self) -> None:
+        assert self._writer is not None
+        try:
+            while True:
+                frame = await self._outbound_q.get()
+                try:
+                    await write_frame(self._writer, frame)
+                except Exception:
+                    logger.exception("outbound frame write failed")
+                finally:
+                    self._outbound_q.task_done()
+        except asyncio.CancelledError:
+            pass
 
     async def _send(self, payload: dict[str, Any]) -> None:
-        assert self._writer is not None
-        async with self._send_lock:
-            await write_frame(self._writer, payload)
+        """Enqueue a frame for the drainer. Effectively non-blocking
+        on an unbounded queue."""
+        await self._outbound_q.put(payload)
 
     def _trace_handler(self, kind: str, payload: dict, call_id, source) -> None:
-        # Sync handler; schedule the actual frame write on the loop. Per
-        # the `agentix.trace` contract, handler errors are caught upstream
-        # — we only need to avoid raising.
-        frame = {"type": F.TRACE, "kind": kind, "payload": payload}
+        # Sync handler — enqueue via put_nowait (queue is unbounded,
+        # so this never raises in practice). The drainer preserves
+        # FIFO order between traces and the result frame that follows.
+        frame: dict[str, Any] = {"type": F.TRACE, "kind": kind, "payload": payload}
         if call_id is not None:
             frame["call_id"] = call_id
         if source is not None:
             frame["source"] = source
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        loop.create_task(self._send(frame))
+            self._outbound_q.put_nowait(frame)
+        except asyncio.QueueFull:
+            pass  # impossible on an unbounded queue, but defensive
 
     _RUNTIME_FRAME_HANDLERS: dict[str, str] = {
         F.CALL: "_on_call",
@@ -246,7 +277,16 @@ class Worker:
         q = self._bidi_queues.get(call_id)
         if q is None:
             return
-        await q.put(frame.get("item"))
+        # Drop on QueueFull — if the impl isn't consuming fast enough
+        # (or already exited), blocking here would stall the main read
+        # loop and freeze the worker. Slow-consumer backpressure on bidi
+        # is the caller's problem; the framework picks "lose data" over
+        # "lose the whole worker".
+        try:
+            q.put_nowait(frame.get("item"))
+        except asyncio.QueueFull:
+            logger.warning("worker %r call %s: bidi input queue full, dropping item",
+                           self._package, call_id)
 
     async def _on_bidi_end_in(self, frame: dict[str, Any]) -> None:
         call_id = frame.get("call_id", "")

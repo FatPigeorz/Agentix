@@ -34,6 +34,7 @@ subprocess or feeds them to an in-process Dispatcher directly.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.metadata
 import logging
 import os
@@ -164,6 +165,8 @@ class _SubprocessWorker:
         # Per-call state: futures for unary, queues for stream/bidi.
         self._unary: dict[str, asyncio.Future] = {}
         self._streams: dict[str, asyncio.Queue] = {}
+        # Best-effort cancel sends kept alive (asyncio's task GC).
+        self._cancel_tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         env = dict(os.environ)
@@ -262,6 +265,20 @@ class _SubprocessWorker:
             "method": request.method, "args": request.args, "kwargs": request.kwargs,
         }
 
+    def _schedule_cancel(self, cid: str) -> None:
+        """Tell the worker to abort a call. Best-effort; the send is fired
+        off as a background task tracked in `_cancel_tasks` so asyncio
+        doesn't GC the reference before the frame lands."""
+        t = asyncio.create_task(self._send_cancel(cid))
+        self._cancel_tasks.add(t)
+        t.add_done_callback(self._cancel_tasks.discard)
+
+    async def _send_cancel(self, cid: str) -> None:
+        try:
+            await self._send({"type": F.CANCEL, "call_id": cid})
+        except Exception:
+            logger.debug("cancel send failed for call %r", cid)
+
     async def call_unary(self, request: RemoteRequest) -> RemoteResponse:
         cid = request.call_id or _new_id()
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -271,20 +288,27 @@ class _SubprocessWorker:
             return await fut
         finally:
             self._unary.pop(cid, None)
+            # Caller bailed before the worker replied — tell it to stop.
+            if not fut.done():
+                self._schedule_cancel(cid)
 
     async def iter_stream(self, request: RemoteRequest) -> AsyncIterator[dict[str, Any]]:
         cid = request.call_id or _new_id()
         q: asyncio.Queue = asyncio.Queue()
         self._streams[cid] = q
+        terminated = False
         try:
             await self._send(self._call_frame(F.KIND_STREAM, cid, request))
             while True:
                 ev = await q.get()
                 yield ev
                 if ev.get("type") in ("end", "error"):
+                    terminated = True
                     return
         finally:
             self._streams.pop(cid, None)
+            if not terminated:
+                self._schedule_cancel(cid)
 
     async def iter_bidi(
         self, request: RemoteRequest, input_iter: AsyncIterator[Any],
@@ -293,6 +317,7 @@ class _SubprocessWorker:
         q: asyncio.Queue = asyncio.Queue()
         self._streams[cid] = q
         input_task: asyncio.Task | None = None
+        terminated = False
         try:
             await self._send(self._call_frame(F.KIND_BIDI, cid, request))
 
@@ -308,11 +333,16 @@ class _SubprocessWorker:
                 ev = await q.get()
                 yield ev
                 if ev.get("type") in ("end", "error"):
+                    terminated = True
                     return
         finally:
             self._streams.pop(cid, None)
             if input_task is not None:
                 input_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await input_task
+            if not terminated:
+                self._schedule_cancel(cid)
 
     async def shutdown(self) -> None:
         if self._proc is None:
@@ -329,8 +359,12 @@ class _SubprocessWorker:
                 await asyncio.wait_for(self._proc.wait(), timeout=2)
             except asyncio.TimeoutError:
                 self._proc.kill()
+                # SIGKILL is guaranteed; wait so we reap the zombie.
+                await self._proc.wait()
         if self._read_task is not None:
             self._read_task.cancel()
+            with contextlib.suppress(BaseException):
+                await self._read_task
 
 
 def _new_id() -> str:

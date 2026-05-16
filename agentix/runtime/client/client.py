@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import inspect
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine
@@ -73,6 +74,36 @@ from agentix.dispatch import detect_shape
 P = ParamSpec("P")
 R = TypeVar("R")
 T = TypeVar("T")
+
+
+# ── Per-call hot-path caches ─────────────────────────────────────────
+#
+# `c.remote(fn, ...)` runs on every dispatch. Two repeated costs would
+# otherwise dominate a tight RL loop:
+#   * `inspect.signature(fn, eval_str=True)` — PEP 563 annotation eval
+#     is ~100–500 µs per call.
+#   * `TypeAdapter(annotation)` — pydantic schema compile is ~50–200 µs
+#     per parameter.
+# Both are deterministic in `fn` / `annotation` identity, so a process-
+# wide cache is correct.
+
+@functools.lru_cache(maxsize=None)
+def _signature_of(fn: Callable) -> inspect.Signature:
+    return inspect.signature(fn, eval_str=True)
+
+
+_ADAPTER_CACHE: dict[int, TypeAdapter] = {}
+
+
+def _adapter_for(ann: Any) -> TypeAdapter:
+    """Return a cached `TypeAdapter` for the annotation. Keyed by
+    `id(ann)`: identity-stable for annotations stored on a function's
+    `__annotations__`, which live as long as the function does."""
+    key = id(ann)
+    a = _ADAPTER_CACHE.get(key)
+    if a is None:
+        a = _ADAPTER_CACHE[key] = TypeAdapter(ann)
+    return a
 
 
 class RemoteCallError(RuntimeError):
@@ -168,21 +199,17 @@ class RuntimeClient:
           * Otherwise → unary; returns `Coroutine[..., R]`; caller
             `await`s it.
         """
-        # eval_str=True: stubs declared with `from __future__ import
-        # annotations` would otherwise expose string annotations here,
-        # mis-routing stream/bidi shapes to unary.
-        sig = inspect.signature(fn, eval_str=True)
+        sig = _signature_of(fn)
         shape = detect_shape(sig)
         if shape == "unary":
-            return self._remote_unary(fn, sig.return_annotation, *args, **kwargs)
+            return self._remote_unary(fn, sig, *args, **kwargs)
         if shape == "stream":
             return self._remote_stream(fn, sig, *args, **kwargs)
         return self._remote_bidi(fn, sig, *args, **kwargs)
 
-    async def _remote_unary(self, fn, return_ann, *args, **kwargs):
+    async def _remote_unary(self, fn, sig, *args, **kwargs):
         package = fn.__module__
         method = fn.__name__
-        sig = inspect.signature(fn)
         body = pack({
             "package": package, "method": method,
             "args": _encode_args(sig, args),
@@ -197,9 +224,10 @@ class RuntimeClient:
         if not resp.ok:
             assert resp.error is not None
             raise RemoteCallError(package=package, method=method, error=resp.error)
+        return_ann = sig.return_annotation
         if return_ann is inspect.Signature.empty:
             return resp.value
-        return TypeAdapter(return_ann).validate_python(resp.value)
+        return _adapter_for(return_ann).validate_python(resp.value)
 
     async def _remote_stream(self, fn, sig, *args, **kwargs):
         package = fn.__module__
@@ -210,7 +238,7 @@ class RuntimeClient:
         self._pending[call_id] = q
 
         ret_args = get_args(sig.return_annotation)
-        item_adapter = TypeAdapter(ret_args[0] if ret_args else Any)
+        item_adapter = _adapter_for(ret_args[0] if ret_args else Any)
         try:
             await sio.emit(STREAM, pack({
                 "call_id": call_id,
@@ -264,8 +292,8 @@ class RuntimeClient:
 
         non_stream_kwargs = _encode_kwargs(sig, dict(bound.arguments))
         out_args = get_args(sig.return_annotation)
-        out_adapter = TypeAdapter(out_args[0] if out_args else Any)
-        in_adapter = TypeAdapter(in_item_type)
+        out_adapter = _adapter_for(out_args[0] if out_args else Any)
+        in_adapter = _adapter_for(in_item_type)
 
         sio = await self._ensure_sio()
         call_id = uuid.uuid4().hex
@@ -431,7 +459,7 @@ def _encode_args(sig: inspect.Signature, args: tuple) -> list[Any]:
             else Any
         )
         try:
-            out.append(TypeAdapter(ann).dump_python(v, mode="python"))
+            out.append(_adapter_for(ann).dump_python(v, mode="python"))
         except Exception:
             out.append(v)
     return out
@@ -448,7 +476,7 @@ def _encode_kwargs(sig: inspect.Signature, kwargs: dict[str, Any]) -> dict[str, 
             else Any
         )
         try:
-            out[k] = TypeAdapter(ann).dump_python(v, mode="python")
+            out[k] = _adapter_for(ann).dump_python(v, mode="python")
         except Exception:
             out[k] = v
     return out

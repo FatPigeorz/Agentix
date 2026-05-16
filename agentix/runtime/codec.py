@@ -66,9 +66,18 @@ def _decode_ext(code: int, data: bytes) -> Any:
     return msgpack.ExtType(code, data)
 
 
+# Module-level `Packer` reused across `pack()` calls. `autoreset=True`
+# means each `.pack()` returns a complete frame and resets internal
+# state — safe for the single-threaded asyncio loop. Re-entrant
+# packing (e.g. `_encode_ext` packing a pydantic model) still goes
+# through `msgpack.packb`, which creates its own short-lived Packer
+# so the module-level one's state is not clobbered.
+_PACKER = msgpack.Packer(default=_encode_ext, use_bin_type=True, autoreset=True)
+
+
 def pack(obj: Any) -> bytes:
     """Serialize an arbitrary Python object to msgpack bytes."""
-    return msgpack.packb(obj, default=_encode_ext, use_bin_type=True)
+    return _PACKER.pack(obj)
 
 
 def unpack(blob: bytes) -> Any:
