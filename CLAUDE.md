@@ -53,7 +53,7 @@ primitives/bash/
 
 The framework's `agentix/__init__.py` extends its `__path__` via `pkgutil.extend_path`, so once a namespace dist installs files at `<site-packages>/agentix/bash/`, `from agentix import bash` resolves and `bash.run` is the remote-callable function. Multiple namespace dists can install peer entries under `agentix/` without colliding.
 
-Reserved by the framework — namespace dists may not shadow: `agentix.cli`, `agentix.deployment`, `agentix.dispatch`, `agentix.idents`, `agentix.models`, `agentix.namespace`, `agentix.rollout`, `agentix.runtime`, `agentix.trace`, `agentix.wire`. Everything else under `agentix.*` is fair game.
+Reserved by the framework — namespace dists may not shadow: `agentix.cli`, `agentix.deployment`, `agentix.dispatch`, `agentix.idents`, `agentix.models`, `agentix.namespace`, `agentix.rollout`, `agentix.runtime`, `agentix.trace`. Everything else under `agentix.*` is fair game.
 
 ### The package IS the namespace
 
@@ -102,7 +102,7 @@ The framework has **two** plugin axes — only the things that cross the host↔
 Everything else (trace sinks, wire patterns, spec resolvers, CLI verbs) is pure host-side Python. The hooks are plain functions/classes you import — no entry points, no `Registry[T]`. See [feedback memory](../../.claude/projects/-apdcephfs-gy4-share-302774114-davejhwang-Agentix/memory/feedback_plugins_only_cross_sandbox.md) for the principle.
 
 - `agentix.trace.subscribe(fn)` to add a trace consumer (OTel, Sentry, custom bus).
-- Wire patterns are a frozen tuple of three built-ins (`unary` / `stream` / `bidi`) in `agentix/wire.py`. No extension hook — add a fourth `WirePattern` subclass directly if a new call shape ever becomes necessary.
+- Call shapes (`unary` / `stream` / `bidi`) are detected from the method signature by `agentix.dispatch.detect_shape`. No extension hook — add a fourth shape by editing that function plus the matching branches in `Dispatcher.bind` and `RuntimeClient.remote`.
 - Spec resolvers live as an ordered list in `agentix/cli/_resolve.py`; new spec shapes mean editing that file, not shipping a wheel.
 - A new `agentix <verb>` CLI: ship your own `agentix-yourcmd` `console_scripts` binary; the central CLI is not a plugin surface.
 
@@ -305,14 +305,15 @@ class Bash(Namespace, Protocol):
 impl: Bash = BashImpl()  # pyright catches structural mismatch here
 ```
 
-### 2. Wire patterns (R2)
+### 2. Call shapes (R2)
 
-Call shapes (unary / server-stream / bidi) live in `agentix.wire` as `WirePattern` subclasses. Each pattern owns:
+Three call shapes (`unary` / `stream` / `bidi`) cover every signature the framework supports. `agentix.dispatch.detect_shape(sig)` returns one of those strings:
 
-* `matches(sig) -> bool` — does this signature use this pattern?
-* `bind(sig)` — per-method state precompute at `Dispatcher.bind` time.
+* `unary`  — plain `T` return
+* `stream` — `-> AsyncIterator[T]` return, no `AsyncIterator` params
+* `bidi`   — one `AsyncIterator[U]` param + `-> AsyncIterator[V]` return
 
-The three built-ins (`UnaryPattern`, `StreamPattern`, `BidiPattern`) are exhaustive for the call shapes the framework supports and are checked in specific-to-general order via `select_pattern`. They are **not** user-extensible — there is no `register_pattern` hook. If a future call shape becomes necessary, add a fourth `WirePattern` subclass to `agentix/wire.py` directly. The Dispatcher picks the pattern at bind time and caches it on the bound method.
+Detection runs at `Dispatcher.bind` time and again on every `c.remote(...)` client-side; both branch on the resulting string. There is no plugin hook for new shapes — the assumption is the framework's three are exhaustive. If a fourth ever becomes necessary, edit `detect_shape` plus the two branch sites; the abstraction overhead of a swappable pattern hierarchy isn't paying for itself.
 
 ### 3. Branded identifiers from `agentix.idents`
 

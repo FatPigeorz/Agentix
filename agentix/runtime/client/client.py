@@ -68,7 +68,7 @@ from agentix.runtime.models import (
     RemoteResponse,
     TraceEvent,
 )
-from agentix.wire import select_pattern
+from agentix.dispatch import detect_shape
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -159,26 +159,25 @@ class RuntimeClient:
     def remote(self, fn, *args, **kwargs):
         """Execute `fn` in the sandbox and return its typed result.
 
-        Dispatch is polymorphic on the stub's signature — a `WirePattern`
-        is selected via `agentix.wire.select_pattern(sig)` and that
-        pattern owns the wire framing (HTTP for unary, Socket.IO for
-        stream/bidi, or anything a third-party pattern registers).
+        Dispatch is polymorphic on the stub's signature:
 
-        The three built-in patterns:
-          * Output `AsyncIterator[T]` + one `AsyncIterator[U]` parameter
-            → `BidiPattern`; returns `AsyncIterator[T]`.
-          * Output `AsyncIterator[T]`, no streaming parameters →
-            `StreamPattern`; returns `AsyncIterator[T]`.
-          * Otherwise → `UnaryPattern`; returns `Coroutine[..., R]`;
-            caller `await`s it.
+          * `-> AsyncIterator[T]` + one `AsyncIterator[U]` parameter
+            → bidi; returns `AsyncIterator[T]`.
+          * `-> AsyncIterator[T]`, no streaming parameters →
+            server-stream; returns `AsyncIterator[T]`.
+          * Otherwise → unary; returns `Coroutine[..., R]`; caller
+            `await`s it.
         """
         # eval_str=True: stubs declared with `from __future__ import
         # annotations` would otherwise expose string annotations here,
-        # mis-routing stream/bidi shapes to UnaryPattern.
+        # mis-routing stream/bidi shapes to unary.
         sig = inspect.signature(fn, eval_str=True)
-        pattern = select_pattern(sig)()
-        pattern.bind(sig)
-        return pattern.client_invoke(self, fn, sig, args, kwargs)
+        shape = detect_shape(sig)
+        if shape == "unary":
+            return self._remote_unary(fn, sig.return_annotation, *args, **kwargs)
+        if shape == "stream":
+            return self._remote_stream(fn, sig, *args, **kwargs)
+        return self._remote_bidi(fn, sig, *args, **kwargs)
 
     async def _remote_unary(self, fn, return_ann, *args, **kwargs):
         package = fn.__module__

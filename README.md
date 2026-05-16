@@ -130,7 +130,7 @@ Orchestrator ──HTTP /_remote──► Runtime Server ──in-process call�
 | Runtime server | `/health`, `/namespaces`, `/_remote` (unary), `/socket.io/` (streams/bidi/logs/traces), `/_llm/<provider>/<path>` (LLM-proxy fan-in) |
 | Namespace | Python class registered under `agentix.namespace` entry point; methods called via `c.remote(...)` |
 | Deployment | Sandbox CRUD plugin under `agentix.deployment`; `local` (Docker) is built in |
-| WirePattern | Internal call-shape strategy — three built-ins (unary / stream / bidi), not user-extensible |
+| Call shape | Detected from signature (unary / stream / bidi); editable in `agentix/dispatch.py` |
 | Trace sink | Optional observability hook — receives every `trace.emit(...)` event |
 
 Discovery is lazy: namespace `ep.load()` is deferred until the first `/_remote` call for that namespace; one broken namespace doesn't block sandbox boot. See [`docs/reference/architecture.mdx`](docs/reference/architecture.mdx) and [`docs/reference/namespace-protocol.mdx`](docs/reference/namespace-protocol.mdx) for protocol details.

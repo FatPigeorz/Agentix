@@ -52,22 +52,21 @@ or async task inside the handler body.
   dispatch needed.
 </Tip>
 
-## Wire patterns — three built-ins, not extensible
+## Call shapes — three built-ins, detected by signature
 
-Three call shapes ship in `agentix.wire`:
+Three call shapes are detected from a method's signature by
+`agentix.dispatch.detect_shape(sig)`:
 
-| Pattern         | Class             | Matches signatures                                                |
-| --------------- | ----------------- | ----------------------------------------------------------------- |
-| Unary           | `UnaryPattern`    | plain return (`-> T`)                                             |
-| Server-stream   | `StreamPattern`   | `-> AsyncIterator[T]`                                             |
-| Bidirectional   | `BidiPattern`     | `AsyncIterator[U]` first param + `-> AsyncIterator[V]`            |
+| Shape    | Signature                                                          |
+| -------- | ------------------------------------------------------------------ |
+| `unary`  | plain return (`-> T`)                                              |
+| `stream` | `-> AsyncIterator[T]`                                              |
+| `bidi`   | one `AsyncIterator[U]` param + `-> AsyncIterator[V]` return        |
 
-Selection is at `Dispatcher.bind` time — the framework inspects each
-namespace method's signature and picks the most specific match. There
-is **no `register_pattern` hook**. If a fourth call shape ever becomes
-necessary, add it as a `WirePattern` subclass in `agentix/wire.py` and
-update the in-tree registry. Wire framing is core to the protocol; it
-doesn't belong in third-party wheels.
+Detection runs at `Dispatcher.bind` time on the server and on every
+`c.remote(...)` on the client. If a fourth shape ever becomes
+necessary, edit `detect_shape` plus the matching branches in
+`Dispatcher.bind` and `RuntimeClient.remote` — no plugin hook.
 
 ## Spec resolvers — internal ordered list
 
@@ -120,7 +119,7 @@ verbs in shell completion.
 | Surface                        | Mechanism                          | Where to add it                              |
 | ------------------------------ | ---------------------------------- | -------------------------------------------- |
 | Trace pub/sub                  | `trace.subscribe(fn)` at startup   | Your own host-side startup code              |
-| Wire patterns                  | In-tree `WirePattern` subclass     | `agentix/wire.py` (framework PR)             |
+| Call shapes                    | `agentix.dispatch.detect_shape`    | `agentix/dispatch.py` (framework PR)         |
 | Spec resolvers                 | In-tree ordered list               | `agentix/cli/_resolve.py` (framework PR)     |
 | A new `agentix <verb>`         | Separate `console_scripts` binary  | Your own wheel — `agentix-<verb>` convention |
 

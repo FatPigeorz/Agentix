@@ -35,7 +35,7 @@ discovery channel.
 **Reserved framework subpackages** — namespace dists may not shadow:
 `agentix.cli`, `agentix.deployment`, `agentix.dispatch`, `agentix.idents`,
 `agentix.models`, `agentix.namespace`, `agentix.rollout`,
-`agentix.runtime`, `agentix.trace`, `agentix.wire`. Everything else
+`agentix.runtime`, `agentix.trace`. Everything else
 under `agentix.*` is fair game.
 
 ## The class IS the namespace
@@ -221,8 +221,7 @@ async def echo(messages: AsyncIterator[str]) -> AsyncIterator[str]:
 
 The caller passes an async iterable of inputs and consumes another
 async iterable of outputs over the same `call_id`. Inputs flow as
-`bidi:in` events; outputs as `bidi:out`. See `agentix.wire.BidiPattern`
-for the framing details.
+`bidi:in` events; outputs as `bidi:out`.
 
 ## Runtime built-ins
 

@@ -19,7 +19,7 @@ import logging
 import traceback
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Generic, ParamSpec, TypeVar, get_args, get_origin
+from typing import Any, Generic, Literal, ParamSpec, TypeVar, get_args, get_origin
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -32,18 +32,36 @@ from agentix.runtime.models import (
     RemoteRequest,
     RemoteResponse,
 )
-from agentix.wire import (
-    BidiPattern,
-    StreamPattern,
-    UnaryPattern,
-    WirePattern,
-    select_pattern,
-)
 
 logger = logging.getLogger("agentix.dispatch")
 
 P = ParamSpec("P")
 R = TypeVar("R")
+
+Shape = Literal["unary", "stream", "bidi"]
+"""How a method's signature maps onto the wire:
+
+  * `unary`  — plain `T` return; one request, one response
+  * `stream` — `-> AsyncIterator[T]` return, no AsyncIterator params
+  * `bidi`   — one `AsyncIterator[U]` param + `-> AsyncIterator[V]` return
+"""
+
+
+def detect_shape(sig: inspect.Signature) -> Shape:
+    """Derive the wire shape from a function's signature.
+
+    The framework's three call shapes are exhaustive; adding a fourth means
+    editing this function and the matching branches in `Dispatcher` /
+    `RuntimeClient`. No plugin extension hook — by design.
+    """
+    ret_is_stream = get_origin(sig.return_annotation) in STREAM_ORIGINS
+    if not ret_is_stream:
+        return "unary"
+    has_stream_param = any(
+        get_origin(p.annotation) in STREAM_ORIGINS
+        for p in sig.parameters.values()
+    )
+    return "bidi" if has_stream_param else "stream"
 
 
 @dataclass
@@ -52,7 +70,7 @@ class _BoundMethod(Generic[P, R]):
     stub: Callable[P, R]
     impl: Callable[..., Any]
     signature: inspect.Signature
-    pattern: type[WirePattern]                    # wire pattern class (Unary/Stream/Bidi/…)
+    shape: Shape
     param_adapters: dict[str, TypeAdapter[Any]]
     return_adapter: TypeAdapter[Any]
     item_adapter: TypeAdapter[Any] | None = None  # output item adapter (stream/bidi only)
@@ -62,11 +80,11 @@ class _BoundMethod(Generic[P, R]):
     @property
     def is_stream(self) -> bool:
         """True for stream and bidi — anything that emits a sequence of items."""
-        return self.pattern is StreamPattern or self.pattern is BidiPattern
+        return self.shape in ("stream", "bidi")
 
     @property
     def is_bidi(self) -> bool:
-        return self.pattern is BidiPattern
+        return self.shape == "bidi"
 
 
 class Dispatcher:
@@ -96,8 +114,8 @@ class Dispatcher:
 
         Both must share the same signature (the stub is just the typed
         contract; impl carries the body). The wire request's `method`
-        field is `stub.__name__`. The `WirePattern` matching the stub's
-        signature is selected at bind time and cached.
+        field is `stub.__name__`. The call shape is detected from the
+        signature at bind time and cached.
         """
         # eval_str=True resolves PEP 563 stringified annotations (`from
         # __future__ import annotations` in the stub module) — without it,
@@ -107,7 +125,7 @@ class Dispatcher:
         name = MethodName(stub.__name__)
         if name in self._methods:
             raise ValueError(f"method '{name}' already bound on this dispatcher")
-        pattern = select_pattern(sig)
+        shape = detect_shape(sig)
 
         param_adapters: dict[str, TypeAdapter[Any]] = {}
         stream_params: list[tuple[str, type]] = []
@@ -126,35 +144,24 @@ class Dispatcher:
         item_adapter: TypeAdapter[Any] | None = None
         input_stream_param: str | None = None
         input_item_adapter: TypeAdapter[Any] | None = None
-        if pattern is UnaryPattern:
+        if shape == "unary":
             return_adapter = TypeAdapter(return_ann)
-        elif pattern is StreamPattern:
-            args = get_args(return_ann)
-            item_type = args[0] if args else Any
-            item_adapter = TypeAdapter(item_type)
-            return_adapter = TypeAdapter(Any)  # unused on streaming path
-        elif pattern is BidiPattern:
-            args = get_args(return_ann)
-            item_type = args[0] if args else Any
-            item_adapter = TypeAdapter(item_type)
-            # BidiPattern.matches already guaranteed exactly one stream param.
-            input_stream_param, input_item_type = stream_params[0]
-            input_item_adapter = TypeAdapter(input_item_type)
-            return_adapter = TypeAdapter(Any)  # unused on streaming path
         else:
-            # Custom pattern: framework doesn't know how to serialize. The
-            # pattern owns wire framing (via its `bind` / `client_invoke` /
-            # whatever server hook it registers). We store an `Any` adapter
-            # so the dispatcher can still bind/coerce parameters; the return
-            # path is the pattern's problem.
-            return_adapter = TypeAdapter(Any)
+            # Stream + bidi both serialise items via the return type's T.
+            args = get_args(return_ann)
+            item_type = args[0] if args else Any
+            item_adapter = TypeAdapter(item_type)
+            return_adapter = TypeAdapter(Any)  # unused on streaming path
+            if shape == "bidi":
+                input_stream_param, input_item_type = stream_params[0]
+                input_item_adapter = TypeAdapter(input_item_type)
 
         self._methods[name] = _BoundMethod(
             name=name,
             stub=stub,
             impl=impl,
             signature=sig,
-            pattern=pattern,
+            shape=shape,
             param_adapters=param_adapters,
             return_adapter=return_adapter,
             item_adapter=item_adapter,

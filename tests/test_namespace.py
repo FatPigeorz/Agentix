@@ -1,10 +1,11 @@
-"""Unit tests for namespace discovery, `WirePattern`, and `Dispatcher.bind_namespace`.
+"""Unit tests for namespace discovery, call-shape detection, and
+`Dispatcher.bind_namespace`.
 
 Discovery is duck-typed — a namespace can be a Python module, a class,
-or any object whose top-level attributes include async callables.
-Wire-pattern selection (Unary / Stream / Bidi) is exercised at the
-`select_pattern` boundary. End-to-end protocol tests live in
-`test_namespace_protocol.py`.
+or any object whose top-level attributes include async callables. The
+three call shapes (unary / stream / bidi) are detected directly from
+the signature by `agentix.dispatch.detect_shape`. End-to-end protocol
+tests live in `test_namespace_protocol.py`.
 """
 
 from __future__ import annotations
@@ -14,15 +15,9 @@ from collections.abc import AsyncIterator
 
 import pytest
 
-from agentix.dispatch import Dispatcher
+from agentix.dispatch import Dispatcher, detect_shape
 from agentix.namespace import discover_methods
 from agentix.runtime.models import RemoteRequest
-from agentix.wire import (
-    BidiPattern,
-    StreamPattern,
-    UnaryPattern,
-    select_pattern,
-)
 
 # ── Namespace method discovery ──────────────────────────────────────
 
@@ -68,7 +63,7 @@ def test_namespace_inherits_methods_from_namespace_ancestors() -> None:
     assert names == ["common", "extra"]
 
 
-# ── Pattern selection ───────────────────────────────────────────────
+# ── Call-shape detection ────────────────────────────────────────────
 
 
 def _sig(fn: object) -> inspect.Signature:
@@ -77,19 +72,19 @@ def _sig(fn: object) -> inspect.Signature:
     return inspect.signature(fn, eval_str=True)  # type: ignore[arg-type]
 
 
-def test_select_unary_for_plain_signature() -> None:
+def test_detect_unary_for_plain_signature() -> None:
     def f(x: int) -> str: ...
-    assert select_pattern(_sig(f)) is UnaryPattern
+    assert detect_shape(_sig(f)) == "unary"
 
 
-def test_select_stream_for_async_iterator_return() -> None:
+def test_detect_stream_for_async_iterator_return() -> None:
     def f(x: int) -> AsyncIterator[int]: ...
-    assert select_pattern(_sig(f)) is StreamPattern
+    assert detect_shape(_sig(f)) == "stream"
 
 
-def test_select_bidi_for_async_iterator_param_and_return() -> None:
+def test_detect_bidi_for_async_iterator_param_and_return() -> None:
     def f(events: AsyncIterator[str]) -> AsyncIterator[int]: ...
-    assert select_pattern(_sig(f)) is BidiPattern
+    assert detect_shape(_sig(f)) == "bidi"
 
 
 # ── Dispatcher.bind_namespace ───────────────────────────────────────
