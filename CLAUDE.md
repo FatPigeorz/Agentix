@@ -322,20 +322,7 @@ There are four `str`s in the wire layer that are easy to confuse — a namespace
 - `RemoteRequest.{package, method, call_id}`
 - `TraceEvent.{call_id, source}` (source is also a `PackageName`)
 - `Sandbox.sandbox_id` / `SandboxInfo.sandbox_id` / `DockerDeployment._ports`
-- `Dispatcher._methods` keyed by `MethodName`, `Registry._entries` by `PackageName`
+- `Dispatcher._methods` keyed by `MethodName`; `NamespaceMultiplexer._entries` by `PackageName`
 - `trace.set_call_context` / `trace.emit` / contextvars
 
-When you write new wire-adjacent code, use the branded types — pyright treats them as distinct, so swapping `MethodName` for `PackageName` becomes a type error. Pydantic v2 understands `NewType`, so JSON round-trip is unchanged.
-
-### 4. Stub ↔ impl signature drift is a CI failure
-
-`tools/check_stub_impl.py` loads each namespace's `_register.register()` and compares the stub's signature against the impl's for every bound method — parameter names, kinds, defaults, annotations, return type. Run it locally:
-
-```
-python tools/check_stub_impl.py            # defaults to primitives/
-python tools/check_stub_impl.py path/to/namespace
-```
-
-Drift causes a non-zero exit. This is the one class of bug the runtime itself cannot catch until the first call lands, so it gets caught in CI instead.
-
-The checker is shape-agnostic: it works for both legacy module-function stubs and for the upcoming class-based `Namespace` shape, because both bottom out at `Dispatcher.bind()`.
+When you write new wire-adjacent code, use the branded types — pyright treats them as distinct, so swapping `MethodName` for `PackageName` becomes a type error. Pydantic v2 understands `NewType`, so wire round-trip is unchanged.

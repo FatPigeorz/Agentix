@@ -21,7 +21,7 @@ __path__ = pkgutil.extend_path(__path__, __name__)
 from agentix import trace
 from agentix.deployment.base import Sandbox
 from agentix.deployment.docker import DockerDeployment
-from agentix.dispatch import Dispatcher, Registry
+from agentix.dispatch import Dispatcher
 from agentix.models import SandboxConfig, SandboxInfo
 from agentix.rollout import RolloutPool
 from agentix.runtime.client import RemoteCallError, RuntimeClient
@@ -33,7 +33,6 @@ __all__ = [
     "Dispatcher",
     "DockerDeployment",
     "LogRecord",
-    "Registry",
     "RemoteCallError",
     "RolloutPool",
     "RuntimeClient",

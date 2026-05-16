@@ -1,27 +1,24 @@
-"""In-process namespace dispatch.
+"""Namespace dispatch — binds a target's public functions for RPC.
 
-A `Dispatcher` binds typed stub signatures to their impl callables. Namespaces
-ship a `_register.register()` function that returns a populated Dispatcher.
-The runtime imports each mounted namespace's package, collects Dispatchers
-into a `Registry`, and serves `POST /{ns}/_remote` by calling
-`registry.get(ns).dispatch(request)` directly — no subprocess, no UDS,
-no reverse proxy.
+`Dispatcher.bind_namespace(target)` walks `target` (a module or class) for
+public async/sync functions and pre-builds pydantic `TypeAdapter`s for each
+parameter and return type from `inspect.signature`. `dispatch` /
+`dispatch_stream` / `dispatch_bidi` coerce wire-decoded args back into the
+declared types and invoke the impl.
 
-Serialization is driven by the stub's `inspect.signature`: each parameter's
-annotation becomes a pydantic `TypeAdapter`, same for the return type.
-Stubs use plain `def`/`async def` with `...` (Ellipsis) bodies — no
-decorators, no base classes.
+The runtime's multiplexer instantiates one Dispatcher per namespace inside
+a worker subprocess; in-process tests bind directly via
+`multiplexer.register_inprocess(target)`.
 """
 
 from __future__ import annotations
 
-import asyncio
 import importlib.metadata
 import inspect
 import logging
 import traceback
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Generic, ParamSpec, TypeVar, get_args, get_origin
 
 from pydantic import TypeAdapter, ValidationError
@@ -262,14 +259,14 @@ class Dispatcher:
         """
         m = self._methods.get(request.method)
         if m is None:
-            yield {"error": RemoteError(
+            yield {"type": "error", "error": RemoteError(
                 type="MethodNotFound",
                 message=f"method '{request.method}' is not bound on this dispatcher; "
                 f"available: {sorted(self._methods)}",
             ).model_dump()}
             return
         if not m.is_stream or m.is_bidi:
-            yield {"error": RemoteError(
+            yield {"type": "error", "error": RemoteError(
                 type="NotAStreamingMethod",
                 message=f"method '{request.method}' is not a (non-bidi) streaming method",
             ).model_dump()}
@@ -277,7 +274,7 @@ class Dispatcher:
         try:
             args, kwargs = self._coerce(m, request.args, request.kwargs)
         except ValidationError as exc:
-            yield {"error": RemoteError(type="ValidationError", message=str(exc)).model_dump()}
+            yield {"type": "error", "error": RemoteError(type="ValidationError", message=str(exc)).model_dump()}
             return
         tokens = trace.set_call_context(request.call_id, _source_for(m.impl))
         try:
@@ -290,15 +287,15 @@ class Dispatcher:
                     try:
                         value = m.item_adapter.dump_python(item, mode="python")
                     except Exception as exc:
-                        yield {"error": RemoteError(
+                        yield {"type": "error", "error": RemoteError(
                             type="SerializationError",
                             message=f"failed to serialize item: {exc}",
                         ).model_dump()}
                         return
-                    yield {"item": value}
+                    yield {"type": "item", "value": value}
             except Exception as exc:
                 logger.exception("namespace stream impl '%s' raised mid-stream", m.name)
-                yield {"error": RemoteError(
+                yield {"type": "error", "error": RemoteError(
                     type=type(exc).__name__,
                     message=str(exc),
                     traceback=traceback.format_exc(),
@@ -306,7 +303,7 @@ class Dispatcher:
                 return
         finally:
             trace.reset_call_context(tokens)
-        yield {"end": True}
+        yield {"type": "end"}
 
     async def dispatch_bidi(
         self,
@@ -321,14 +318,14 @@ class Dispatcher:
         """
         m = self._methods.get(request.method)
         if m is None:
-            yield {"error": RemoteError(
+            yield {"type": "error", "error": RemoteError(
                 type="MethodNotFound",
                 message=f"method '{request.method}' is not bound on this dispatcher; "
                 f"available: {sorted(self._methods)}",
             ).model_dump()}
             return
         if not m.is_bidi:
-            yield {"error": RemoteError(
+            yield {"type": "error", "error": RemoteError(
                 type="NotABidiMethod",
                 message=f"method '{request.method}' is not bidirectional",
             ).model_dump()}
@@ -348,7 +345,7 @@ class Dispatcher:
                 coerced[pname] = adapter.validate_python(raw) if adapter is not None else raw
             coerced[m.input_stream_param] = input_iter
         except (TypeError, ValidationError) as exc:
-            yield {"error": RemoteError(type=type(exc).__name__, message=str(exc)).model_dump()}
+            yield {"type": "error", "error": RemoteError(type=type(exc).__name__, message=str(exc)).model_dump()}
             return
         tokens = trace.set_call_context(request.call_id, _source_for(m.impl))
         try:
@@ -361,15 +358,15 @@ class Dispatcher:
                     try:
                         value = m.item_adapter.dump_python(item, mode="python")
                     except Exception as exc:
-                        yield {"error": RemoteError(
+                        yield {"type": "error", "error": RemoteError(
                             type="SerializationError",
                             message=f"failed to serialize item: {exc}",
                         ).model_dump()}
                         return
-                    yield {"item": value}
+                    yield {"type": "item", "value": value}
             except Exception as exc:
                 logger.exception("namespace bidi impl '%s' raised mid-stream", m.name)
-                yield {"error": RemoteError(
+                yield {"type": "error", "error": RemoteError(
                     type=type(exc).__name__,
                     message=str(exc),
                     traceback=traceback.format_exc(),
@@ -377,7 +374,7 @@ class Dispatcher:
                 return
         finally:
             trace.reset_call_context(tokens)
-        yield {"end": True}
+        yield {"type": "end"}
 
     @staticmethod
     def _coerce(
@@ -433,132 +430,12 @@ def _source_for(impl: Callable[..., Any]) -> PackageName | None:
 NAMESPACE_ENTRY_POINT_GROUP = "agentix.namespace"
 
 
-@dataclass
-class _Entry:
-    """One registered namespace. `dispatcher` is built lazily on first use.
-
-    `loader` returns the namespace's `Namespace` subclass on demand. For
-    entry-point-discovered namespaces it's `ep.load`; for test fixtures it's
-    a pre-bound `lambda: cls`. Either way, the actual import + dispatcher
-    build is deferred until `get_or_load(...)` is awaited.
-    """
-
-    loader: Callable[[], type]
-    dist_name: str | None = None
-    dist_version: str | None = None
-    dispatcher: Dispatcher | None = None
-    error: Exception | None = None
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-
-
-class Registry:
-    """Per-runtime collection of package-path → namespace entry.
-
-    Namespaces are discovered via `importlib.metadata.entry_points(group=
-    "agentix.namespace")` at sandbox-startup time, but their Python packages
-    are not imported and their Dispatchers are not built until the first
-    call to `get_or_load(package)`. This keeps sandbox boot cheap and
-    isolates per-namespace import failures so they surface on call rather
-    than at startup.
-
-    The namespace's Python import path (e.g. 'agentix.bash') is the routing
-    key — there are no caller-chosen namespaces.
-    """
-
-    def __init__(self) -> None:
-        self._entries: dict[PackageName, _Entry] = {}
-
-    def register(
-        self,
-        package: PackageName,
-        loader: Callable[[], type],
-        *,
-        dist_name: str | None = None,
-        dist_version: str | None = None,
-    ) -> None:
-        """Mark a namespace as known but not yet loaded.
-
-        `loader()` must return the namespace's `Namespace` subclass. The
-        registry calls it lazily on first dispatch. `dist_name` and
-        `dist_version` come from `importlib.metadata` and are surfaced
-        via `/namespaces` for introspection.
-        """
-        if package in self._entries:
-            raise ValueError(f"package '{package}' already registered")
-        self._entries[package] = _Entry(
-            loader=loader,
-            dist_name=dist_name,
-            dist_version=dist_version,
-        )
-
-    def register_entry_point(self, ep: Any) -> None:
-        """Register a `importlib.metadata.EntryPoint`. Convenience for the
-        normal entry-point discovery path.
-        """
-        package = PackageName(ep.value.split(":", 1)[0])
-        dist_name = getattr(ep.dist, "name", None) if ep.dist else None
-        dist_version = getattr(ep.dist, "version", None) if ep.dist else None
-        self.register(
-            package,
-            loader=ep.load,
-            dist_name=dist_name,
-            dist_version=dist_version,
-        )
-
-    async def get_or_load(self, package: PackageName) -> Dispatcher | None:
-        """Return the dispatcher for `package`, building it on first call.
-
-        Returns None for unknown packages. Re-raises the original
-        exception on every call if the load has previously failed.
-        Concurrent first calls to the same package serialise on a
-        per-entry lock so the loader + bind sequence runs once.
-        """
-        entry = self._entries.get(package)
-        if entry is None:
-            return None
-        if entry.dispatcher is not None:
-            return entry.dispatcher
-        if entry.error is not None:
-            raise entry.error
-        async with entry.lock:
-            if entry.dispatcher is not None:
-                return entry.dispatcher
-            if entry.error is not None:
-                raise entry.error
-            try:
-                target = entry.loader()
-                entry.dispatcher = Dispatcher().bind_namespace(target)
-            except Exception as exc:
-                logger.exception("lazy-load failed for namespace '%s'", package)
-                entry.error = exc
-                raise
-            return entry.dispatcher
-
-    def packages(self) -> list[PackageName]:
-        """All known packages — registered, regardless of load state."""
-        return list(self._entries)
-
-    def loaded_packages(self) -> list[PackageName]:
-        """Packages whose dispatcher has been built (post first-use)."""
-        return [pkg for pkg, e in self._entries.items() if e.dispatcher is not None]
-
-    def info_for(self, package: PackageName) -> tuple[str | None, str | None] | None:
-        """`(dist_name, dist_version)` for the namespace, or None if not registered."""
-        e = self._entries.get(package)
-        if e is None:
-            return None
-        return e.dist_name, e.dist_version
-
-    def __contains__(self, package: PackageName) -> bool:
-        return package in self._entries
-
-
 def discover_entry_points() -> list[Any]:
     """Return every installed `agentix.namespace` entry point.
 
     Cheap: walks `importlib.metadata` dist metadata; nothing is imported.
-    The framework uses this at sandbox-startup to populate the Registry
-    without paying the import cost of every namespace.
+    The multiplexer uses this in dev/test mode to know which namespaces
+    exist without paying the import cost of every namespace.
     """
     eps = importlib.metadata.entry_points()
     # Python 3.10+: SelectableGroups with .select(); earlier: dict.

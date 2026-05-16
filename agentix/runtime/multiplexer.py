@@ -38,14 +38,14 @@ import importlib.metadata
 import logging
 import os
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
-from agentix import trace
 from agentix.dispatch import NAMESPACE_ENTRY_POINT_GROUP, Dispatcher
 from agentix.models import NamespaceManifest
+from agentix.runtime import frames as F
 from agentix.runtime.models import RemoteError, RemoteRequest, RemoteResponse
 from agentix.runtime.rpc import read_frame, write_frame
 
@@ -55,9 +55,21 @@ logger = logging.getLogger("agentix.runtime.multiplexer")
 
 
 TraceForwarder = Callable[[str, dict[str, Any], str | None, str | None], None]
-"""Callback the multiplexer invokes for every trace frame from any worker
-(or for in-process trace.emit when using InProcessEntry). The runtime
-plugs in a function that publishes to the Socket.IO `traces` room."""
+"""Callback the multiplexer invokes for every trace event from any worker.
+The runtime plugs in a function that publishes to the Socket.IO `traces`
+room."""
+
+
+class _WorkerLike(Protocol):
+    """Both _InProcessWorker and _SubprocessWorker satisfy this surface;
+    the multiplexer routes through it without caring which backs the call."""
+
+    async def call_unary(self, request: RemoteRequest) -> RemoteResponse: ...
+    def iter_stream(self, request: RemoteRequest) -> AsyncIterator[dict[str, Any]]: ...
+    def iter_bidi(
+        self, request: RemoteRequest, input_iter: AsyncIterator[Any],
+    ) -> AsyncIterator[dict[str, Any]]: ...
+    async def shutdown(self) -> None: ...
 
 
 # ── entries (one per discovered namespace) ──────────────────────────
@@ -81,7 +93,7 @@ class _NamespaceEntry:
     dispatcher: Dispatcher | None = None
 
     # Spawned worker state (lazy)
-    worker: "_SubprocessWorker | _InProcessWorker | None" = field(default=None, repr=False)
+    worker: _WorkerLike | None = field(default=None, repr=False)
     spawn_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
@@ -99,14 +111,14 @@ class _InProcessWorker:
 
     async def iter_stream(self, request: RemoteRequest) -> AsyncIterator[dict[str, Any]]:
         async for ev in self._dispatcher.dispatch_stream(request):
-            yield _translate_dispatcher_event(ev)
+            yield ev
 
     async def iter_bidi(
         self, request: RemoteRequest, input_iter: AsyncIterator[Any],
     ) -> AsyncIterator[dict[str, Any]]:
-        # In-process workers coerce input items via the bound dispatcher's
-        # adapter — the runtime transport just forwards raw values, same
-        # contract as a subprocess worker's stdin frames.
+        # Coerce input items via the dispatcher's bound adapter so the
+        # impl receives typed values, matching subprocess-worker semantics
+        # (where the worker process owns the same coercion).
         adapter = self._dispatcher.input_adapter_for(request.method)  # type: ignore[arg-type]
 
         async def _coerced():
@@ -116,13 +128,7 @@ class _InProcessWorker:
                 yield raw
 
         async for ev in self._dispatcher.dispatch_bidi(request, _coerced()):
-            yield _translate_dispatcher_event(ev)
-
-    async def cancel(self, call_id: str) -> None:
-        # In-process dispatch isn't cancellable mid-flight — the dispatcher
-        # is sync-driven inside one task. Cancellation only meaningful for
-        # subprocess workers.
-        return
+            yield ev
 
     async def shutdown(self) -> None:
         return
@@ -158,9 +164,6 @@ class _SubprocessWorker:
         # Per-call state: futures for unary, queues for stream/bidi.
         self._unary: dict[str, asyncio.Future] = {}
         self._streams: dict[str, asyncio.Queue] = {}
-        # Pydantic-validated dispatchers don't exist here; the worker
-        # itself owns the adapters. So is_bidi / input_adapter_for are
-        # unavailable to us — the multiplexer just forwards frames.
 
     async def start(self) -> None:
         env = dict(os.environ)
@@ -208,17 +211,17 @@ class _SubprocessWorker:
 
     def _on_frame(self, frame: dict[str, Any]) -> None:
         kind = frame.get("type")
-        if kind == "ready":
+        if kind == F.READY:
             self._ready.set()
-        elif kind == "boot_error":
+        elif kind == F.BOOT_ERROR:
             self._boot_error = frame.get("error") or {"type": "Unknown", "message": ""}
             self._ready.set()
-        elif kind == "result":
+        elif kind == F.RESULT:
             cid = frame.get("call_id", "")
             fut = self._unary.pop(cid, None)
             if fut and not fut.done():
                 fut.set_result(RemoteResponse(ok=True, value=frame.get("value")))
-        elif kind == "error":
+        elif kind == F.ERROR:
             cid = frame.get("call_id", "")
             err_payload = frame.get("error") or {"type": "Unknown", "message": ""}
             err = RemoteError(**err_payload)
@@ -229,15 +232,15 @@ class _SubprocessWorker:
             q = self._streams.get(cid)
             if q is not None:
                 q.put_nowait({"type": "error", "error": err_payload})
-        elif kind == "stream_item":
+        elif kind == F.STREAM_ITEM:
             q = self._streams.get(frame.get("call_id", ""))
             if q is not None:
                 q.put_nowait({"type": "item", "value": frame.get("value")})
-        elif kind == "stream_end":
+        elif kind == F.STREAM_END:
             q = self._streams.get(frame.get("call_id", ""))
             if q is not None:
                 q.put_nowait({"type": "end"})
-        elif kind == "trace":
+        elif kind == F.TRACE:
             if self._trace_forwarder is not None:
                 self._trace_forwarder(
                     frame.get("kind", ""),
@@ -253,25 +256,28 @@ class _SubprocessWorker:
         async with self._send_lock:
             await write_frame(self._proc.stdin, payload)
 
+    def _call_frame(self, kind: str, cid: str, request: RemoteRequest) -> dict[str, Any]:
+        return {
+            "type": F.CALL, "kind": kind, "call_id": cid,
+            "method": request.method, "args": request.args, "kwargs": request.kwargs,
+        }
+
     async def call_unary(self, request: RemoteRequest) -> RemoteResponse:
         cid = request.call_id or _new_id()
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._unary[cid] = fut
-        await self._send({
-            "type": "call", "kind": "unary", "call_id": cid,
-            "method": request.method, "args": request.args, "kwargs": request.kwargs,
-        })
-        return await fut
+        try:
+            await self._send(self._call_frame(F.KIND_UNARY, cid, request))
+            return await fut
+        finally:
+            self._unary.pop(cid, None)
 
     async def iter_stream(self, request: RemoteRequest) -> AsyncIterator[dict[str, Any]]:
         cid = request.call_id or _new_id()
         q: asyncio.Queue = asyncio.Queue()
         self._streams[cid] = q
-        await self._send({
-            "type": "call", "kind": "stream", "call_id": cid,
-            "method": request.method, "args": request.args, "kwargs": request.kwargs,
-        })
         try:
+            await self._send(self._call_frame(F.KIND_STREAM, cid, request))
             while True:
                 ev = await q.get()
                 yield ev
@@ -286,20 +292,18 @@ class _SubprocessWorker:
         cid = request.call_id or _new_id()
         q: asyncio.Queue = asyncio.Queue()
         self._streams[cid] = q
-        await self._send({
-            "type": "call", "kind": "bidi", "call_id": cid,
-            "method": request.method, "args": request.args, "kwargs": request.kwargs,
-        })
-
-        async def _pump_input():
-            try:
-                async for item in input_iter:
-                    await self._send({"type": "bidi_in", "call_id": cid, "item": item})
-            finally:
-                await self._send({"type": "bidi_end_in", "call_id": cid})
-
-        input_task = asyncio.create_task(_pump_input())
+        input_task: asyncio.Task | None = None
         try:
+            await self._send(self._call_frame(F.KIND_BIDI, cid, request))
+
+            async def _pump_input():
+                try:
+                    async for item in input_iter:
+                        await self._send({"type": F.BIDI_IN, "call_id": cid, "item": item})
+                finally:
+                    await self._send({"type": F.BIDI_END_IN, "call_id": cid})
+
+            input_task = asyncio.create_task(_pump_input())
             while True:
                 ev = await q.get()
                 yield ev
@@ -307,19 +311,14 @@ class _SubprocessWorker:
                     return
         finally:
             self._streams.pop(cid, None)
-            input_task.cancel()
-
-    async def cancel(self, call_id: str) -> None:
-        try:
-            await self._send({"type": "cancel", "call_id": call_id})
-        except Exception:
-            pass
+            if input_task is not None:
+                input_task.cancel()
 
     async def shutdown(self) -> None:
         if self._proc is None:
             return
         try:
-            await self._send({"type": "shutdown"})
+            await self._send({"type": F.SHUTDOWN})
         except Exception:
             pass
         try:
@@ -337,21 +336,6 @@ class _SubprocessWorker:
 def _new_id() -> str:
     import uuid
     return uuid.uuid4().hex
-
-
-def _translate_dispatcher_event(ev: dict[str, Any]) -> dict[str, Any]:
-    """`Dispatcher.dispatch_stream` / `dispatch_bidi` yield events shaped
-    `{"item": ...}` / `{"end": True}` / `{"error": ...}`. The multiplexer's
-    transport-facing protocol (matching subprocess worker frames) uses
-    `{"type": "item"|"end"|"error", ...}`. Normalize on the way out.
-    """
-    if "item" in ev:
-        return {"type": "item", "value": ev["item"]}
-    if "end" in ev:
-        return {"type": "end"}
-    if "error" in ev:
-        return {"type": "error", "error": ev["error"]}
-    return ev
 
 
 # ── multiplexer ─────────────────────────────────────────────────────
@@ -447,6 +431,28 @@ class NamespaceMultiplexer:
         self._entries[package] = _NamespaceEntry(
             package=package, dist_name=package.replace(".", "-"), dist_version="0.0.0",
             dispatcher=dispatcher,
+        )
+
+    def register_subprocess(
+        self,
+        package: str,
+        target: str,
+        python: str,
+        *,
+        dist_name: str = "",
+        dist_version: str = "0.0.0",
+        bin_dir: Path | None = None,
+    ) -> None:
+        """Register a subprocess-backed namespace explicitly.
+
+        Production discovery (`discover_entry_points()`) builds these
+        entries from installed entry points. Tests that need to exercise
+        the real subprocess path (rather than `_InProcessWorker`) can
+        register their own here without poking at `_entries` directly.
+        """
+        self._entries[package] = _NamespaceEntry(
+            package=package, dist_name=dist_name, dist_version=dist_version,
+            target=target, python=python, bin_dir=bin_dir,
         )
 
     def has(self, package: str) -> bool:

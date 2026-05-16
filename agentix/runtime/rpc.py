@@ -26,7 +26,6 @@ Frame schemas (`{"type": "...", ...}` — extra fields per type):
     stream_item  {call_id, value}            — one chunk of a streaming response
     stream_end   {call_id}                   — clean end of stream/bidi out
     trace        {kind, payload, call_id?, source?}   — namespace trace.emit()
-    log          {level, name, message, timestamp}    — namespace logging records
 
 `call_id` correlates request frames with their response frames.
 

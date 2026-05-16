@@ -68,15 +68,10 @@ _ROOT_LOG_NAME = "agentix"  # forwarded log records start at this logger and bel
 
 
 def _u(data: Any) -> dict:
-    """Unpack a Socket.IO event payload. Empty / missing → {}."""
-    if data is None:
+    """Unpack a Socket.IO event payload (msgpack bytes). Missing → {}."""
+    if not data:
         return {}
-    if isinstance(data, (bytes, bytearray, memoryview)):
-        return unpack(bytes(data)) or {}
-    if isinstance(data, dict):
-        # Legacy JSON-mode payload (some test clients).
-        return data
-    return {}
+    return unpack(bytes(data)) or {}
 
 
 @dataclass

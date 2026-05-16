@@ -189,21 +189,6 @@ def select_pattern(sig: inspect.Signature) -> type[WirePattern]:
     raise TypeError(f"no WirePattern matches signature {sig!r}")
 
 
-# ── Helpers shared across patterns ──────────────────────────────────
-
-
-def stream_item_type(ann: object) -> object:
-    """Return `T` from `AsyncIterator[T]` / `AsyncGenerator[T, ...]`.
-
-    Raises TypeError if `ann` isn't a stream origin. Returns `Any` when
-    the generic is unparameterised.
-    """
-    if get_origin(ann) not in STREAM_ORIGINS:
-        raise TypeError(f"not a stream type: {ann!r}")
-    args = get_args(ann)
-    return args[0] if args else Any
-
-
 __all__ = [
     "AsyncIterator",
     "BidiPattern",
@@ -211,5 +196,4 @@ __all__ = [
     "UnaryPattern",
     "WirePattern",
     "select_pattern",
-    "stream_item_type",
 ]

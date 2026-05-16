@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
-import logging
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine
 from typing import (
@@ -70,8 +69,6 @@ from agentix.runtime.models import (
     TraceEvent,
 )
 from agentix.wire import select_pattern
-
-logger = logging.getLogger("agentix.client")
 
 P = ParamSpec("P")
 R = TypeVar("R")

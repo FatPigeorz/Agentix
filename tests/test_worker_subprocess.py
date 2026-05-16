@@ -12,6 +12,7 @@ add `tests/` to its PYTHONPATH.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -19,10 +20,12 @@ from pathlib import Path
 import pytest
 
 from agentix.runtime.models import RemoteRequest
-from agentix.runtime.multiplexer import NamespaceMultiplexer, _SubprocessWorker
+from agentix.runtime.multiplexer import NamespaceMultiplexer
 
 
 TESTS_DIR = Path(__file__).parent
+_PACKAGE = "_worker_target"
+_TARGET = f"{_PACKAGE}:Echo"
 
 
 @pytest.fixture
@@ -36,37 +39,32 @@ def worker_env(monkeypatch):
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(parts))
 
 
+def _make_multiplexer(trace_forwarder=None) -> NamespaceMultiplexer:
+    mp = NamespaceMultiplexer(trace_forwarder=trace_forwarder)
+    mp.register_subprocess(_PACKAGE, _TARGET, sys.executable, dist_name="test-worker")
+    return mp
+
+
 async def test_subprocess_worker_unary_round_trip(worker_env):
     """A real worker subprocess runs a method and returns the value."""
-    multiplexer = NamespaceMultiplexer()
-    # Manually register a subprocess entry (bypassing entry-point discovery).
-    from agentix.runtime.multiplexer import _NamespaceEntry
-    multiplexer._entries["_worker_target"] = _NamespaceEntry(
-        package="_worker_target", dist_name="test-worker", dist_version="0.0.0",
-        target="_worker_target:Echo", python=sys.executable,
-    )
+    mp = _make_multiplexer()
     try:
-        resp = await multiplexer.dispatch_unary(RemoteRequest(
-            package="_worker_target", method="echo", kwargs={"msg": "hi"},
+        resp = await mp.dispatch_unary(RemoteRequest(
+            package=_PACKAGE, method="echo", kwargs={"msg": "hi"},
         ))
         assert resp.ok, resp.error
         assert resp.value == {"msg": "echo:hi"}
     finally:
-        await multiplexer.shutdown()
+        await mp.shutdown()
 
 
 async def test_subprocess_worker_streaming(worker_env):
     """Server-streaming method round-trip via subprocess."""
-    multiplexer = NamespaceMultiplexer()
-    from agentix.runtime.multiplexer import _NamespaceEntry
-    multiplexer._entries["_worker_target"] = _NamespaceEntry(
-        package="_worker_target", dist_name="test-worker", dist_version="0.0.0",
-        target="_worker_target:Echo", python=sys.executable,
-    )
+    mp = _make_multiplexer()
     try:
         events = []
-        async for ev in multiplexer.dispatch_stream(RemoteRequest(
-            package="_worker_target", method="counter", kwargs={"n": 3},
+        async for ev in mp.dispatch_stream(RemoteRequest(
+            package=_PACKAGE, method="counter", kwargs={"n": 3},
         )):
             events.append(ev)
             if ev.get("type") in ("end", "error"):
@@ -75,7 +73,7 @@ async def test_subprocess_worker_streaming(worker_env):
         assert items == [0, 1, 2]
         assert events[-1] == {"type": "end"}
     finally:
-        await multiplexer.shutdown()
+        await mp.shutdown()
 
 
 async def test_subprocess_worker_trace_forwarding(worker_env):
@@ -85,22 +83,15 @@ async def test_subprocess_worker_trace_forwarding(worker_env):
     def forwarder(kind, payload, call_id, source):
         received.append((kind, payload))
 
-    multiplexer = NamespaceMultiplexer(trace_forwarder=forwarder)
-    from agentix.runtime.multiplexer import _NamespaceEntry
-    multiplexer._entries["_worker_target"] = _NamespaceEntry(
-        package="_worker_target", dist_name="test-worker", dist_version="0.0.0",
-        target="_worker_target:Echo", python=sys.executable,
-    )
+    mp = _make_multiplexer(trace_forwarder=forwarder)
     try:
-        resp = await multiplexer.dispatch_unary(RemoteRequest(
-            package="_worker_target", method="trace_then_echo", kwargs={"msg": "x"},
+        resp = await mp.dispatch_unary(RemoteRequest(
+            package=_PACKAGE, method="trace_then_echo", kwargs={"msg": "x"},
         ))
         assert resp.ok, resp.error
-        # Give the worker a moment to flush the trace frame, which is
-        # fire-and-forget on the worker side; the read loop picks it up
-        # but it may land just after the result.
-        import asyncio
+        # Trace frame is fire-and-forget on the worker side; let the
+        # multiplexer read loop pick it up.
         await asyncio.sleep(0.2)
         assert ("test_event", {"msg": "x"}) in received
     finally:
-        await multiplexer.shutdown()
+        await mp.shutdown()

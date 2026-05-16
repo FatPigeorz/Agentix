@@ -31,6 +31,7 @@ from typing import Any
 
 from agentix import trace
 from agentix.dispatch import Dispatcher
+from agentix.runtime import frames as F
 from agentix.runtime.models import RemoteError, RemoteRequest
 from agentix.runtime.rpc import read_frame, write_frame
 
@@ -91,7 +92,7 @@ class Worker:
         # trace events get captured.
         trace.subscribe(self._trace_handler)
 
-        await self._send({"type": "ready", "package": self._package})
+        await self._send({"type": F.READY, "package": self._package})
 
         while not self._shutdown.is_set():
             try:
@@ -117,7 +118,7 @@ class Worker:
         # Sync handler; schedule the actual frame write on the loop. Per
         # the `agentix.trace` contract, handler errors are caught upstream
         # — we only need to avoid raising.
-        frame = {"type": "trace", "kind": kind, "payload": payload}
+        frame = {"type": F.TRACE, "kind": kind, "payload": payload}
         if call_id is not None:
             frame["call_id"] = call_id
         if source is not None:
@@ -128,24 +129,27 @@ class Worker:
             return
         loop.create_task(self._send(frame))
 
+    _RUNTIME_FRAME_HANDLERS: dict[str, str] = {
+        F.CALL: "_on_call",
+        F.BIDI_IN: "_on_bidi_in",
+        F.BIDI_END_IN: "_on_bidi_end_in",
+    }
+
     async def _handle(self, frame: dict[str, Any]) -> None:
         kind = frame.get("type")
-        if kind == "call":
-            await self._on_call(frame)
-        elif kind == "bidi_in":
-            await self._on_bidi_in(frame)
-        elif kind == "bidi_end_in":
-            await self._on_bidi_end_in(frame)
-        elif kind == "cancel":
+        handler_name = self._RUNTIME_FRAME_HANDLERS.get(kind)
+        if handler_name is not None:
+            await getattr(self, handler_name)(frame)
+        elif kind == F.CANCEL:
             self._cancel(frame.get("call_id", ""))
-        elif kind == "shutdown":
+        elif kind == F.SHUTDOWN:
             self._shutdown.set()
         else:
             logger.warning("worker: unknown frame type %r", kind)
 
     async def _on_call(self, frame: dict[str, Any]) -> None:
         call_id = frame.get("call_id", "")
-        kind = frame.get("kind", "unary")
+        kind = frame.get("kind", F.KIND_UNARY)
         request = RemoteRequest(
             package=self._package,
             method=frame["method"],
@@ -153,17 +157,17 @@ class Worker:
             kwargs=frame.get("kwargs") or {},
             call_id=call_id,
         )
-        if kind == "unary":
+        if kind == F.KIND_UNARY:
             task = asyncio.create_task(self._run_unary(call_id, request))
-        elif kind == "stream":
+        elif kind == F.KIND_STREAM:
             task = asyncio.create_task(self._run_stream(call_id, request))
-        elif kind == "bidi":
+        elif kind == F.KIND_BIDI:
             in_q: asyncio.Queue = asyncio.Queue(maxsize=64)
             self._bidi_queues[call_id] = in_q
             task = asyncio.create_task(self._run_bidi(call_id, request, in_q))
         else:
             await self._send({
-                "type": "error", "call_id": call_id,
+                "type": F.ERROR, "call_id": call_id,
                 "error": RemoteError(type="BadFrame", message=f"unknown call kind {kind!r}").model_dump(),
             })
             return
@@ -171,74 +175,69 @@ class Worker:
         task.add_done_callback(lambda _t: self._calls.pop(call_id, None))
         task.add_done_callback(lambda _t: self._bidi_queues.pop(call_id, None))
 
+    async def _forward_stream_event(self, call_id: str, event: dict[str, Any]) -> bool:
+        """Map a Dispatcher stream/bidi event to its wire frame; return True
+        if the event was terminal (caller should stop iterating)."""
+        kind = event.get("type")
+        if kind == "item":
+            await self._send({"type": F.STREAM_ITEM, "call_id": call_id, "value": event["value"]})
+            return False
+        if kind == "error":
+            await self._send({"type": F.ERROR, "call_id": call_id, "error": event["error"]})
+            return True
+        if kind == "end":
+            await self._send({"type": F.STREAM_END, "call_id": call_id})
+            return True
+        return False
+
     async def _run_unary(self, call_id: str, request: RemoteRequest) -> None:
         try:
             resp = await self._dispatcher.dispatch(request)
         except Exception as exc:
-            await self._send({"type": "error", "call_id": call_id, "error": _err(exc)})
+            await self._send({"type": F.ERROR, "call_id": call_id, "error": _err(exc)})
             return
         if resp.ok:
-            await self._send({"type": "result", "call_id": call_id, "value": resp.value})
+            await self._send({"type": F.RESULT, "call_id": call_id, "value": resp.value})
         else:
-            await self._send({"type": "error", "call_id": call_id,
+            await self._send({"type": F.ERROR, "call_id": call_id,
                               "error": (resp.error or RemoteError(type="Unknown", message="")).model_dump()})
 
     async def _run_stream(self, call_id: str, request: RemoteRequest) -> None:
         try:
             async for event in self._dispatcher.dispatch_stream(request):
-                if "item" in event:
-                    await self._send({"type": "stream_item", "call_id": call_id, "value": event["item"]})
-                elif "error" in event:
-                    await self._send({"type": "error", "call_id": call_id, "error": event["error"]})
+                if await self._forward_stream_event(call_id, event):
                     return
-                elif "end" in event:
-                    await self._send({"type": "stream_end", "call_id": call_id})
-                    return
-            await self._send({"type": "stream_end", "call_id": call_id})
+            await self._send({"type": F.STREAM_END, "call_id": call_id})
         except Exception as exc:
-            await self._send({"type": "error", "call_id": call_id, "error": _err(exc)})
+            await self._send({"type": F.ERROR, "call_id": call_id, "error": _err(exc)})
 
     async def _run_bidi(self, call_id: str, request: RemoteRequest, in_q: asyncio.Queue) -> None:
-        sentinel = object()
         adapter = self._dispatcher.input_adapter_for(request.method)
 
         async def _input_iter():
             while True:
                 item = await in_q.get()
-                if item is sentinel:
+                if item is _END_SENTINEL:
                     return
-                yield item
-
-        # Pre-validate items as they arrive in the input queue by wrapping
-        # the queue's iterator with the dispatcher's input adapter. The
-        # dispatcher itself feeds raw items to the impl; we coerce here.
-        async def _coerced_iter():
-            async for raw in _input_iter():
                 if adapter is not None:
                     try:
-                        raw = adapter.validate_python(raw)
+                        item = adapter.validate_python(item)
                     except Exception as exc:
-                        await self._send({"type": "error", "call_id": call_id, "error": _err(exc)})
+                        await self._send({"type": F.ERROR, "call_id": call_id, "error": _err(exc)})
                         return
-                yield raw
+                yield item
 
         try:
-            async for event in self._dispatcher.dispatch_bidi(request, _coerced_iter()):
-                if "item" in event:
-                    await self._send({"type": "stream_item", "call_id": call_id, "value": event["item"]})
-                elif "error" in event:
-                    await self._send({"type": "error", "call_id": call_id, "error": event["error"]})
+            async for event in self._dispatcher.dispatch_bidi(request, _input_iter()):
+                if await self._forward_stream_event(call_id, event):
                     return
-                elif "end" in event:
-                    await self._send({"type": "stream_end", "call_id": call_id})
-                    return
-            await self._send({"type": "stream_end", "call_id": call_id})
+            await self._send({"type": F.STREAM_END, "call_id": call_id})
         except Exception as exc:
-            await self._send({"type": "error", "call_id": call_id, "error": _err(exc)})
+            await self._send({"type": F.ERROR, "call_id": call_id, "error": _err(exc)})
         finally:
-            # Make sure the input iterator unblocks if the impl exited early.
+            # Unblock the input iterator if the impl exited early.
             try:
-                in_q.put_nowait(sentinel)
+                in_q.put_nowait(_END_SENTINEL)
             except asyncio.QueueFull:
                 pass
 
@@ -254,11 +253,6 @@ class Worker:
         q = self._bidi_queues.get(call_id)
         if q is None:
             return
-        # Sentinel: an explicit "_end_" marker. Use a tuple to disambiguate
-        # from legitimate user-supplied None / sentinel-like values. The
-        # input iterator in _run_bidi compares with `is sentinel`, but we
-        # don't have that object reference here — instead push a special
-        # frame and let _run_bidi recognise via `_END_SENTINEL`.
         await q.put(_END_SENTINEL)
 
     def _cancel(self, call_id: str) -> None:
@@ -267,10 +261,9 @@ class Worker:
             task.cancel()
 
 
-# Singleton sentinel for "end of bidi input" pushed through the input queue.
-# `_run_bidi` uses a per-call object created at task start; cross-method
-# coordination here needs a stable reference. Using an object() at module
-# scope works because Worker compares with `is`.
+# Module-level singleton used to signal "end of bidi input" through the
+# input queue. Compared with `is`; the same object reference must be
+# visible from both _on_bidi_end_in (pusher) and _run_bidi (consumer).
 _END_SENTINEL: Any = object()
 
 
@@ -290,9 +283,8 @@ async def _amain(target: str) -> None:
     except Exception as exc:
         # Worker hasn't initialized stdio framing yet; bootstrap a minimal
         # writer so the multiplexer learns why we're exiting.
-        sys.stdout.buffer.write(b"")  # ensure stdout is flushed binary
         from agentix.runtime.rpc import pack_frame
-        sys.stdout.buffer.write(pack_frame({"type": "boot_error", "error": _err(exc)}))
+        sys.stdout.buffer.write(pack_frame({"type": F.BOOT_ERROR, "error": _err(exc)}))
         sys.stdout.buffer.flush()
         sys.exit(1)
     worker = Worker(dispatcher, package)
