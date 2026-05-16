@@ -1,26 +1,22 @@
 ---
-title: The six plugin axes
-description: How Agentix's extension surfaces are structured — what each axis exists to do, what shape it has, and when you reach for one.
+title: The two plugin axes
+description: Agentix has two entry-point-discovered extension axes — namespaces and deployments. Everything else is plain Python.
 ---
 
-Agentix is extensible along **six** axes. Each one is a Python
-entry-point group; every plugin is a normal pip-installable distribution
-declaring one TOML block. The framework discovers them via
-`importlib.metadata` and exposes them through the runtime, the
-dispatcher, or the CLI.
+Agentix has **two** plugin axes — the things that cross the host↔sandbox
+boundary. Each is a Python entry-point group; every plugin is a normal
+pip-installable distribution declaring one TOML block. The framework
+discovers them via `importlib.metadata` and exposes them through the
+runtime, the dispatcher, or the CLI.
 
 ```mermaid
 flowchart LR
     user[Caller / Trainer] -->|c.remote| rt[Runtime server]
-    rt -->|dispatch| ns([agentix.namespace])
-    rt -->|fan-out| ts([agentix.trace_sink])
-    rt -->|route by sig| wp([agentix.wire_pattern])
-    cli[agentix CLI] -->|subcommand| sc([agentix.cli])
-    cli -->|build/install spec| sr([agentix.spec_resolver])
-    cli -->|deploy| dp([agentix.deployment])
+    rt -->|dispatch into sandbox| ns([agentix.namespace])
+    cli[agentix CLI] -->|deploy| dp([agentix.deployment])
 ```
 
-All six axes follow the same plug pattern:
+Both axes follow the same plug pattern:
 
 ```toml
 [project.entry-points."agentix.<axis>"]
@@ -28,24 +24,24 @@ my-thing = "module:Thing"
 ```
 
 What changes per axis is **how the framework consumes the plugins it
-finds** — select-one, fan-out, chain, or merge.
+finds** — runtime imports namespaces on first dispatch; the CLI selects
+one deployment by name.
 
 ## At a glance
 
-| Axis                                | Group                   | Shape                                       | Built-ins                                            | When you reach for it                                       |
-| ----------------------------------- | ----------------------- | ------------------------------------------- | ---------------------------------------------------- | ----------------------------------------------------------- |
-| [Namespaces](#namespaces)           | `agentix.namespace`     | **select-many**, lazy-load on first call    | (third-party only)                                   | Anything your trainer / harness calls into the sandbox      |
-| [Deployments](#deployments)         | `agentix.deployment`    | **select-one** by CLI name                  | `local` / `daytona` / `e2b`                          | A new sandbox host (Fly, Modal, k8s, …)                     |
-| [Trace sinks](#trace-sinks)         | `agentix.trace_sink`    | **fan-out** with error isolation            | (third-party only)                                   | Pipe `trace.emit` events to Sentry/OTel/your bus            |
-| [Spec resolvers](#spec-resolvers)   | `agentix.spec_resolver` | **chain-of-responsibility**, priority desc  | `path` / `image` / `local_repo` / `pypi`             | Teach `agentix build foo` a new spec form                   |
-| [Wire patterns](#wire-patterns)     | `agentix.wire_pattern`  | **first-match by signature**                | `unary` / `stream` / `bidi`                          | A new call shape (pubsub, batch, …)                         |
-| [CLI subcommands](#cli-subcommands) | `agentix.cli`           | **merge-namespace**                         | `build` / `install` / `deploy` / `check` / `plugins` | A new `agentix <name>` verb                                 |
+| Axis                         | Group                  | Shape                                       | Built-ins                                            | When you reach for it                                       |
+| ---------------------------- | ---------------------- | ------------------------------------------- | ---------------------------------------------------- | ----------------------------------------------------------- |
+| [Namespaces](#namespaces)    | `agentix.namespace`    | **select-many**, lazy-load on first call    | (third-party only)                                   | Anything your trainer / harness calls into the sandbox      |
+| [Deployments](#deployments)  | `agentix.deployment`   | **select-one** by CLI name                  | `local` / `daytona` / `e2b`                          | A new sandbox host (Fly, Modal, k8s, …)                     |
 
 <Tip>
-  **Discoverability check.** `agentix plugins` walks every axis and
-  prints what's installed, where it came from (`dist@version`), and
-  whether it loaded cleanly. Run it after `pip install <your-extension>`
-  to confirm the framework picked your wheel up.
+  **Why only two?** Plugin discovery exists to bridge process
+  boundaries. Namespace code runs *inside* the sandbox; deployment code
+  *provisions* the sandbox. Both legitimately need name-based dispatch
+  across the host↔sandbox edge. Host-only helpers (trace sinks, the
+  three built-in wire patterns, the CLI dispatcher, internal spec
+  resolvers) don't — users integrate them by `import`ing and calling.
+  See [Host-side extension hooks](#host-side-extension-hooks) below.
 </Tip>
 
 ## Namespaces
@@ -79,301 +75,144 @@ class on first call, and the method body runs inside the sandbox.
     ```toml
     [project.entry-points."agentix.namespace"]
     myagent = "agentix.myagent:MyAgent"
+
+    [tool.hatch.build.targets.wheel]
+    packages = ["src/agentix"]
     ```
   </Tab>
 </Tabs>
 
-**Why select-many lazy-load?** Sandboxes may mount dozens of namespaces;
-importing them all at boot would pay a real cost. The framework records
-the entry-point object at startup but defers `ep.load()` until the
-first dispatch for that namespace. A broken namespace surfaces *on
-call*, not at boot — and unused namespaces cost zero.
+**Why this shape.** Namespace code runs in the sandbox process, far
+from any caller. Eager import would couple every namespace's startup
+cost to every other; lazy load defers each namespace's import until its
+first call, so a broken or unused namespace never blocks boot. Errors
+surface at call time with the call's stack trace.
 
-**When you write one:** anything you want the trainer to call inside
-the sandbox — an agent runtime (Claude Code, OpenHands), a benchmark
-harness (SWE-bench, MLE-Bench), a primitive (shell, files, browser).
+**When you write one.** New tool, new dataset, new model adapter,
+new policy — anything the trainer / harness calls into the sandbox.
 
 ## Deployments
 
-**Group:** `agentix.deployment`   ·   **Shape:** select-one by CLI name   ·   **Built-ins:** `local`, `daytona`, `e2b`
+**Group:** `agentix.deployment`   ·   **Shape:** select-one by CLI name
 
-Sandbox lifecycle: `create / delete / get`. A structural `Protocol` —
-backends don't inherit; they just implement three methods. The user
-picks one with `agentix deploy <backend>`; the framework calls `cls()`
-with no constructor arguments (backends read their config from
-environment variables — `DAYTONA_API_KEY`, `E2B_API_KEY`, etc.).
+Where the sandbox runs. A deployment backend is a class implementing
+the three-method `Deployment` Protocol (`create`, `delete`, `get`). The
+framework instantiates it with no arguments — backends read API keys,
+regions, and other config from environment variables in their
+`__init__`.
 
 <Tabs>
-  <Tab title="Plugin">
-    ```python my_deploy/__init__.py
-    import os
-    from agentix.deployment.base import Sandbox
-    from agentix.idents import SandboxId
+  <Tab title="Caller side">
+    ```bash
+    # By CLI name — third-party backends slot into the same command:
+    agentix deploy fly --image my-agent:0.1.0
+    ```
+
+    ```python
+    # Or in code, after `pip install agentix-deployment-fly`:
+    from agentix_deployment_fly import FlyDeployment
+    from agentix.deployment.base import session
+
+    async with session(FlyDeployment(), SandboxConfig(...)) as sandbox:
+        # use sandbox.runtime_url
+        ...
+    ```
+  </Tab>
+  <Tab title="Plugin side">
+    ```python
+    from agentix.deployment.base import Deployment, Sandbox
     from agentix.models import SandboxConfig, SandboxInfo
 
     class FlyDeployment:
-        def __init__(self) -> None:
-            self._token = os.environ["FLY_API_TOKEN"]
-
         async def create(self, config: SandboxConfig) -> Sandbox: ...
-        async def delete(self, sandbox_id: SandboxId) -> None: ...
-        async def get(self, sandbox_id: SandboxId) -> SandboxInfo: ...
+        async def delete(self, sandbox_id: str) -> None: ...
+        async def get(self, sandbox_id: str) -> SandboxInfo: ...
     ```
-
-    No inheritance — structural type matching against the `Deployment`
-    Protocol. `isinstance(FlyDeployment(), Deployment)` returns True on
-    its own.
   </Tab>
   <Tab title="pyproject.toml">
     ```toml
     [project.entry-points."agentix.deployment"]
-    fly = "my_deploy:FlyDeployment"
+    fly = "agentix_deployment_fly:FlyDeployment"
     ```
   </Tab>
 </Tabs>
 
-After `pip install`, `agentix deploy fly --image my-agent:0.1.0` is
-live.
+**Why this shape.** The CLI accepts one `<name>` argument, so the
+framework needs a single class per `pip install`. Backends are
+structural (Protocol) rather than inherited so a deployment can satisfy
+the interface without coupling to framework machinery.
 
-**Why select-one?** A sandbox runs on one host at a time; picking the
-backend is a single user choice. Two dists registering the same name
-raise `PluginConflictError` with both dist+version labels — silent
-last-wins would hide a stale install.
+**When you write one.** A new sandbox host — Fly, Modal, k8s, a
+managed-sandbox vendor, a local-process backend for tests. Backends
+that talk to different APIs but share a Protocol are exactly the
+shape this axis was designed for.
 
-**When you write one:** a new managed-sandbox host or a custom on-prem
-deployment.
+## Host-side extension hooks
 
-## Trace sinks
+The following are **not** plugin axes — they're plain Python you import
+and call from your own startup code. Listed here for completeness.
 
-**Group:** `agentix.trace_sink`   ·   **Shape:** fan-out, per-sink error isolation
+### `agentix.trace.register_sink(fn)` — trace consumers
 
-Every closure-side `agentix.trace.emit(kind, payload)` call is
-delivered to every registered sink in registration order. Sinks
-register via an **installer** — a callable the framework invokes once
-at lifespan startup. This mirrors the way Sentry and OpenTelemetry
-SDKs hook themselves into a host process.
-
-```python my_otel_sink/__init__.py
-from opentelemetry import trace as otel
+```python
 from agentix.trace import register_sink
 
-def install() -> None:
-    tracer = otel.get_tracer("agentix")
+def my_sink(kind, payload, call_id, source):
+    # forward to OTel / Sentry / your own bus
+    ...
 
-    def sink(kind, payload, call_id, source):
-        with tracer.start_as_current_span(f"agentix.{kind}") as span:
-            span.set_attribute("agentix.call_id", call_id or "")
-            for k, v in payload.items():
-                span.set_attribute(f"agentix.payload.{k}", v)
-
-    register_sink(sink)
+register_sink(my_sink)
 ```
 
-```toml
-[project.entry-points."agentix.trace_sink"]
-otel = "my_otel_sink:install"
-```
+Every namespace's `trace.emit(...)` fans out to every registered sink.
+Sink errors are caught and logged; tracing never breaks a rollout.
 
-**Why fan-out?** Observability is additive — you might ship traces to
-Sentry, OTel, Logfire, AND a local JSONL file in the same run.
-Selecting one defeats the purpose. Each sink runs in a `try` block; a
-crashing sink doesn't block siblings or the runtime.
+### Wire patterns — three built-ins, not extensible
 
-<Warning>
-  **Sinks must never raise to the caller.** The framework swallows
-  exceptions and logs them. A sink that deadlocks or hangs forever
-  *will* slow tracing, though — keep `sink(...)` bodies short and
-  offload heavy work (network I/O, file flushes) to a background
-  thread or async task.
-</Warning>
+Three call shapes ship in `agentix.wire`: `UnaryPattern`,
+`StreamPattern`, `BidiPattern`. Selection at bind time picks the most
+specific match. There is no `register_pattern` hook — if a fourth call
+shape ever becomes necessary, add it as a `WirePattern` subclass in
+`agentix/wire.py` and the framework will pick it up.
 
-**When you write one:** any external observability product you want
-agent runs to surface in.
+### Spec resolvers — internal list
 
-## Spec resolvers
+`agentix build` / `agentix install` accept short names, paths, and
+image refs. The four built-in resolvers in `agentix/cli/_resolve.py`
+are exhaustive for the spec shapes the CLI understands. A new shape
+means editing that file.
 
-**Group:** `agentix.spec_resolver`   ·   **Shape:** chain-of-responsibility (priority desc)   ·   **Built-ins:** `path` / `image` / `local_repo` / `pypi`
+### A new `agentix <verb>` CLI
 
-`agentix build foo` and `agentix install foo bar baz` accept a *spec*
-— a single string. Resolvers turn that string into a `NamespaceSpec`
-the build pipeline understands. The framework iterates registered
-resolvers by `priority` descending and takes the first non-`None`
-result.
-
-```python my_github_resolver/__init__.py
-from agentix.cli._resolve import NamespaceSpec
-
-class GithubResolver:
-    priority = 30
-
-    def resolve(self, spec: str) -> NamespaceSpec | None:
-        if not spec.startswith("github:"):
-            return None
-        org_repo = spec[len("github:"):]
-        return NamespaceSpec(
-            short=org_repo.split("/")[-1],
-            kind="pypi",
-            pypi_dist=f"agentix-{org_repo.replace('/', '-')}",
-        )
-```
-
-`priority` controls ordering — higher = earlier in the chain. Built-in
-priorities: `path` 100, `image` 90, `local_repo` 50, `pypi` 10. Pick
-yours to slot in. Returning `None` lets the next resolver try, which is
-how chains stay composable.
-
-```toml
-[project.entry-points."agentix.spec_resolver"]
-github = "my_github_resolver:GithubResolver"
-```
-
-**Why a chain?** A single string (`bash`, `./primitives/bash`,
-`docker.io/me/agent:1.0`, `github:my-org/my-thing`) can mean four
-different things depending on shape. Each resolver's `resolve()`
-returns `None` if it doesn't recognize the string; the next one gets a
-shot. New input formats slot in without framework changes.
-
-**When you write one:** a new way for users to point at a closure — a
-private registry, a Git repo, an HTTP URL, a build-server artifact.
-
-## Wire patterns
-
-**Group:** `agentix.wire_pattern`   ·   **Shape:** first-match by signature   ·   **Built-ins:** `unary`, `stream`, `bidi`
-
-When `c.remote(Method, …)` runs, the framework inspects `Method`'s
-signature and picks a wire pattern. Unary returns → HTTP.
-`AsyncIterator` returns → Socket.IO stream. `AsyncIterator` param +
-`AsyncIterator` return → bidi. Wire patterns are the strategy objects
-that own the client-side framing for each shape.
-
-```python my_pubsub_pattern/__init__.py
-import inspect
-from agentix.wire import WirePattern
-
-class PubSubPattern(WirePattern):
-    name = "pubsub"
-
-    @classmethod
-    def matches(cls, sig: inspect.Signature) -> bool:
-        # detect your marker type on the return annotation
-        return getattr(sig.return_annotation, "__origin__", None) is Topic
-
-    def bind(self, sig: inspect.Signature) -> None: ...
-    def client_invoke(self, client, fn, sig, args, kwargs): ...
-```
-
-```toml
-[project.entry-points."agentix.wire_pattern"]
-pubsub = "my_pubsub_pattern:PubSubPattern"
-```
-
-Entry-point patterns come **ahead** of the three built-ins; an
-in-process `register_pattern(cls)` overrides an entry-point pattern of
-the same name (handy for tests, dangerous in prod).
-
-**Why first-match by signature?** The user shouldn't have to *tell*
-the framework which wire to use — the method signature is enough
-information. New call shapes are pure plugin work; the framework's
-runtime doesn't need to know about them.
-
-**When you write one:** a new transport semantic — pubsub broadcast,
-batched RPC, server-side push, anything that doesn't fit
-unary/stream/bidi.
-
-<Info>
-  **Most extensions don't need this.** 99% of namespaces are fine with
-  the three built-ins. Wire patterns are the framework's escape hatch
-  when a brand-new call shape earns its keep.
-</Info>
-
-## CLI subcommands
-
-**Group:** `agentix.cli`   ·   **Shape:** merge-namespace   ·   **Built-ins:** `build`, `install`, `deploy`, `check`, `plugins`
-
-`agentix <name>` is discovered the same way every other plugin is:
-walk the `agentix.cli` group, the entry-point target is a
-`main(argv: list[str]) -> int` callable. The framework's own
-subcommands ship via this group too — dogfood.
-
-```python my_extra/__init__.py
-import argparse
-
-def main(argv: list[str]) -> int:
-    """`agentix extra` — short description for `agentix --help`."""
-    parser = argparse.ArgumentParser(prog="agentix extra")
-    parser.add_argument("thing")
-    args = parser.parse_args(argv)
-    print(f"doing extra cool stuff with {args.thing}")
-    return 0
-```
-
-```toml
-[project.entry-points."agentix.cli"]
-extra = "my_extra:main"
-```
-
-After install:
-
-```bash
-$ agentix --help
-commands:
-  build    build a single namespace image
-  …
-  extra    `agentix extra` — short description for `agentix --help`.
-```
-
-The description comes from the first line of `main()`'s docstring, or
-falls back to its module's docstring.
-
-**Why merge-namespace?** Every installed dist contributes its own
-subcommands to a single flat namespace. Conflicts on subcommand name
-are loud (the framework refuses to silently shadow).
-
-**When you write one:** a new `agentix <verb>` for your workflow —
-publishing artifacts, scaffolding new namespaces, generating wheels,
-introspecting an environment. Anything that's "an agentix concept
-operation" but doesn't fit `build / install / deploy / check / plugins`.
+The four built-in subcommands (`build`, `install`, `deploy`, `check`)
+are hardcoded in `agentix/cli/__init__.py`. Third parties that want a
+new top-level verb should ship a separate `console_scripts` binary —
+`agentix-yourcmd` — rather than registering against the central
+dispatcher.
 
 ## Cross-cutting principles
 
-All six axes share a small set of design rules that fall out of the
-entry-point model.
+<Tip>
+  **Lazy by default.** Namespace `ep.load()` is deferred until first
+  dispatch; deployments load on first CLI call. A broken plugin only
+  fails the call that needs it.
+</Tip>
 
-<Info>
-  **Same install UX.** Every extension ships as a wheel.
-  `pip install <extension>` plus a one-line entry-point block makes it
-  live. No framework patch, no config file, no decorator at import
-  time. `agentix plugins` confirms the framework picked it up.
-</Info>
+<Tip>
+  **One source of truth.** The class IS the namespace; there's no
+  stub-vs-impl shadow file. The `Deployment` Protocol is structural —
+  no inheritance, no base class, just three methods.
+</Tip>
 
-<Info>
-  **Composition over inheritance.** None of the axes require
-  subclassing. `Deployment` and `SpecResolver` are `Protocol`s;
-  `Namespace` is a marker base used purely for the discovery hook;
-  everything else is callable-or-class shapes. The framework never
-  demands you inherit from it to plug in.
-</Info>
+<Tip>
+  **Conflicts surface.** Two dists registering the same name in the
+  same group raise `PluginConflictError`. Silent last-wins would hide
+  stale installs.
+</Tip>
 
-<Info>
-  **Conflicts surface loudly.** Two dists registering the same name in
-  the same group raise `PluginConflictError` with both `dist@version`
-  labels. Silent last-wins is the wrong default — it hides stale
-  installs.
-</Info>
-
-<Info>
-  **One failure doesn't poison the rest.** Loader exceptions are caught
-  per-entry. `agentix plugins` shows the failures; siblings keep
-  working. The runtime starts cleanly even if one plugin is broken.
-</Info>
-
-<Info>
-  **Imperative `register_*` for tests.** Every axis exposes an
-  in-process helper — `register_deployment`, `register_sink`,
-  `register_spec_resolver`, `register_pattern` — that bypasses
-  entry-point discovery. Production code paths don't touch these;
-  tests use them to inject stubs without installing distributions.
-</Info>
-
-For the full how-to of writing each axis end-to-end, see the
-[Plugin authors guide](/plugin-authors).
+<Tip>
+  **Plugins are not the only extension mechanism.** Host-side hooks
+  (`register_sink`, the wire-pattern list, internal resolvers) are
+  plain Python — `import` and call. Plugin axes are reserved for
+  things that cross the host↔sandbox boundary.
+</Tip>

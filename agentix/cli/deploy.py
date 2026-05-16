@@ -92,7 +92,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "backend",
         help="deployment backend name (any registered `agentix.deployment` "
-             "entry point; run `agentix plugins` to list)",
+             "entry point)",
     )
     parser.add_argument(
         "--image", required=True,

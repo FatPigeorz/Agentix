@@ -83,38 +83,38 @@ The runtime loads each namespace lazily — the entry-point object is captured a
 
 ### Extension axes beyond namespaces
 
-The framework has six plugin axes total, every one of them entry-point discovered (see `docs/plugin-authors.mdx` for the full reference):
+The framework has **two** plugin axes — only the things that cross the host↔sandbox boundary are entry-point discovered:
 
-| Axis | Group | Semantics |
+| Axis | Group | What it ships |
 |---|---|---|
-| Namespaces | `agentix.namespace` | dispatch surface — what `c.remote(...)` calls |
-| Deployments | `agentix.deployment` | sandbox lifecycle (`local`, `daytona`, `e2b`, …) |
-| Trace sinks | `agentix.trace_sink` | fan-out trace event consumers |
-| Spec resolvers | `agentix.spec_resolver` | CLI spec → NamespaceSpec mapping (chain) |
-| Wire patterns | `agentix.wire_pattern` | call shape extensions (Unary/Stream/Bidi/…) |
-| CLI subcommands | `agentix.cli` | `agentix <name>` discovery |
+| Namespaces | `agentix.namespace` | Python class whose `@staticmethod` methods run **inside the sandbox** |
+| Deployments | `agentix.deployment` | host-side backend that **provisions** the sandbox (`local`, `daytona`, `e2b`, …) |
 
-`agentix plugins` lists what's installed across all groups.
+Everything else (trace sinks, wire patterns, spec resolvers, CLI verbs) is pure host-side Python. The hooks are plain functions/classes you import — no entry points, no `Registry[T]`. See [feedback memory](../../.claude/projects/-apdcephfs-gy4-share-302774114-davejhwang-Agentix/memory/feedback_plugins_only_cross_sandbox.md) for the principle.
+
+- `agentix.trace.register_sink(fn)` to add a trace consumer (OTel, Sentry, custom bus).
+- Wire patterns are a frozen tuple of three built-ins (`unary` / `stream` / `bidi`) in `agentix/wire.py`. No extension hook — add a fourth `WirePattern` subclass directly if a new call shape ever becomes necessary.
+- Spec resolvers live as an ordered list in `agentix/cli/_resolve.py`; new spec shapes mean editing that file, not shipping a wheel.
+- A new `agentix <verb>` CLI: ship your own `agentix-yourcmd` `console_scripts` binary; the central CLI is not a plugin surface.
 
 ### CLI
 
-Developer commands ship as the `agentix` console script (`pip install -e .[dev]` registers it). Subcommands are themselves `agentix.cli` plugins:
+Developer commands ship as the `agentix` console script (`pip install -e .[dev]` registers it). The four built-in subcommands are hardcoded in `agentix/cli/__init__.py`:
 
 ```
-agentix build primitives/bash                          # build one namespace image
-agentix install bash files claude-code -o my-agent:0.1.0  # bundle several namespaces
-agentix deploy local --image my-agent:0.1.0            # run a sandbox
-agentix check                                          # list installed namespaces, smoke-import each
-agentix plugins                                        # list installed plugins across every axis
+agentix build primitives/bash                              # build one namespace image
+agentix install bash files claude-code -o my-agent:0.1.0   # bundle several namespaces
+agentix deploy local --image my-agent:0.1.0                # run a sandbox
+agentix check                                              # list installed namespaces, smoke-import each
 ```
 
-Each command is a thin module under `agentix/cli/`; `agentix --help` lists them.
+Each command is a thin module under `agentix/cli/`; `agentix --help` lists them. The four subcommands are hardcoded — third-party verbs go through their own `console_scripts` binaries, not a plugin registry.
 
 **`agentix build <spec>`** — builds a single namespace image. `<spec>` is an explicit path (`primitives/bash`), a short name resolved against the repo (`bash`), or a PyPI dist (`agentix-bash`, currently stubbed). Stages source + shared Dockerfile/nix into a temp dir, runs `docker build`.
 
 **`agentix install <names> -o <tag>`** — bundles multiple namespaces into one image (every namespace pip-installed alongside the runtime). The runtime discovers them via `importlib.metadata.entry_points`, so no bundle disposition file is needed.
 
-**`agentix deploy <backend>`** — provisions a sandbox. `local` is wired through `DockerDeployment`; `daytona`/`e2b` are CLI surfaces awaiting their managed-sandbox integrations. Backends are entry-point plugins under `agentix.deployment` — third parties can `pip install agentix-deployment-fly` and `agentix deploy fly --image …` works without framework changes.
+**`agentix deploy <backend>`** — provisions a sandbox. `local` is wired through `DockerDeployment`; `daytona`/`e2b` are CLI surfaces awaiting their managed-sandbox integrations. Backends are one of the two plugin axes — they register under `agentix.deployment`, so `pip install agentix-deployment-fly` is enough for `agentix deploy fly --image …` to work without framework changes.
 
 Foreground by default: prints `runtime_url`, holds the sandbox alive until Ctrl-C, then deletes. `--detach` exits after `create()` and just prints the sandbox handle.
 
@@ -279,30 +279,14 @@ class Bash(Namespace, Protocol):
 impl: Bash = BashImpl()  # pyright catches structural mismatch here
 ```
 
-### 2. Pluggable wire patterns (R2)
+### 2. Wire patterns (R2)
 
-Call shapes (unary / server-stream / bidi / …) live in `agentix.wire` as `WirePattern` subclasses. Each pattern owns:
+Call shapes (unary / server-stream / bidi) live in `agentix.wire` as `WirePattern` subclasses. Each pattern owns:
 
 * `matches(sig) -> bool` — does this signature use this pattern?
 * `bind(sig)` — per-method state precompute at `Dispatcher.bind` time.
 
-Built-ins ship as `UnaryPattern`, `StreamPattern`, `BidiPattern` and are registered in specific-to-general order. Third parties extend the framework by registering their own:
-
-```python
-from agentix.wire import WirePattern, register_pattern
-
-class PubSubPattern(WirePattern):
-    name = "pubsub"
-
-    @classmethod
-    def matches(cls, sig): ...
-
-    def bind(self, sig): ...
-
-register_pattern(PubSubPattern)
-```
-
-`register_pattern` prepends to the list — user patterns outrank built-ins. The Dispatcher picks the pattern at bind time and caches it on the bound method.
+The three built-ins (`UnaryPattern`, `StreamPattern`, `BidiPattern`) are exhaustive for the call shapes the framework supports and are checked in specific-to-general order via `select_pattern`. They are **not** user-extensible — there is no `register_pattern` hook. If a future call shape becomes necessary, add a fourth `WirePattern` subclass to `agentix/wire.py` directly. The Dispatcher picks the pattern at bind time and caches it on the bound method.
 
 ### 3. Branded identifiers from `agentix.idents`
 

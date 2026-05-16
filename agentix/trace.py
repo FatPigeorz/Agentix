@@ -1,36 +1,23 @@
 """Trace emission with fan-out sinks.
 
-Closure impls call `agentix.trace.emit(kind, payload)` to record one
+Namespace impls call `agentix.trace.emit(kind, payload)` to record one
 event in the rollout's trace. Every registered **trace sink** receives
 the event. The framework's runtime ships a sink that fans events out
-over the Socket.IO `trace` channel; downstream observability sinks
-(Sentry, OTel, Logfire, …) can register their own.
-
-Sink registration uses the `agentix.trace_sink` entry-point group.
-Each entry points at a `module:install` callable that the framework
-invokes once at startup. The callable receives a *registrar* it can
-call with its own sink function:
+over the Socket.IO `trace` channel; observability sinks (Sentry, OTel,
+Logfire, …) register their own by calling `register_sink(fn)` at
+startup — there's no entry-point machinery here, it's a plain Python
+API.
 
 ```python
-# downstream agentix-trace-otel/agentix_trace_otel/__init__.py
+# in your runtime extension or app startup
 from agentix.trace import register_sink
 
-def install():
-    def _sink(kind, payload, call_id, source):
-        # emit OTel span / send to collector / etc.
-        ...
-    register_sink(_sink)
-```
+def my_sink(kind, payload, call_id, source):
+    # forward to OTel / Sentry / your own bus
+    ...
 
-```toml
-# downstream pyproject.toml
-[project.entry-points."agentix.trace_sink"]
-otel = "agentix_trace_otel:install"
+register_sink(my_sink)
 ```
-
-Then `pip install agentix-trace-otel` is the entire wiring — the
-runtime imports + calls `install()` at lifespan-startup and the sink
-gets every event after that.
 
 `call_id` correlates events to a specific rollout. The dispatcher pins
 the active call_id into a contextvar before invoking each impl, so
@@ -46,7 +33,6 @@ import time
 from collections.abc import Callable
 from typing import Any, Final
 
-from agentix._plugin import Registry
 from agentix.idents import CallId, PackageName
 
 logger = logging.getLogger("agentix.trace")
@@ -57,19 +43,10 @@ should never raise (the framework swallows exceptions to keep tracing
 from breaking a rollout), but the framework also defensively wraps
 each call."""
 
-InstallFn = Callable[[], None]
-"""Entry-point callable. Called once at runtime startup; expected to
-invoke `register_sink` zero or more times to hook its own sink(s) up."""
-
 # In-process sink list. `register_sink` appends; emit() fans out across
-# every sink. Sinks added via in-process calls (tests, ad-hoc) and via
-# `agentix.trace_sink` entry-point installers live side by side.
+# every sink. Sinks live for the runtime's lifetime; tests use
+# `unregister_sink` to clean up.
 _sinks: list[SinkFn] = []
-
-# Entry-point registry — used by `_install_entry_point_sinks` at
-# runtime startup. We don't store the install callables in `_sinks`
-# because that list holds the *sinks*, not their installers.
-_installers: Registry[InstallFn] = Registry("agentix.trace_sink")
 
 _current_call_id: contextvars.ContextVar[CallId | None] = contextvars.ContextVar(
     "agentix_trace_call_id", default=None,
@@ -99,26 +76,6 @@ def unregister_sink(sink: SinkFn) -> None:
         _sinks.remove(sink)
     except ValueError:
         pass
-
-
-def install_entry_point_sinks() -> None:
-    """Invoke every `agentix.trace_sink` installer.
-
-    Called once at runtime lifespan startup. Each installer is a
-    `module:install` callable that registers its sink(s) via
-    `register_sink`. Installer errors are caught and logged; one
-    broken sink doesn't block the others or the runtime.
-    """
-    for name, installer in _installers.all().items():
-        try:
-            installer()
-        except Exception as exc:
-            logger.warning("trace sink installer %r failed: %s", name, exc)
-
-
-def installers() -> Registry[InstallFn]:
-    """The underlying registry — for `agentix plugins` and tests."""
-    return _installers
 
 
 def set_call_context(

@@ -44,7 +44,7 @@ T = TypeVar("T")
 @dataclass(frozen=True)
 class PluginSource:
     """Where a registered plugin came from — used in conflict reports
-    and `agentix plugins` output."""
+    and CLI listings."""
 
     dist_name: str | None
     dist_version: str | None
@@ -58,9 +58,9 @@ class PluginSource:
 class PluginConflictError(RuntimeError):
     """Two plugins claim the same name in the same group.
 
-    `agentix plugins` should surface this so users can uninstall the
-    duplicate dist. The framework refuses to silently last-wins because
-    it would hide bugs (e.g. a stale wheel from a previous install).
+    The framework refuses to silently last-wins because it would hide
+    bugs (e.g. a stale wheel from a previous install). Users see the
+    conflict on first registry access and uninstall the duplicate dist.
     """
 
 

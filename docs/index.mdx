@@ -34,8 +34,7 @@ Python entry points.
     The `Namespace` class pattern; `@staticmethod` methods; pyproject setup.
   </Card>
   <Card title="Plugin authors guide" icon="puzzle-piece" href="/plugin-authors">
-    Reference for every extension axis: deployments, trace sinks, spec
-    resolvers, wire patterns, CLI subcommands.
+    Reference for the two plugin axes: namespaces and deployments.
   </Card>
   <Card title="Architecture" icon="sitemap" href="/reference/architecture">
     How discovery, dispatch, wire patterns, and the runtime server fit
@@ -45,25 +44,24 @@ Python entry points.
     The wire-format contract between caller and sandbox.
   </Card>
   <Card title="CLI" icon="terminal" href="/reference/cli">
-    `agentix build / install / deploy / check / plugins`.
+    `agentix build / install / deploy / check`.
   </Card>
 </CardGroup>
 
-## Six extension axes, one mechanism
+## Two plugin axes — the boundary that matters
 
-Every axis discovers plugins via Python entry points.
+Plugins exist for the things that cross the host↔sandbox boundary.
+Everything else is plain Python the user imports.
 
-| Axis            | Entry-point group       | Semantics                          |
-| --------------- | ----------------------- | ---------------------------------- |
-| Namespaces      | `agentix.namespace`     | typed remote-callable surface      |
-| Deployments     | `agentix.deployment`    | sandbox lifecycle, select-one      |
-| Trace sinks     | `agentix.trace_sink`    | fan-out trace event consumers      |
-| Spec resolvers  | `agentix.spec_resolver` | CLI input → namespace spec, chain  |
-| Wire patterns   | `agentix.wire_pattern`  | call-shape extensions              |
-| CLI subcommands | `agentix.cli`           | `agentix <name>` discovery         |
+| Axis        | Entry-point group    | What it ships                                                |
+| ----------- | -------------------- | ------------------------------------------------------------ |
+| Namespaces  | `agentix.namespace`  | Python class whose code runs **inside the sandbox**          |
+| Deployments | `agentix.deployment` | host-side backend that **provisions** the sandbox            |
 
-`pip install your-extension` plus one TOML block makes it live.
-`agentix plugins` lists every installed plugin across all six axes.
+`pip install your-extension` plus one TOML block makes it live. The
+host-side extension hooks — trace sinks, the three built-in wire
+patterns, the CLI dispatcher, spec resolvers — live as ordinary
+functions/classes in `agentix.*` and are not plugin axes.
 
 ## Status
 

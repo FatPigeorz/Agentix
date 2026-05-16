@@ -28,7 +28,7 @@ async with RuntimeClient(sandbox_url) as c:
 
 Every extension is a normal pip-installable distribution. There is no custom config file, no decorator at import time, no per-framework registry call: the user installs a wheel and the framework discovers it via Python entry points.
 
-Six extension axes — closures used to be the only one; this version adds five more on the same mechanism (see "Extending Agentix" below).
+Two plugin axes — `agentix.namespace` for things that run *inside* the sandbox, and `agentix.deployment` for backends that decide *where* the sandbox runs. Everything else (trace sinks, wire patterns, spec resolvers) is plain Python you import and call (see "Extending Agentix" below).
 
 ## Install
 
@@ -51,14 +51,13 @@ pip install -e primitives/bash -e primitives/files   # the bundled primitives
 ## CLI
 
 ```bash
-agentix plugins                                # list every installed plugin across every axis
-agentix build  primitives/bash                 # build a single namespace image
+agentix build  primitives/bash                             # build a single namespace image
 agentix install bash files claude-code -o my-agent:0.1.0   # bundle several namespaces
-agentix deploy local --image my-agent:0.1.0    # run a sandbox + connect
-agentix check                                  # smoke-import every installed namespace
+agentix deploy local --image my-agent:0.1.0                # run a sandbox + connect
+agentix check                                              # smoke-import every installed namespace
 ```
 
-Every subcommand is itself an entry-point plugin under the `agentix.cli` group — `pip install your-extension` plus one TOML block makes `agentix <new-command>` work without patching the framework.
+The four subcommands are framework built-ins. Third parties that want their own `agentix-foo` verb should ship a separate `console_scripts` binary — the `agentix` dispatcher itself is not a plugin surface.
 
 ## Writing a namespace
 
@@ -100,27 +99,28 @@ The framework's `agentix/__init__.py` extends `__path__` so `agentix.<your-names
 
 ## Extending Agentix
 
-Six axes, all entry-point discovered with the same mechanism:
+Two plugin axes — only the things that cross the host↔sandbox boundary deserve entry-point discovery:
 
-| Axis | Entry-point group | Semantics | Built-ins |
+| Axis | Entry-point group | What it ships | Built-ins |
 |---|---|---|---|
-| Namespaces | `agentix.namespace` | typed remote-callable surface | (third-party only) |
-| Deployments | `agentix.deployment` | sandbox lifecycle, select-one by name | `local` / `daytona` / `e2b` |
-| Trace sinks | `agentix.trace_sink` | fan-out trace event consumers | (third-party only) |
-| Spec resolvers | `agentix.spec_resolver` | CLI input → namespace spec, chain | `path` / `image` / `local_repo` / `pypi` |
-| Wire patterns | `agentix.wire_pattern` | call-shape extensions | `unary` / `stream` / `bidi` |
-| CLI subcommands | `agentix.cli` | `agentix <name>` discovery | `build` / `install` / `deploy` / `check` / `plugins` |
-
-Every axis looks the same to a plugin author:
+| Namespaces | `agentix.namespace` | Python class whose code runs **inside the sandbox** | (third-party only) |
+| Deployments | `agentix.deployment` | host-side backend that **provisions** the sandbox | `local` / `daytona` / `e2b` |
 
 ```toml
-[project.entry-points."agentix.<axis>"]
-my-thing = "module:Thing"
+[project.entry-points."agentix.namespace"]
+my-thing = "agentix.my_thing:MyThing"
 ```
 
-> The quotes around the group name are TOML syntax — `agentix.deployment` contains a dot, and TOML treats dots in `[a.b.c]` as table-key separators. Quoting forces it to be a single key. Every framework with a dotted group name does this (`flask.commands`, `mkdocs.plugins`, `sphinx.builders`, …).
+> The quotes around the group name are TOML syntax — `agentix.namespace` contains a dot, and TOML treats dots in `[a.b.c]` as table-key separators. Quoting forces it to be a single key. Every framework with a dotted group name does this (`flask.commands`, `mkdocs.plugins`, `sphinx.builders`, …).
 
-See [`docs/plugin-authors.mdx`](docs/plugin-authors.mdx) for the full plugin authors guide — one section per axis with working examples. Rendered site: [agentiix.github.io](https://agentiix.github.io/).
+Everything else lives entirely on the host:
+
+- **Trace sinks** — `agentix.trace.register_sink(fn)` to add a trace consumer (OTel, Sentry, custom bus).
+- **Wire patterns** — three built-ins (`unary` / `stream` / `bidi`) cover every call shape; not user-extensible. Add a fourth by editing `agentix/wire.py` directly.
+- **Spec resolvers** — internal ordered list in `agentix/cli/_resolve.py`; new spec shapes mean editing that file.
+- **CLI verbs** — ship your own `agentix-yourcmd` `console_scripts` binary; the central CLI is not a plugin surface.
+
+See [`docs/plugin-authors.mdx`](docs/plugin-authors.mdx) for the full plugin authors guide. Rendered site: [agentiix.github.io](https://agentiix.github.io/).
 
 ## Architecture
 

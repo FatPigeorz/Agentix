@@ -1,33 +1,11 @@
-"""Wire patterns — pluggable call-shape protocols.
+"""Wire patterns — call-shape protocols.
 
-A `WirePattern` owns one call shape (unary / server-streaming / bidi /
-… third-party) end to end: how to detect it from a stub's signature,
-how the server runs it, and how the client invokes it. Built-in
-patterns ship in this module; third parties can `register_pattern(cls)`
-to add their own.
-
-```python
-class PubSubPattern(WirePattern):
-    name = "pubsub"
-
-    @classmethod
-    def matches(cls, sig: inspect.Signature) -> bool:
-        # e.g. detect a Topic[T] marker in the return annotation
-        ...
-
-    async def server_invoke(self, bound, request, transport):
-        ...
-
-    async def client_invoke(self, client, package, method, sig, args, kwargs):
-        ...
-
-register_pattern(PubSubPattern)
-```
-
-Pattern selection is a priority list. `register_pattern(cls)` prepends,
-so user patterns outrank the built-ins. The built-ins ship in
-specific-to-general order — bidi before stream before unary — so the
-fallback is `UnaryPattern`.
+A `WirePattern` owns one call shape (unary / server-streaming / bidi)
+end to end: how to detect it from a stub's signature, how the server
+runs it, and how the client invokes it. The three built-ins are
+exhaustive — bidi if the stub takes and returns an `AsyncIterator`,
+stream if it just returns one, unary otherwise. If a fourth shape
+ever becomes necessary, add it here; there is no extension hook.
 
 The Dispatcher caches the matched pattern instance on each bound
 method; pattern lookup happens at `bind` time, not per call.
@@ -190,66 +168,13 @@ class BidiPattern(WirePattern):
         return client._remote_bidi(fn, sig, *args, **kwargs)
 
 
-# ── Registry ────────────────────────────────────────────────────────
+# ── Pattern list ────────────────────────────────────────────────────
 #
-# Pattern lookup walks two sources:
-#
-#   1. The `agentix.wire_pattern` entry-point group — production third
-#      parties install their patterns via `pip install`.
-#   2. An in-process list seeded with the three built-ins and extended
-#      by `register_pattern(...)` for tests / dynamic registration.
-#
-# Both are merged at lookup time; the in-process list takes precedence
-# (so tests can override an entry-point pattern), then user-installed
-# entry-points come ahead of built-ins. Order matters because more
-# specific patterns shadow general ones (Bidi before Stream before
-# Unary).
+# Frozen tuple — bidi first, stream second, unary last (most-general
+# fallback). Not extensible at runtime; add a new pattern by editing
+# this module.
 
-from agentix._plugin import Registry  # noqa: E402
-
-_patterns: list[type[WirePattern]] = [BidiPattern, StreamPattern, UnaryPattern]
-_pattern_plugins: Registry[type[WirePattern]] = Registry("agentix.wire_pattern")
-
-
-def register_pattern(pattern_cls: type[WirePattern]) -> None:
-    """Register a wire pattern imperatively.
-
-    Patterns are checked in registration order, most recently registered
-    first; built-ins are at the tail. Production third parties should
-    declare a `[project.entry-points."agentix.wire_pattern"]` instead
-    — pip install + nothing else.
-
-    Pattern names must be unique. Re-registering a name overwrites
-    the existing entry — useful for tests, dangerous in production.
-    """
-    name = pattern_cls.name
-    for i, p in enumerate(_patterns):
-        if p.name == name:
-            _patterns[i] = pattern_cls
-            return
-    _patterns.insert(0, pattern_cls)
-
-
-def wire_patterns() -> Registry[type[WirePattern]]:
-    """The entry-point registry — for `agentix plugins` and tests."""
-    return _pattern_plugins
-
-
-def _ordered_patterns() -> list[type[WirePattern]]:
-    """Resolved pattern list: in-process registrations first (override
-    everything), then entry-point patterns (loaded lazily, in entry-
-    point-name order), then the built-in fallbacks.
-    """
-    in_process_names = {p.name for p in _patterns}
-    out: list[type[WirePattern]] = list(_patterns[:-3])  # skip the built-in trio at the tail
-    # Entry-point patterns whose names aren't already shadowed.
-    for name, cls in _pattern_plugins.all().items():
-        if name in in_process_names:
-            continue
-        out.append(cls)
-    # The three built-ins, at the tail, most-general last.
-    out.extend(_patterns[-3:])
-    return out
+_PATTERNS: tuple[type[WirePattern], ...] = (BidiPattern, StreamPattern, UnaryPattern)
 
 
 def select_pattern(sig: inspect.Signature) -> type[WirePattern]:
@@ -258,22 +183,10 @@ def select_pattern(sig: inspect.Signature) -> type[WirePattern]:
     `UnaryPattern.matches` returns True unconditionally, so this never
     raises — every signature has a pattern.
     """
-    for p in _ordered_patterns():
+    for p in _PATTERNS:
         if p.matches(sig):
             return p
     raise TypeError(f"no WirePattern matches signature {sig!r}")
-
-
-def registered_patterns() -> list[type[WirePattern]]:
-    """Snapshot of the current pattern list, highest priority first."""
-    return _ordered_patterns()
-
-
-def _reset_patterns() -> None:
-    """Test-only — restore built-in defaults and clear plugin registry."""
-    global _patterns
-    _patterns = [BidiPattern, StreamPattern, UnaryPattern]
-    _pattern_plugins.reset()
 
 
 # ── Helpers shared across patterns ──────────────────────────────────
@@ -297,8 +210,6 @@ __all__ = [
     "StreamPattern",
     "UnaryPattern",
     "WirePattern",
-    "register_pattern",
-    "registered_patterns",
     "select_pattern",
     "stream_item_type",
 ]

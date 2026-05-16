@@ -42,31 +42,24 @@ in five minutes.
 
 `agentix` is the framework; `agentix-bash` and `agentix-files` are
 **namespaces** — independently versioned wheels that contribute the
-remote-callable `Bash` and `Files` classes. Every namespace,
-deployment, or trace sink follows the same pattern: one wheel, one
+remote-callable `Bash` and `Files` classes. Namespaces and deployments
+are the two plugin axes; both follow the same pattern: one wheel, one
 entry-point block.
 
 ## Verify the install
 
 ```bash
-agentix plugins
+agentix check
 ```
 
 ```text
-agentix.namespace
-  bash    → agentix.bash:Bash    [agentix-bash@0.1.0]   ok
-  files   → agentix.files:Files  [agentix-files@0.1.0]  ok
-
-agentix.deployment
-  local   → agentix.deployment.docker:DockerDeployment  [agentix@0.1.0] ok
-  daytona → …
-  e2b     → …
+OK   bash    agentix.bash:Bash    agentix-bash@0.1.0
+OK   files   agentix.files:Files  agentix-files@0.1.0
 ```
 
-`agentix plugins` lists every installed extension across all six axes —
-namespaces, deployments, trace sinks, spec resolvers, wire patterns, and
-CLI subcommands. Add `--verbose` to see load tracebacks for anything
-that failed to import.
+`agentix check` walks `importlib.metadata.entry_points(group="agentix.namespace")`,
+imports each one, and surfaces any that fail. Deployments are listed
+via `agentix deploy --help`.
 
 ## Call a namespace
 
@@ -189,8 +182,8 @@ framework discovers the entry point, and
 
 <CardGroup cols={2}>
   <Card title="Plugin authors guide" icon="puzzle-piece" href="/plugin-authors">
-    Deployments, trace sinks, spec resolvers, wire patterns, CLI
-    subcommands — all six axes share this same entry-point pattern.
+    Namespaces and deployments — the two plugin axes, both backed by
+    the same entry-point mechanism.
   </Card>
   <Card title="Architecture" icon="sitemap" href="/reference/architecture">
     How the dispatcher, runtime, and wire patterns fit together inside
@@ -198,7 +191,7 @@ framework discovers the entry point, and
   </Card>
   <Card title="CLI reference" icon="terminal" href="/reference/cli">
     Every `agentix <subcommand>` documented: `build`, `install`,
-    `deploy`, `check`, `plugins`.
+    `deploy`, `check`.
   </Card>
   <Card title="Namespace protocol" icon="diagram-project" href="/reference/namespace-protocol">
     The wire-format contract between caller and sandbox — useful when

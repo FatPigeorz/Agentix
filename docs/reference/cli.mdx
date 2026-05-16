@@ -1,11 +1,12 @@
 ---
 title: CLI reference
-description: Every agentix subcommand documented — build, install, deploy, check, plugins.
+description: Every agentix subcommand documented — build, install, deploy, check.
 ---
 
-Every subcommand is itself an entry-point plugin under the
-`agentix.cli` group. The framework's builtins are listed below;
-downstream `pip install` adds more without framework patches.
+The four built-in subcommands are hardcoded in
+`agentix/cli/__init__.py`. Third parties that want their own top-level
+verb should ship a `console_scripts` binary (`agentix-yourcmd`) rather
+than registering against the central dispatcher.
 
 ```bash
 agentix --help
@@ -21,8 +22,9 @@ agentix build primitives/bash --dry-run
 agentix build bash --tag my-bash:dev
 ```
 
-`<spec>` accepts the same forms `agentix install` does — see
-[spec resolvers](/plugin-authors#spec-resolvers).
+`<spec>` accepts the same forms `agentix install` does — paths, short
+names resolved against the repo, image refs, or PyPI dists. The
+resolution chain is the ordered list in `agentix/cli/_resolve.py`.
 
 - **Path:** `./primitives/bash` or any directory with a `pyproject.toml`.
 - **Short name:** looked up under the repo's `primitives/`.
@@ -63,7 +65,8 @@ agentix deploy daytona --image docker.io/me/my-agent:0.1.0    # currently NotImp
 ```
 
 `<backend>` is the name of any registered `agentix.deployment` plugin.
-`agentix plugins --group agentix.deployment` lists what's installed.
+The three built-in backends are `local`, `daytona`, and `e2b`; any
+`pip install agentix-deployment-*` package adds its own.
 
 By default the command stays in the foreground: prints the sandbox's
 `runtime_url`, waits for Ctrl-C, then tears the sandbox down.
@@ -73,20 +76,6 @@ user can manage the sandbox lifetime themselves.
 - `--base` — base task image (default `ubuntu:24.04`)
 - `--runtime` — runtime image ref (default `agentix/runtime:latest`)
 - `--detach` — exit immediately after sandbox creation
-
-## `agentix plugins`
-
-List every installed plugin across every framework axis.
-
-```bash
-agentix plugins
-agentix plugins --group agentix.deployment      # filter by axis
-agentix plugins --verbose                       # show tracebacks for load failures
-```
-
-Output one line per plugin: name, target, dist@version, load status.
-Loading is forced (so failures surface here, not at the first
-`agentix deploy …` call).
 
 ## `agentix check`
 

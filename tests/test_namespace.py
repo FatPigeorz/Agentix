@@ -1,9 +1,9 @@
 """Unit tests for `Namespace`, `WirePattern`, and `Dispatcher.bind_namespace`.
 
-These are the R1 (dynamic bind + static typing) + R2 (extensible wire
-patterns) primitives. Closure-protocol-level integration is exercised
-in `test_namespace_protocol.py`; here we test the abstractions in
-isolation.
+Covers the R1 typing rule (dynamic bind + static typing). Wire patterns
+are exercised at the `select_pattern` boundary — the three built-ins
+are fixed and not user-extensible. Closure-protocol-level integration
+is exercised in `test_namespace_protocol.py`.
 """
 
 from __future__ import annotations
@@ -20,9 +20,6 @@ from agentix.wire import (
     BidiPattern,
     StreamPattern,
     UnaryPattern,
-    WirePattern,
-    _reset_patterns,
-    register_pattern,
     select_pattern,
 )
 
@@ -92,38 +89,6 @@ def test_select_stream_for_async_iterator_return() -> None:
 def test_select_bidi_for_async_iterator_param_and_return() -> None:
     def f(events: AsyncIterator[str]) -> AsyncIterator[int]: ...
     assert select_pattern(_sig(f)) is BidiPattern
-
-
-# ── register_pattern() — third-party extensibility (R2) ────────────
-
-
-def test_register_pattern_prepends_and_overrides_builtins() -> None:
-    """A user pattern with a stricter `matches` outranks the built-ins."""
-
-    class StringStreamPattern(WirePattern):
-        name = "string-stream"
-
-        @classmethod
-        def matches(cls, sig: inspect.Signature) -> bool:
-            ret = sig.return_annotation
-            return getattr(ret, "__origin__", None) is __import__(
-                "collections.abc",
-            ).abc.AsyncIterator and getattr(ret, "__args__", (None,))[0] is str
-
-        def bind(self, sig: inspect.Signature) -> None:
-            return
-
-    try:
-        register_pattern(StringStreamPattern)
-
-        def stream_str() -> AsyncIterator[str]: ...
-        def stream_int() -> AsyncIterator[int]: ...
-
-        assert select_pattern(_sig(stream_str)) is StringStreamPattern
-        # int stream still falls through to the built-in StreamPattern
-        assert select_pattern(_sig(stream_int)) is StreamPattern
-    finally:
-        _reset_patterns()
 
 
 # ── Dispatcher.bind_namespace ───────────────────────────────────────

@@ -90,7 +90,7 @@ def load_deployment(name: str) -> type[Deployment]:
 
 
 def deployments() -> Registry[type[Deployment]]:
-    """The underlying registry — for `agentix plugins` and tests."""
+    """The underlying registry — for tests and introspection."""
     return _deployments
 
 
