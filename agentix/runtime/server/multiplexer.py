@@ -438,28 +438,40 @@ class NamespaceMultiplexer:
     # ── discovery ───────────────────────────────────────────────────
 
     def discover_entry_points(self) -> None:
-        """Discover namespace entry points.
+        """Discover namespace entry points across whichever bundle layout
+        we're running in.
 
-        In bundle images (produced by `agentix build`), every namespace
-        lives in its own `/nix/<short>/` venv; we walk those for
-        `agentix.namespace` entry points and record each venv's Python
-        interpreter so workers spawn in their own dep world.
+        The framework's bundle CLI has two modes:
 
-        In dev / test (no bundle layout), fall back to walking the current
-        Python's installed entry points — every namespace pip-installed
-        in the same env is reachable via `sys.executable`.
+          * **Merged (default).** Every namespace pip-installed into
+            `/nix/runtime/` alongside the framework. One venv, one bin/.
+            Discovery walks `/nix/runtime/`'s site-packages for entry
+            points; workers spawn from that venv's interpreter.
+          * **Isolated (`agentix build --isolated`).** Per-namespace
+            venvs at `/nix/<short>/`. Discovery walks each. Workers
+            spawn from the respective venv interpreter with the
+            namespace's own bin/ on PATH.
+
+        In dev / test (no bundle layout), fall back to walking the
+        current Python's installed entry points — every namespace
+        pip-installed in the same env is reachable via `sys.executable`.
 
         Tests using `register_inprocess()` skip this entirely.
         """
         nix_root = Path("/nix")
         if (nix_root / "runtime").is_dir():
-            # Bundle layout: /nix/runtime + /nix/<short>/ siblings.
+            # Bundle layout — `/nix/runtime` always carries the framework;
+            # in merged mode it also carries every namespace. The walker
+            # records `/nix/runtime` as a discoverable venv unconditionally;
+            # any per-namespace sibling dirs from isolated mode get walked
+            # too. (A purely-merged bundle has no siblings; a purely-isolated
+            # bundle has no namespace entry points under /nix/runtime.)
             self._discover_from_nix(nix_root)
         else:
             self._discover_from_current_env()
 
-    # Names under /nix/ that are NOT namespace venvs.
-    _NIX_NON_NAMESPACE = frozenset({"runtime", "store"})
+    # Names under /nix/ that are NOT venvs we should walk.
+    _NIX_NON_NAMESPACE = frozenset({"store"})
 
     def _discover_from_nix(self, nix_root: Path) -> None:
         for venv in sorted(nix_root.iterdir()):

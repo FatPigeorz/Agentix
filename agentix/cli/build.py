@@ -2,39 +2,50 @@
 
 Usage:
 
-    agentix build ./Agentix-Runtime-Basic                        # one namespace, auto-tag
-    agentix build ./Agentix-Runtime-Basic -o my-bundle:dev       # explicit tag
-    agentix build ./ns-a ./ns-b ./ns-c -o my-agent:0.1.0         # bundle several namespaces
-    agentix build ./ns-a ./ns-b --dry-run -o sandbox:dev         # stage to ./build/<tag>/
+    agentix build .                                              # current project, auto-tag
+    agentix build . -o my:dev                                    # explicit tag
+    agentix build . ../some-plugin -o my:0.1.0                   # your project + a plugin
+    agentix build . --dry-run -o sandbox:dev                     # stage only, no docker invoke
+    agentix build . ../clashing-deps --isolated -o my:dev        # per-namespace venvs
 
 Each spec is one of:
 
-  1. **Path:** a directory containing `pyproject.toml` and the namespace's
-     Python package under `src/agentix/<name>/`.
+  1. **Path:** a directory containing `pyproject.toml`. Works whether
+     or not the project declares an `agentix.namespace` entry point —
+     plugin projects declare one for `from agentix import <short>`
+     uniformity; user projects don't need to.
   2. **Image ref:** pre-built — `:` AND `/` (not yet wired).
   3. **Short name:** assumed to be a PyPI dist `agentix-<name>`
      (currently stubbed — wheel-based builds aren't wired yet).
 
-Build shape — every namespace gets its own venv under `/nix/<short>/`:
+Build modes (the `--isolated` flag flips between them):
 
-  Python deps **per namespace**: each namespace is pip-installed into its
-  own `/nix/<short>/` (uv-managed) so two namespaces can pull
-  incompatible dep versions without conflict. The multiplexer spawns a
-  worker subprocess using each namespace's venv interpreter and prepends
-  `/nix/<short>/bin` to PATH — `subprocess.run("git", ...)` in user code
-  resolves transparently.
+  * **Merged (default).** Every spec + its declared deps install into
+    the framework's own venv at `/nix/runtime/`. One Python, one
+    site-packages, one bin/ — `from agentix.bash import run` inside
+    your worker just works, and any Nix-built binary (`claude`, `git`,
+    …) is on PATH for every worker. Cost: if two specs need
+    incompatible Python deps, pip's resolver fails the build with a
+    clear error. The CLI suggests `--isolated` when that happens.
 
-  System deps **per namespace**: a namespace that needs native binaries
-  (claude CLI, git, …) ships a `default.nix` next to its `pyproject.toml`.
-  If any spec ships one, a Nix builder stage runs first; the derivation's
-  `bin/*` is then symlinked into the namespace's `/nix/<short>/bin/`.
-  Bundles with no `default.nix` anywhere skip Nix entirely.
+  * **Isolated (`--isolated`).** Each spec gets `/nix/<short>/` with
+    its own uv-managed venv and its own bin/. Conflicting deps don't
+    merge; namespaces stop being able to inline-import each other.
+    The only cross-namespace path is host-side `c.remote(...)`. Use
+    when merged mode fails or when you genuinely need per-namespace
+    dep isolation.
 
-  The output image extends `agentix/runtime:<framework-version>` (override
-  via `--runtime-image`). If that image isn't present locally, build it
-  from `Agentix-Runtime-Basic/runtime/Dockerfile` or pull it from your
-  registry — the CLI no longer auto-builds it, since the template now
-  ships with a separate wheel.
+  System deps **per namespace** are unchanged: a namespace that needs
+  native binaries (claude CLI, git, …) ships a `default.nix` next to
+  its `pyproject.toml`. A Nix builder stage runs first; the
+  derivation's `bin/*` is symlinked into `/nix/runtime/bin/` (merged)
+  or `/nix/<short>/bin/` (isolated). Bundles with no `default.nix`
+  anywhere skip Nix entirely.
+
+  The output image extends `agentix/runtime:<framework-version>`
+  (override via `--runtime-image`). The runtime image must exist
+  locally; build it from `Agentix-Runtime-Basic/runtime/Dockerfile`
+  or pull it from your registry.
 """
 
 from __future__ import annotations
@@ -90,6 +101,42 @@ def _has_system_deps(src: Path) -> bool:
     return (src / "default.nix").is_file()
 
 
+def _warn_merged_with_system_deps(
+    resolved: list[tuple[NamespaceSpec, Path]],
+    *,
+    isolated: bool,
+) -> None:
+    """Build-time warning: in merged mode, code that inline-wraps a
+    plugin requiring system deps depends on the merged-bin/ collapse.
+
+    If the user later switches to `--isolated`, their inline wrapper
+    will silently break — `subprocess.run(['claude', ...])` will fail
+    to find the binary because per-namespace bin/ isn't on the user's
+    worker PATH any more. Flagging this at build time so the user
+    knows what merge buys them (and what they'd lose).
+    """
+    if isolated:
+        return
+    sys_dep_plugins = [spec.short for spec, p in resolved if _has_system_deps(p)]
+    if not sys_dep_plugins:
+        return
+    names = ", ".join(sys_dep_plugins)
+    print(
+        f"\nnote: building in merged mode. Plugin(s) shipping system "
+        f"binaries via `default.nix` ({names}) install their bins into "
+        f"the shared /nix/runtime/bin/. Inline composition "
+        f"(`from agentix.{sys_dep_plugins[0]} import …` from any worker) "
+        f"works because those binaries are on every worker's PATH.\n"
+        f"Trade-offs:\n"
+        f"  * two plugins shipping a binary with the same name collide "
+        f"(last-write wins).\n"
+        f"  * code that inline-wraps these plugins will NOT work if you "
+        f"later rebuild with `--isolated`; cross-namespace composition "
+        f"must go through host-side `c.remote(...)` in that mode.\n",
+        file=sys.stderr,
+    )
+
+
 def _image_exists_locally(image: str) -> bool:
     """`docker image inspect` returns 0 iff the image is locally present."""
     proc = subprocess.run(
@@ -138,18 +185,30 @@ def _stage(specs: list[tuple[NamespaceSpec, Path]], build_dir: Path) -> None:
 def _render_dockerfile(
     specs: list[tuple[NamespaceSpec, Path]],
     runtime_image: str,
+    isolated: bool = False,
 ) -> str:
-    """Multi-stage Dockerfile.
+    """Generate the bundle's multi-stage Dockerfile.
 
-    Stage 1 (optional): Nix builder for any namespace that ships
-    `default.nix`. Skipped entirely if no spec does.
+    Two layout modes:
 
-    Stage 2: extends the runtime image. For each namespace, create
-    `/nix/<short>/` via uv and `pip install` the namespace + the
-    bundled framework wheel into it. If the namespace shipped a
-    `default.nix`, symlink the derivation's `bin/*` into
-    `/nix/<short>/bin/` so the namespace's worker subprocess (with
-    PATH=/nix/<short>/bin:…) can invoke them transparently.
+      * **Merged (default).** Every spec + its declared deps install
+        into the framework's own venv at `/nix/runtime/`. One Python,
+        one `site-packages`, one `bin/` — so `from agentix.bash import
+        run` inside your worker just works, and `claude` is on PATH for
+        any worker that has `agentix-claude-code` declared. The Python
+        composition story is "regular Python — `import` whatever you
+        installed."
+
+      * **Isolated (`--isolated`).** Each spec gets its own
+        `/nix/<short>/` venv with its own `bin/`. Conflicting Python
+        deps across namespaces don't merge; the cost is that inline
+        composition stops working — namespaces only see each other via
+        host-side `c.remote(...)`. Reach for this when pip can't
+        resolve a unified dep set.
+
+    Stage 1 is optional and identical in both modes: a Nix builder
+    that materialises `default.nix` derivations into `/nix/store/`.
+    Stage 2 diverges by mode.
     """
     nix_specs = [(s, p) for s, p in specs if _has_system_deps(p)]
     nix_shorts = {s.short for s, _ in nix_specs}
@@ -188,34 +247,88 @@ def _render_dockerfile(
         parts.append("COPY --from=sys-builder /export/nix/store /nix/store")
         parts.append("COPY --from=sys-builder /export/nix/.sys-paths /nix/.sys-paths")
 
-    # One venv per namespace under /nix/<short>/. uv venv is millisecond-scale;
-    # each `pip install` runs in its own venv so cross-namespace dep versions
-    # don't merge. The framework wheel is the only shared dep — installed
-    # into every venv from /nix/.wheels/ stashed by the runtime image.
+    if isolated:
+        parts += _isolated_install_steps(specs, nix_shorts)
+        mode = "isolated"
+    else:
+        parts += _merged_install_steps(specs, nix_shorts)
+        mode = "merged"
+
+    short_names = " ".join(s.short for s, _ in specs)
+    parts.append(f'LABEL org.agentix.bundle.namespaces="{short_names}"')
+    parts.append(f'LABEL org.agentix.bundle.mode="{mode}"')
+
+    return "\n".join(parts) + "\n"
+
+
+def _merged_install_steps(
+    specs: list[tuple[NamespaceSpec, Path]],
+    nix_shorts: set[str],
+) -> list[str]:
+    """All specs install into the framework's own venv at /nix/runtime/.
+
+    The runtime base image already has the framework installed there,
+    so a single `pip install /src/a /src/b ...` adds every namespace +
+    its declared deps to one site-packages. pip's resolver runs once
+    over the union — if it can't satisfy everyone simultaneously, the
+    build fails with a clear error (and the CLI suggests `--isolated`).
+    """
+    steps: list[str] = []
+    # Copy every spec's source tree first.
     for spec, _ in specs:
-        steps = [
+        steps.append(f"COPY {spec.short}/ /src/{spec.short}/")
+
+    src_args = " ".join(f"/src/{spec.short}" for spec, _ in specs)
+    steps.append(
+        "RUN /nix/runtime/bin/pip install --no-cache-dir "
+        + src_args
+    )
+
+    # Symlink every Nix-built binary into /nix/runtime/bin/. Two
+    # namespaces shipping a binary with the same name will collide
+    # (last-write wins); that's the price of merging.
+    if nix_shorts:
+        sl_steps = ["RUN set -eux; \\"]
+        for short in sorted(nix_shorts):
+            sl_steps.append(
+                f"    SP=$(cat /nix/.sys-paths/{short}) && "
+                f"for f in $SP/bin/*; do ln -sf \"$f\" /nix/runtime/bin/$(basename \"$f\"); done; \\"
+            )
+        sl_steps.append("    true")
+        steps += sl_steps
+    return steps
+
+
+def _isolated_install_steps(
+    specs: list[tuple[NamespaceSpec, Path]],
+    nix_shorts: set[str],
+) -> list[str]:
+    """One venv per namespace under /nix/<short>/.
+
+    Each `pip install` runs in its own venv so cross-namespace dep
+    versions don't merge. The framework wheel is the only shared dep —
+    installed into every venv from /nix/.wheels/ stashed by the
+    runtime image. Namespaces can't inline-import each other; only
+    host-side `c.remote(...)` crosses the boundary.
+    """
+    steps: list[str] = []
+    for spec, _ in specs:
+        block = [
             f"COPY {spec.short}/ /src/{spec.short}/",
             f"RUN uv venv /nix/{spec.short} && \\",
             f"    /nix/{spec.short}/bin/pip install --no-cache-dir "
             f"/nix/.wheels/agentix-*.whl /src/{spec.short}",
         ]
-        # If this namespace shipped default.nix, symlink the derivation's
-        # bin/* into the namespace's bin/. Worker PATH points at this dir
-        # so user code can call `subprocess.run("git", ...)` directly.
         if spec.short in nix_shorts:
-            steps[-1] += " && \\"
-            steps += [
+            block[-1] += " && \\"
+            block += [
                 f"    SP=$(cat /nix/.sys-paths/{spec.short}) && \\",
                 "    for f in $SP/bin/*; do \\",
                 f"        ln -sf \"$f\" /nix/{spec.short}/bin/$(basename \"$f\"); \\",
                 "    done",
             ]
-        parts += steps
-
-    short_names = " ".join(s.short for s, _ in specs)
-    parts.append(f'LABEL org.agentix.bundle.namespaces="{short_names}"')
-
-    return "\n".join(parts) + "\n"
+        steps += block
+    return steps
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -236,6 +349,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="base runtime image the bundle extends. Must exist locally; "
              "build it from Agentix-Runtime-Basic/runtime/Dockerfile or pull "
              f"it from your registry. (default: agentix/runtime:{FRAMEWORK_VERSION})",
+    )
+    parser.add_argument(
+        "--isolated", action="store_true",
+        help="give each namespace its own venv at /nix/<short>/ instead of "
+             "merging into the framework venv. Inline imports across "
+             "namespaces stop working; only `c.remote(...)` crosses the "
+             "boundary. Use when pip can't resolve a unified dep set.",
     )
     parser.add_argument("--dry-run", action="store_true",
                         help="stage to ./build/<tag>/ and print path; do NOT invoke docker")
@@ -261,39 +381,67 @@ def main(argv: Sequence[str] | None = None) -> int:
     if ":" not in tag:
         raise SystemExit(f"image tag must include `:<version>` (got {tag!r})")
 
+    _warn_merged_with_system_deps(resolved, isolated=args.isolated)
+
     if args.dry_run:
         out = REPO_ROOT / "build" / tag.rsplit("/", 1)[-1].split(":", 1)[0]
         if out.exists():
             shutil.rmtree(out)
         out.mkdir(parents=True)
         _stage(resolved, out)
-        (out / "Dockerfile").write_text(_render_dockerfile(resolved, args.runtime_image))
+        (out / "Dockerfile").write_text(
+            _render_dockerfile(resolved, args.runtime_image, isolated=args.isolated),
+        )
         print(f"staged build context → {out}")
         print(f"would build → {tag}")
         print(f"  extends → {args.runtime_image}")
+        print(f"  mode → {'isolated' if args.isolated else 'merged'}")
         if len(specs) > 1:
             print(f"  namespaces: {', '.join(shorts)}")
         return 0
 
     # Ensure the runtime image exists locally before generating the bundle —
     # the bundle Dockerfile's `FROM agentix/runtime:<version>` would fail
-    # otherwise. Auto-build hides the docker-build call from users.
+    # otherwise.
     _ensure_runtime_image(args.runtime_image)
 
     with TemporaryDirectory(prefix="agentix-build-") as tmp:
         build_dir = Path(tmp)
         _stage(resolved, build_dir)
-        (build_dir / "Dockerfile").write_text(_render_dockerfile(resolved, args.runtime_image))
+        (build_dir / "Dockerfile").write_text(
+            _render_dockerfile(resolved, args.runtime_image, isolated=args.isolated),
+        )
         ns_count = len(specs)
+        mode_label = "isolated" if args.isolated else "merged"
         print(
             f"building {tag} ({ns_count} namespace{'s' if ns_count > 1 else ''} "
-            f"extending {args.runtime_image})…",
+            f"extending {args.runtime_image}, {mode_label} mode)…",
             file=sys.stderr,
         )
         proc = subprocess.run(
             ["docker", "build", "-t", tag, str(build_dir)],
             check=False,
+            stderr=subprocess.PIPE,
         )
+        if proc.stderr:
+            sys.stderr.buffer.write(proc.stderr)
+        if proc.returncode != 0 and not args.isolated:
+            # Heuristic: pip's resolution errors mention "conflict" /
+            # "no matching" / "incompatible". Suggest --isolated.
+            err = proc.stderr.decode(errors="replace") if proc.stderr else ""
+            if any(
+                token in err
+                for token in ("conflict", "no matching distribution", "incompatible", "ResolutionImpossible")
+            ):
+                print(
+                    "\nhint: docker build failed during the unified pip install — "
+                    "two specs probably want incompatible Python deps. "
+                    "Retry with `agentix build --isolated …` to give each spec "
+                    "its own venv. Note: with --isolated, namespaces stop being "
+                    "able to inline-import each other; cross-namespace composition "
+                    "must go through `c.remote(...)` from the host.",
+                    file=sys.stderr,
+                )
         return proc.returncode
 
 
