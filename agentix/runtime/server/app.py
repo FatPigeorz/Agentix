@@ -23,7 +23,7 @@ from fastapi import FastAPI
 
 from agentix import __version__
 from agentix.runtime.server.sio import make_sio
-from agentix.runtime.server.worker_client import RuntimeWorkerClient
+from agentix.runtime.server.worker import RuntimeWorkerClient
 from agentix.runtime.shared.models import HealthResponse
 
 logger = logging.getLogger("agentix.runtime")

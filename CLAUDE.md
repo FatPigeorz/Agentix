@@ -54,32 +54,25 @@ Sibling repos (`Agentix-Runtime-Basic`, `Agentix-Deployment-*`,
 ```text
 agentix/
 ├── runtime/
-│   ├── invoke/              — internal callable binding + declared-shape detection
-│   │   ├── shape.py             — detect_declared_shape (unary | stream | bidi)
-│   │   ├── bound.py             — _BoundCallable + arg coercion helper
-│   │   └── invoker.py           — CallableInvoker
 │   ├── shared/              — wire types, codec, framing, event names
 │   ├── client/              — RuntimeClient
-│   └── server/              — FastAPI + Socket.IO + worker client + worker
+│   └── server/              — FastAPI + Socket.IO + worker package
 ├── deployment/          — Deployment Protocol + backend plugin loader
-└── cli/                 — agentix build, agentix deploy
+└── cli/                 — agentix build
 ```
 
 One line per system:
 
-- **runtime.invoke** — inspects a pickle-resolved callable, compiles
-  pydantic adapters, validates args, calls the callable, and serializes
-  outputs.
 - **runtime.shared** — msgpack codec, length-prefixed worker frames,
-  Socket.IO event names, pydantic wire models, and branded wire ids.
+  Socket.IO event names, pydantic wire models, call-shape helpers, and
+  branded wire ids.
 - **runtime.client** — `RuntimeClient.remote(fn, ...)`; Socket.IO for unary,
   stream, and bidi; HTTP only for health.
-- **runtime.server** — `agentix-server`; owns one runtime worker
-  process, forwards Socket.IO calls, and correlates events by
-  `call_id`.
-- **deployment** — host-side `Deployment` Protocol and backend lookup
-  for `agentix deploy <backend>`.
-- **cli** — `agentix build [path]` and `agentix deploy <backend>`.
+- **runtime.server** — `agentix-server`; owns one runtime worker process,
+  invokes pickle-resolved callables, forwards Socket.IO calls, and
+  correlates events by `call_id`.
+- **deployment** — host-side `Deployment` Protocol and backend lookup.
+- **cli** — `agentix build [path]`.
 
 ## Remote Call Implementation
 

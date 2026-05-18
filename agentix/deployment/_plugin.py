@@ -3,7 +3,7 @@
 Lives under `agentix.deployment` because deployments are the only
 framework axis discovered via entry points. Remote callables do not need
 a framework registry; only sandbox lifecycle backends need a name-to-class
-registry for `agentix deploy <name>`.
+registry.
 
 Two ways to find plugins:
 

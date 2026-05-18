@@ -30,15 +30,15 @@ dev = [
     "pyright>=1.1.380",
 ]
 [project.scripts]
-# Dev-side CLI: `agentix build`, `agentix deploy`, `agentix check`.
+# Dev-side CLI: `agentix build`.
 # Subcommands live in `agentix.cli`. The CLI is intentionally thin —
 # most logic is in the submodules so they can also be imported directly.
 agentix = "agentix.cli:main"
 # Runtime server entrypoint — the bundle image's Docker ENTRYPOINT.
 agentix-server = "agentix.runtime.server:main"
 
-# Deployment backends ship in their own wheels. Runtime integrations are
-# normal Python dependencies installed into the bundle.
+# Deployment backends and runtime integrations ship in their own wheels.
+# Runtime integrations are normal Python dependencies installed into the bundle.
 #   pip install agentix-deployment-docker   # registers `local`
 #   pip install agentix-deployment-daytona  # registers `daytona`
 #   pip install agentix-deployment-e2b      # registers `e2b`

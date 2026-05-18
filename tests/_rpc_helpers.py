@@ -3,9 +3,9 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
-from agentix.runtime.invoke import detect_declared_shape
 from agentix.runtime.shared.callables import display_name_for, dump_callable
 from agentix.runtime.shared.models import RemoteRequest
+from agentix.runtime.shared.rpc import detect_declared_shape
 
 
 def request_for(

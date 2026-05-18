@@ -12,7 +12,7 @@ import sys
 import traceback
 from typing import Any
 
-from agentix.runtime.invoke import CallableInvoker
+from agentix.runtime.server.worker.invoker import CallableInvoker
 from agentix.runtime.shared import frames as F
 from agentix.runtime.shared import pump as _pump
 from agentix.runtime.shared.callables import load_callable
@@ -20,7 +20,7 @@ from agentix.runtime.shared.framing import read_frame, write_frame
 from agentix.runtime.shared.idents import CallId
 from agentix.runtime.shared.models import RemoteError, RemoteRequest
 
-logger = logging.getLogger("agentix.runtime.server.worker")
+logger = logging.getLogger("agentix.runtime.server.worker.process")
 
 
 def _err(exc: BaseException) -> dict[str, Any]:

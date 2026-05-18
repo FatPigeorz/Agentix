@@ -7,7 +7,7 @@ is importable in the runtime venv.
 from __future__ import annotations
 
 from agentix import RuntimeClient
-from agentix.runtime.server.worker_client import RuntimeWorkerClient
+from agentix.runtime.server.worker import RuntimeWorkerClient
 from tests._rpc_helpers import request_for
 
 

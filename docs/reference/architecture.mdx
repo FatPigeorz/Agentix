@@ -27,12 +27,11 @@ Everything else supports that loop.
 
 | System | Responsibility |
 | --- | --- |
-| `agentix.runtime.invoke` | Inspect pickle-resolved callables, detect declared call shapes, bind and validate args, serialize outputs |
-| `agentix.runtime.shared` | Wire models, msgpack codec, framing, Socket.IO event names |
+| `agentix.runtime.shared` | Wire models, msgpack codec, framing, Socket.IO event names, call-shape helpers |
 | `agentix.runtime.client` | `RuntimeClient.remote(fn, ...)` and transport-specific client behavior |
-| `agentix.runtime.server` | FastAPI and Socket.IO server, worker process management, call correlation |
+| `agentix.runtime.server` | FastAPI and Socket.IO server, worker process management, callable invocation, call correlation |
 | `agentix.deployment` | Host-side sandbox lifecycle protocol and backend plugin lookup |
-| `agentix.cli` | `agentix build` and `agentix deploy` |
+| `agentix.cli` | `agentix build` |
 
 ## Remote Target
 

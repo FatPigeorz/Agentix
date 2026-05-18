@@ -1,9 +1,8 @@
 """`agentix` command-line interface.
 
-Two built-in subcommands (`build`, `deploy`) ship as modules under
-`agentix/cli/`. Third parties that want to add a new `agentix <name>`
-verb should expose their own `console_scripts` entry instead — the
-central CLI is not a plugin surface.
+The core CLI intentionally stays narrow: `agentix build` packages a
+project into a bundle image. Other workflows should expose their own
+`console_scripts` entry instead of expanding the central CLI.
 
 The CLI deliberately doesn't use argparse subparsers — argparse
 intercepts `--help` greedily at the root level, so `agentix build --help`
@@ -22,7 +21,6 @@ from collections.abc import Callable, Sequence
 # `agentix.cli` whose `main(argv)` handles the verb.
 _COMMANDS: tuple[tuple[str, str], ...] = (
     ("build", "agentix.cli.build"),
-    ("deploy", "agentix.cli.deploy"),
 )
 
 

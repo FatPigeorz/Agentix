@@ -4,8 +4,7 @@ A deployment backend is anything that creates / deletes / inspects a
 sandbox. The framework treats them as plugins: each backend is a class
 registered under the `agentix.deployment` entry-point group. Backends
 ship in their own packages (`agentix-deployment-docker`,
-`agentix-deployment-fly`, ...) and become available to
-`agentix deploy <name>` after install.
+`agentix-deployment-fly`, ...).
 
 ```toml
 # downstream pyproject.toml
@@ -23,8 +22,8 @@ class FlyDeployment:                          # no inheritance, structural type
     async def get(self, sid): ...
 ```
 
-`agentix deploy fly --image my-agent:0.1.0` works after the install with
-zero framework changes.
+`load_deployment("fly")` works after the install with zero framework
+changes.
 """
 
 from __future__ import annotations

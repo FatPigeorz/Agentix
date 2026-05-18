@@ -16,7 +16,6 @@ The Docker backend is the local development path:
 
 ```bash
 pip install agentix-deployment-docker
-agentix deploy local --image my-rollout:0.1.0
 ```
 
 In code, create a deployment, pass a `SandboxConfig`, and use the
@@ -37,18 +36,6 @@ async with session(deployment, config) as sandbox:
 
 `session(...)` creates the sandbox on entry and deletes it on exit.
 
-## CLI Shape
-
-```bash
-agentix deploy <backend> --image <tag>
-agentix deploy local --image my-rollout:0.1.0
-agentix deploy local --image my-rollout:0.1.0 --detach
-```
-
-Foreground mode prints the runtime URL and tears the sandbox down on
-Ctrl-C. Detached mode creates the sandbox and exits after printing the
-handle.
-
 ## Backend Plugins
 
 Deployment packages register classes in the `agentix.deployment` entry
@@ -63,11 +50,13 @@ version = "0.1.0"
 fly = "my_deploy:FlyDeployment"
 ```
 
-After installation, the backend name becomes available to the CLI:
+After installation, the backend name becomes available to
+`load_deployment`:
 
-```bash
-pip install agentix-deployment-fly
-agentix deploy fly --image my-rollout:0.1.0
+```python
+from agentix.deployment.base import load_deployment
+
+FlyDeployment = load_deployment("fly")
 ```
 
 ## Backend Protocol

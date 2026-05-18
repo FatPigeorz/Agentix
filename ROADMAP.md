@@ -20,7 +20,7 @@ Current architecture:
 - [x] One runtime server per sandbox image.
 - [x] One worker subprocess per runtime server.
 - [x] Pickle callable payloads for Python-native callable references.
-- [x] Callable invocation through `agentix.runtime.invoke`; targets are not
+- [x] Callable invocation inside `agentix.runtime.server`; targets are not
       required to be pure functions. If Python can resolve the callable
       from the requested target, Agentix should be able to invoke it.
 - [x] Single-spec `agentix build`; integrations arrive through normal

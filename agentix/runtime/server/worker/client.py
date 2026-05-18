@@ -18,13 +18,13 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Protocol
 
-from agentix.runtime.invoke import CallableInvoker
+from agentix.runtime.server.worker.invoker import CallableInvoker
 from agentix.runtime.shared import frames as F
 from agentix.runtime.shared.callables import load_callable
 from agentix.runtime.shared.framing import read_frame, write_frame
 from agentix.runtime.shared.models import RemoteError, RemoteRequest, RemoteResponse
 
-logger = logging.getLogger("agentix.runtime.server.worker_client")
+logger = logging.getLogger("agentix.runtime.server.worker.client")
 
 _WORKER_START_TIMEOUT = 15.0
 _DEFAULT_WORKER_PATH = "/usr/local/bin:/usr/bin:/bin"
@@ -400,4 +400,4 @@ class RuntimeWorkerClient:
             yield ev
 
 
-__all__ = ["RuntimeWorkerClient"]
+__all__ = ["RuntimeWorkerClient", "WorkerBackend"]

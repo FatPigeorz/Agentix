@@ -14,7 +14,7 @@ import sys
 
 import pytest
 
-from agentix.runtime.server.worker_client import RuntimeWorkerClient
+from agentix.runtime.server.worker import RuntimeWorkerClient
 from agentix.runtime.shared.models import RemoteRequest
 from tests import _worker_target as target
 from tests._rpc_helpers import request_for
@@ -26,7 +26,7 @@ def worker_env():
     return None
 
 
-def _make_worker_client() -> RuntimeWorkerClient:
+def _make_worker() -> RuntimeWorkerClient:
     mp = RuntimeWorkerClient()
     mp._python = sys.executable
     return mp
@@ -34,7 +34,7 @@ def _make_worker_client() -> RuntimeWorkerClient:
 
 async def test_subprocess_worker_unary_round_trip(worker_env):
     """A real worker subprocess runs a callable and returns the value."""
-    mp = _make_worker_client()
+    mp = _make_worker()
     try:
         resp = await mp.call_unary(request_for(target.echo, kwargs={"msg": "hi"}))
         assert resp.ok, resp.error
@@ -59,7 +59,7 @@ async def test_subprocess_worker_bad_callable_payload_fails_without_hanging(work
 
 async def test_subprocess_worker_streaming(worker_env):
     """Server-streaming function round-trip via subprocess."""
-    mp = _make_worker_client()
+    mp = _make_worker()
     try:
         events = []
         async for ev in mp.call_stream(request_for(target.counter, kwargs={"n": 3})):
@@ -76,7 +76,7 @@ async def test_subprocess_worker_streaming(worker_env):
 async def test_subprocess_worker_death_fails_in_flight_stream(worker_env):
     """Killing the worker mid-stream surfaces WorkerExited to the caller —
     PROTOCOL.md invariant #5 (no call hangs indefinitely)."""
-    mp = _make_worker_client()
+    mp = _make_worker()
     try:
         # Force the worker to spawn by issuing one unary first.
         resp = await mp.call_unary(request_for(target.echo, kwargs={"msg": "warm"}))

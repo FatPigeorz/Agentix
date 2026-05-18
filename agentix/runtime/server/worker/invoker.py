@@ -1,9 +1,8 @@
-"""`CallableInvoker` — validates and invokes remote callables.
+"""Server-side callable execution for remote calls.
 
-The runtime receives a pickle-serialized callable, resolves its
-signature, builds pydantic adapters, coerces wire args, calls the
-callable, serializes outputs, and traps exceptions into `RemoteError` so
-the wire stays in-band.
+The worker receives a pickle-resolved callable plus wire args. This module
+binds args, applies pydantic validation, calls the callable, serializes
+outputs, and converts exceptions into in-band `RemoteError` values.
 """
 
 from __future__ import annotations
@@ -11,31 +10,84 @@ from __future__ import annotations
 import inspect
 import logging
 import traceback
-from collections.abc import AsyncIterator
-from typing import Any, get_args
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
+from typing import Any, Generic, ParamSpec, TypeVar, get_args
 
 from pydantic import TypeAdapter, ValidationError
 
-from agentix.runtime.invoke.bound import _BoundCallable, coerce_args
-from agentix.runtime.invoke.shape import detect_declared_shape
 from agentix.runtime.shared.models import (
+    CallShape,
     RemoteError,
     RemoteRequest,
     RemoteResponse,
 )
-from agentix.runtime.shared.rpc import is_channel_annotation
+from agentix.runtime.shared.rpc import detect_declared_shape, is_channel_annotation
 
-logger = logging.getLogger("agentix.runtime.invoke")
+logger = logging.getLogger("agentix.runtime.server.worker.invoker")
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+@dataclass
+class _BoundCallable(Generic[P, R]):
+    name: str
+    stub: Callable[P, R]
+    impl: Callable[..., Any]
+    signature: inspect.Signature
+    shape: CallShape
+    param_adapters: dict[str, TypeAdapter[Any]]
+    return_adapter: TypeAdapter[Any]
+    item_adapter: TypeAdapter[Any] | None = None
+    input_channel_param: str | None = None
+    input_item_adapter: TypeAdapter[Any] | None = None
+
+    @property
+    def is_stream(self) -> bool:
+        return self.shape in ("stream", "bidi")
+
+    @property
+    def is_bidi(self) -> bool:
+        return self.shape == "bidi"
+
+
+def _coerce_args(
+    m: _BoundCallable[Any, Any],
+    args: list[Any],
+    kwargs: dict[str, Any],
+) -> tuple[list[Any], dict[str, Any]]:
+    bound = m.signature.bind(*args, **kwargs)
+    bound.apply_defaults()
+    coerced: dict[str, Any] = {}
+    for pname, raw in bound.arguments.items():
+        adapter = m.param_adapters.get(pname)
+        coerced[pname] = adapter.validate_python(raw) if adapter is not None else raw
+
+    out_args: list[Any] = []
+    out_kwargs: dict[str, Any] = {}
+    for pname, param in m.signature.parameters.items():
+        if pname not in coerced:
+            continue
+        v = coerced[pname]
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        ):
+            out_args.append(v)
+        elif param.kind is inspect.Parameter.VAR_POSITIONAL:
+            out_args.extend(v)
+        elif param.kind is inspect.Parameter.VAR_KEYWORD:
+            out_kwargs.update(v)
+        else:
+            out_kwargs[pname] = v
+    return out_args, out_kwargs
 
 
 class CallableInvoker:
     """Call one pickle-resolved Python callable."""
 
     def _build(self, name: str, fn: Any) -> _BoundCallable[Any, Any]:
-        # eval_str=True resolves PEP 563 stringified annotations
-        # (`from __future__ import annotations` in the module) — without
-        # it, `param.annotation` would be a string and `get_origin` would
-        # return None, mis-classifying streams as unary.
         sig = inspect.signature(fn, eval_str=True)
         shape = detect_declared_shape(fn, sig)
 
@@ -44,7 +96,6 @@ class CallableInvoker:
         for pname, param in sig.parameters.items():
             ann = param.annotation if param.annotation is not inspect.Parameter.empty else Any
             if is_channel_annotation(ann):
-                # Channel[T] params: adapter validates items, not the channel itself.
                 args = get_args(ann)
                 item_type = args[0] if args else Any
                 channel_params.append((pname, item_type))
@@ -52,18 +103,21 @@ class CallableInvoker:
             else:
                 param_adapters[pname] = TypeAdapter(ann)
 
-        return_ann = sig.return_annotation if sig.return_annotation is not inspect.Signature.empty else Any
+        return_ann = (
+            sig.return_annotation
+            if sig.return_annotation is not inspect.Signature.empty
+            else Any
+        )
         item_adapter: TypeAdapter[Any] | None = None
         input_channel_param: str | None = None
         input_item_adapter: TypeAdapter[Any] | None = None
         if shape == "unary":
             return_adapter = TypeAdapter(return_ann)
         else:
-            # Stream + bidi both serialise items via the return type's T.
             args = get_args(return_ann)
             item_type = args[0] if args else Any
             item_adapter = TypeAdapter(item_type)
-            return_adapter = TypeAdapter(Any)  # unused on streaming path
+            return_adapter = TypeAdapter(Any)
             if shape == "bidi":
                 input_channel_param, input_item_type = channel_params[0]
                 input_item_adapter = TypeAdapter(input_item_type)
@@ -81,20 +135,20 @@ class CallableInvoker:
             input_item_adapter=input_item_adapter,
         )
 
-    # ── call entry points ─────────────────────────────────────────
-
     async def call_unary(self, fn: Any, request: RemoteRequest) -> RemoteResponse:
-        """Invoke a unary callable and serialize its return value."""
         m = self._build(request.display_name, fn)
         if m.shape != request.shape:
-            return RemoteResponse(ok=False, error=_shape_error(request.display_name, request.shape, m.shape))
+            return RemoteResponse(
+                ok=False,
+                error=_shape_error(request.display_name, request.shape, m.shape),
+            )
         if m.shape != "unary":
             return RemoteResponse(ok=False, error=RemoteError(
                 type="NotAUnaryCallable",
                 message=f"callable {request.display_name!r} is {m.shape}, not unary",
             ))
         try:
-            args, kwargs = coerce_args(m, request.args, request.kwargs)
+            args, kwargs = _coerce_args(m, request.args, request.kwargs)
         except ValidationError as exc:
             return RemoteResponse(
                 ok=False,
@@ -126,22 +180,38 @@ class CallableInvoker:
             )
         return RemoteResponse(ok=True, value=value)
 
-    async def call_stream(self, fn: Any, request: RemoteRequest) -> AsyncIterator[dict[str, Any]]:
-        """Server-streaming call. Yields {item|end|error} event dicts."""
+    async def call_stream(
+        self,
+        fn: Any,
+        request: RemoteRequest,
+    ) -> AsyncIterator[dict[str, Any]]:
         m = self._build(request.display_name, fn)
         if m.shape != request.shape:
-            yield {"type": "error", "error": _shape_error(request.display_name, request.shape, m.shape).model_dump()}
+            yield {
+                "type": "error",
+                "error": _shape_error(
+                    request.display_name,
+                    request.shape,
+                    m.shape,
+                ).model_dump(),
+            }
             return
         if not m.is_stream or m.is_bidi:
             yield {"type": "error", "error": RemoteError(
                 type="NotAStreamFunction",
-                message=f"callable {request.display_name!r} is not a non-bidi streaming callable",
+                message=(
+                    f"callable {request.display_name!r} is not a non-bidi "
+                    "streaming callable"
+                ),
             ).model_dump()}
             return
         try:
-            args, kwargs = coerce_args(m, request.args, request.kwargs)
+            args, kwargs = _coerce_args(m, request.args, request.kwargs)
         except ValidationError as exc:
-            yield {"type": "error", "error": RemoteError(type="ValidationError", message=str(exc)).model_dump()}
+            yield {
+                "type": "error",
+                "error": RemoteError(type="ValidationError", message=str(exc)).model_dump(),
+            }
             return
         try:
             result = m.impl(*args, **kwargs)
@@ -174,11 +244,16 @@ class CallableInvoker:
         request: RemoteRequest,
         input_iter: AsyncIterator[Any],
     ) -> AsyncIterator[dict[str, Any]]:
-        """Bidirectional call. `input_iter` is the caller-pushed inbound stream;
-        items must already match the impl's `Channel[T]` item type."""
         m = self._build(request.display_name, fn)
         if m.shape != request.shape:
-            yield {"type": "error", "error": _shape_error(request.display_name, request.shape, m.shape).model_dump()}
+            yield {
+                "type": "error",
+                "error": _shape_error(
+                    request.display_name,
+                    request.shape,
+                    m.shape,
+                ).model_dump(),
+            }
             return
         if not m.is_bidi:
             yield {"type": "error", "error": RemoteError(
@@ -187,7 +262,6 @@ class CallableInvoker:
             ).model_dump()}
             return
         assert m.input_channel_param is not None
-        # Bind non-channel args/kwargs; inject input_iter as the channel param.
         non_channel_kwargs = dict(request.kwargs)
         non_channel_kwargs.pop(m.input_channel_param, None)
         try:
@@ -198,10 +272,18 @@ class CallableInvoker:
                 if pname == m.input_channel_param:
                     continue
                 adapter = m.param_adapters.get(pname)
-                coerced[pname] = adapter.validate_python(raw) if adapter is not None else raw
+                coerced[pname] = (
+                    adapter.validate_python(raw) if adapter is not None else raw
+                )
             coerced[m.input_channel_param] = input_iter
         except (TypeError, ValidationError) as exc:
-            yield {"type": "error", "error": RemoteError(type=type(exc).__name__, message=str(exc)).model_dump()}
+            yield {
+                "type": "error",
+                "error": RemoteError(
+                    type=type(exc).__name__,
+                    message=str(exc),
+                ).model_dump(),
+            }
             return
         try:
             result = m.impl(**coerced)
@@ -236,7 +318,10 @@ class CallableInvoker:
 def _shape_error(display_name: str, expected: str, actual: str) -> RemoteError:
     return RemoteError(
         type="ShapeMismatch",
-        message=f"callable {display_name!r} was sent as {expected!r} but resolved as {actual!r}",
+        message=(
+            f"callable {display_name!r} was sent as {expected!r} "
+            f"but resolved as {actual!r}"
+        ),
     )
 
 

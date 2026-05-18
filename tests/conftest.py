@@ -59,7 +59,7 @@ def use_inprocess_worker(runtime_module) -> Callable[[], None]:
     server, _, _ = runtime_module
 
     def _use() -> None:
-        server.worker._use_inprocess()
+        server.app.state.worker._use_inprocess()
 
     return _use
 

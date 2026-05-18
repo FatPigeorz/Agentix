@@ -7,21 +7,12 @@ runtime worker subprocess.
 Submodules:
   - `app`         — FastAPI app, lifespan, /health
   - `sio`         — Socket.IO server + remote-call event handlers
-  - `worker_client` — server-side bridge to the worker process
-  - `worker`        — worker subprocess entry point
+  - `worker`      — worker client, subprocess entry point, callable invocation
 """
 
-from agentix.runtime.server.app import (
-    _worker,
-    app,
-    main,
-)
-
-# `worker` alias for tests that want to select the in-process backend.
-worker = _worker
+from agentix.runtime.server.app import app, main
 
 __all__ = [
     "app",
     "main",
-    "worker",
 ]

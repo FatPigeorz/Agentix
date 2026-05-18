@@ -37,7 +37,7 @@ from typing import Any
 import socketio
 from pydantic import ValidationError
 
-from agentix.runtime.server.worker_client import RuntimeWorkerClient
+from agentix.runtime.server.worker import RuntimeWorkerClient
 from agentix.runtime.shared import pump as _pump
 from agentix.runtime.shared.codec import pack, unpack
 from agentix.runtime.shared.events import (

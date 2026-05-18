@@ -39,7 +39,6 @@ import httpx
 import socketio
 from pydantic import TypeAdapter
 
-from agentix.runtime.invoke import detect_declared_shape
 from agentix.runtime.shared.callables import display_name_for, dump_callable
 from agentix.runtime.shared.codec import pack, unpack
 from agentix.runtime.shared.events import (
@@ -62,7 +61,14 @@ from agentix.runtime.shared.models import (
     HealthResponse,
     RemoteError,
 )
-from agentix.runtime.shared.rpc import Bidi, Channel, Stream, Unary, is_channel_annotation
+from agentix.runtime.shared.rpc import (
+    Bidi,
+    Channel,
+    Stream,
+    Unary,
+    detect_declared_shape,
+    is_channel_annotation,
+)
 
 P = ParamSpec("P")
 R = TypeVar("R")

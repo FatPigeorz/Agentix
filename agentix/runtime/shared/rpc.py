@@ -28,9 +28,13 @@ from its async iterator.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Coroutine, Generator
+import functools
+import inspect
+from collections.abc import AsyncIterator, Callable, Coroutine, Generator
 from dataclasses import dataclass
 from typing import Any, Generic, TypeAlias, TypeVar, get_origin
+
+from agentix.runtime.shared.models import CallShape
 
 In = TypeVar("In")
 R = TypeVar("R")
@@ -38,9 +42,39 @@ R = TypeVar("R")
 
 def is_channel_annotation(ann: Any) -> bool:
     """True if `ann` is `Channel` or `Channel[T]`. The marker that
-    `agentix.runtime.invoke.detect_declared_shape` and `RuntimeClient.remote` use to
-    distinguish bidi from stream."""
+    `RuntimeClient.remote` uses to distinguish bidi from stream."""
     return ann is Channel or get_origin(ann) is Channel
+
+
+def detect_declared_shape(
+    fn: Callable[..., Any],
+    sig: inspect.Signature | None = None,
+) -> CallShape:
+    """Derive the declared wire shape from a callable and its signature."""
+    if sig is None:
+        sig = inspect.signature(fn, eval_str=True)
+    if not _is_asyncgen_callable(fn):
+        return "unary"
+    has_channel = any(
+        is_channel_annotation(p.annotation) for p in sig.parameters.values()
+    )
+    return "bidi" if has_channel else "stream"
+
+
+def _is_asyncgen_callable(fn: Callable[..., Any]) -> bool:
+    impl = _callable_impl(fn)
+    return inspect.isasyncgenfunction(impl)
+
+
+def _callable_impl(fn: Callable[..., Any]) -> Any:
+    """Return the body-bearing callable used for shape detection."""
+    fn = inspect.unwrap(fn)
+    if isinstance(fn, functools.partial):
+        return _callable_impl(fn.func)
+    if inspect.isfunction(fn) or inspect.ismethod(fn) or inspect.isasyncgenfunction(fn):
+        return fn
+    call = getattr(fn, "__call__", None)
+    return inspect.unwrap(call) if call is not None else fn
 
 
 # Module-level singleton used to signal end-of-input through Channel's
@@ -52,8 +86,7 @@ class Channel(AsyncIterator[In], Generic[In]):
     """User-pushed async channel for bidi inputs.
 
     Satisfies `AsyncIterator[I]` — `Channel[T]` as a bidi callable's
-    parameter annotation is what marks the call as bidi (see
-    `agentix.runtime.invoke.detect_declared_shape`). The caller pushes items with
+    parameter annotation is what marks the call as bidi. The caller pushes items with
     `await ch.send(item)`; `await ch.close()` signals end-of-input.
     Items are delivered FIFO. `maxsize` bounds the local buffer;
     when full, `.send()` awaits until consumers (the framework's
@@ -126,5 +159,6 @@ RemoteCall: TypeAlias = Unary[R] | Stream[R] | Bidi[Any, R]
 
 __all__ = [
     "Bidi", "Channel", "RemoteCall", "Stream", "Unary",
+    "detect_declared_shape",
     "is_channel_annotation",
 ]

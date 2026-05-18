@@ -30,7 +30,7 @@ The PyPI distribution is named `agentixx`; the import package is
 ## Run the Runtime Locally
 
 You can run the runtime server without Docker while iterating on client,
-server, worker, or invoke code.
+server, or worker code.
 
 ```bash
 agentix-server
@@ -98,12 +98,11 @@ pytest -x
 
 | Path | Purpose |
 | --- | --- |
-| `agentix/invoke` | Function binding, shape detection, validation, invocation |
 | `agentix/runtime/shared` | Wire types, msgpack codec, Socket.IO event names |
 | `agentix/runtime/client` | `RuntimeClient` and transport behavior |
-| `agentix/runtime/server` | FastAPI app, Socket.IO handlers, worker client, worker process |
+| `agentix/runtime/server` | FastAPI app, Socket.IO handlers, worker client, worker process, callable invocation |
 | `agentix/deployment` | Deployment protocol and backend discovery |
-| `agentix/cli` | Build and deploy commands |
+| `agentix/cli` | Build command |
 
 ## Design Rules
 

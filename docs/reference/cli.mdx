@@ -1,18 +1,16 @@
 ---
 title: CLI reference
-description: Build bundle images and deploy them as sandboxes.
+description: Build bundle images.
 ---
 
-The Agentix CLI has two verbs:
+The Agentix CLI has one verb:
 
 - `agentix build` turns a Python project into a deploy-ready runtime
   image.
-- `agentix deploy` starts that image through a deployment backend.
 
 ```bash
 agentix --help
 agentix build --help
-agentix deploy --help
 ```
 
 ## `agentix build`
@@ -68,30 +66,6 @@ agentix build . --dry-run
 Dry run stages the generated Dockerfile and copied project tree under
 `./build/<tag>/`, prints what would be built, and exits without invoking
 Docker.
-
-## `agentix deploy`
-
-Provision a sandbox from a bundle image.
-
-```bash
-agentix deploy <backend> --image <tag>
-agentix deploy local --image my-rollout:0.1.0
-agentix deploy local --image my-rollout:0.1.0 --detach
-```
-
-`<backend>` is any installed deployment plugin registered in the
-`agentix.deployment` entry point group. The local Docker backend ships in
-`agentix-deployment-docker`.
-
-| Option | Meaning |
-| --- | --- |
-| `backend` | Deployment backend name such as `local` |
-| `--image` | Bundle image tag to start |
-| `--detach` | Exit after `create()`; the sandbox keeps running |
-
-Foreground mode prints the runtime URL, waits for Ctrl-C, and deletes the
-sandbox. Detached mode exits after creation and prints the sandbox
-handle.
 
 ## Configuration
 
