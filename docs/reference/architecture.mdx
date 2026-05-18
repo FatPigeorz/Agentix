@@ -1,51 +1,94 @@
 ---
 title: Architecture
-description: How bundle dependencies and remote calls fit together.
+description: The client, runtime server, worker, bundle, and wire protocol in one view.
 ---
 
-Agentix has two core pieces:
+Agentix is built around a small execution loop:
 
-1. **Bundle** builds one runtime image containing user code,
-   integrations, Python dependencies, and optional system binaries.
-2. **Remote calls** run installed functions inside that image with
-   `RuntimeClient.remote(fn, ...)`.
+```text
+Host Python
+  RuntimeClient.remote(fn, ...)
+        |
+        v
+Sandbox runtime server
+  HTTP or Socket.IO endpoint
+        |
+        v
+Worker subprocess
+  import module
+  validate args
+  call function
+  encode result
+```
 
-Bundle decides what code exists in the sandbox. `client.remote(fn, ...)`
-chooses which installed function to call.
+Everything else supports that loop.
 
-## User Model
+## Systems
 
-Pass a normal imported function:
+| System | Responsibility |
+| --- | --- |
+| `agentix.invoke` | Resolve target functions, detect call shapes, bind and validate args, serialize outputs |
+| `agentix.runtime.shared` | Wire models, msgpack codec, framing, Socket.IO event names |
+| `agentix.runtime.client` | `RuntimeClient.remote(fn, ...)` and transport-specific client behavior |
+| `agentix.runtime.server` | FastAPI and Socket.IO server, worker process management, call correlation |
+| `agentix.deployment` | Host-side sandbox lifecycle protocol and backend plugin lookup |
+| `agentix.cli` | `agentix build` and `agentix deploy` |
+
+## Remote Target
+
+The caller passes a normal imported function:
 
 ```python
-from agentix import RuntimeClient
 from app import run
 
-async with RuntimeClient(sandbox.runtime_url) as client:
-    result = await client.remote(run, input="hello")
+result = await client.remote(run, input="hello")
 ```
 
-Importing the module first also works:
+The client builds the target string from the function object:
 
 ```python
-import app
-
-result = await client.remote(app.run, input="hello")
+target = f"{run.__module__}::{run.__name__}"
 ```
 
-## Bundle
+The runtime worker splits the target, imports the module inside the
+sandbox, resolves the function by name, and invokes it.
 
-`agentix build [path]` installs the project into the runtime venv:
+## Call Flow
+
+```text
+1. Host imports `app.run`.
+2. Host calls `client.remote(run, input="hello")`.
+3. Client inspects the signature and detects unary, stream, or bidi.
+4. Client encodes args and kwargs with the shared codec.
+5. Runtime server receives the call.
+6. Server forwards the request to the worker subprocess.
+7. Worker imports `app`, resolves `run`, validates args, and calls it.
+8. Worker encodes the return value or stream item.
+9. Client decodes the result into the function's annotated return type.
+```
+
+## Transports
+
+| Call shape | Function shape | Transport | Client behavior |
+| --- | --- | --- | --- |
+| Unary | `async def f(...) -> T` or sync `def f(...) -> T` | HTTP `POST /_remote` | `await client.remote(f, ...)` |
+| Stream | `async def f(...) -> AsyncIterator[T]` | Socket.IO | `async for item in client.remote(f, ...)` |
+| Bidi | `async def f(..., inbox: Channel[I]) -> AsyncIterator[T]` | Socket.IO | send through `Channel`, receive with `async for` |
+
+Unary responses are msgpack RPC envelopes with either `value` or
+`error`. Stream and bidi calls emit item, end, and error events keyed by
+`call_id`.
+
+## Bundle Layout
+
+`agentix build [path]` installs one Python project into the runtime venv:
 
 ```bash
 /nix/runtime/bin/pip install --no-cache-dir /src/project
 ```
 
-That install brings in the user project, direct dependencies,
-transitive dependencies, and integration modules declared in
-`pyproject.toml`.
-
-Runtime layout:
+The install brings in user code, direct dependencies, transitive
+dependencies, and integration packages declared in `pyproject.toml`.
 
 ```text
 /nix/runtime/
@@ -60,80 +103,46 @@ Runtime layout:
     └── app.py
 ```
 
-If the project includes `default.nix`, `agentix build` adds a Nix
-builder stage and symlinks the derivation's `bin/*` into
-`/nix/runtime/bin/`. Worker subprocesses use:
+If the project includes `default.nix`, the build adds a Nix builder stage
+and links binaries into `/nix/runtime/bin`.
+
+## Worker Model
+
+The runtime server owns one worker subprocess. The worker handles remote
+function invocation and keeps the runtime server isolated from user code.
+
+For each target, the worker prepares and caches invocation metadata:
+
+- module import
+- function lookup
+- signature inspection
+- pydantic argument adapters
+- return-value serialization metadata
+
+The worker uses the same `/nix/runtime` environment as the runtime
+server, so anything installed into the bundle can be imported on demand.
+
+## Deployment Boundary
+
+Deployments are host-side plugins that start bundle images. They return a
+`runtime_url`; after that, the runtime protocol is the same regardless of
+where the sandbox is running.
 
 ```text
-/nix/runtime/bin:/usr/local/bin:/usr/bin:/bin
+Deployment.create(SandboxConfig(image="my-rollout:0.1.0"))
+        |
+        v
+Sandbox(runtime_url="http://...")
+        |
+        v
+RuntimeClient(runtime_url)
 ```
-
-## Remote Calls
-
-The client turns the function object into a target string:
-
-```python
-target = f"{fn.__module__}::{fn.__name__}"
-```
-
-Example:
-
-```python
-from agentix.swebench import run
-
-score = await client.remote(run, instance=inst, patch=patch)
-```
-
-Wire payload:
-
-```python
-{
-    "target": "agentix.swebench::run",
-    "args": [],
-    "kwargs": {"instance": inst, "patch": patch},
-}
-```
-
-The runtime worker imports `agentix.swebench` inside the sandbox and
-calls `run(...)`.
-
-Args, kwargs, return values, and stream items travel as msgpack payloads.
-The client uses the local function signature to encode inputs; the
-worker resolves the imported function signature and validates/coerces
-inputs before calling it.
-
-## Flow
-
-```text
-Host
-  RuntimeClient.remote(fn, ...)
-    read fn.__module__ and fn.__name__
-    build "module.path::function_name"
-    detect unary / stream / bidi
-    encode args and kwargs
-      |
-      v
-Sandbox
-  agentix-server
-      |
-      v
-Single runtime worker process
-  import module.path
-  call function_name(*args, **kwargs)
-```
-
-## Call Shapes
-
-| Function shape | Transport | Client usage |
-| --- | --- | --- |
-| normal async function | HTTP `POST /_remote` | `await client.remote(fn, ...)` |
-| async generator | Socket.IO stream | `async for item in client.remote(fn, ...)` |
-| async generator with `Channel[T]` input | Socket.IO bidi | send through `Channel`, receive with `async for` |
 
 ## Mental Model
 
 ```text
 Bundle = what code and dependencies exist in the sandbox
-client.remote(fn) = which installed function to call
-Worker = where the function executes
+Remote call = which installed function to call
+Worker = where user code executes
+Deployment = where the bundle image runs
 ```

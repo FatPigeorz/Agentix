@@ -1,0 +1,107 @@
+---
+title: Bundles
+description: How Agentix packages Python projects into deployable sandbox runtime images.
+---
+
+A bundle is the sandbox's world: your project, Agentix, integration
+packages, transitive Python dependencies, and optional system binaries in
+one runtime image.
+
+`agentix build [path]` takes a normal Python project and produces a
+deploy-ready Docker image.
+
+```bash
+agentix build ./my-rollout -o my-rollout:0.1.0
+```
+
+## What Goes In
+
+Agentix does not maintain a separate plugin manifest. The project's
+`pyproject.toml` is the manifest.
+
+```toml
+[project]
+name = "my-rollout"
+version = "0.1.0"
+dependencies = [
+    "agentixx>=0.1.0",
+    "agentix-runtime-basic>=0.1.0",
+    "agentix-claude-code>=0.1.0",
+    "agentix-swebench>=0.1.0",
+]
+```
+
+During the build, Agentix copies the project into the image and runs one
+install into the runtime environment:
+
+```bash
+/nix/runtime/bin/pip install --no-cache-dir /src/project
+```
+
+That single install brings in user code, direct dependencies,
+transitive dependencies, and integration modules such as `agentix.bash`
+or `agentix.swebench`.
+
+## Runtime Layout
+
+```text
+/nix/runtime/
+├── bin/
+│   ├── python
+│   ├── pip
+│   └── agentix-server
+└── lib/python3.11/site-packages/
+    ├── agentix/
+    ├── agentix/bash/
+    ├── agentix/swebench/
+    └── app.py
+```
+
+The runtime server and worker use this same environment. If the worker
+can import a module from that environment, the host can call it with
+`client.remote(fn, ...)`.
+
+## System Binaries
+
+If the project root includes `default.nix`, `agentix build` adds a Nix
+builder stage. The derivation closure is copied into the final image,
+and binaries are linked under `/nix/runtime/bin`.
+
+Worker subprocesses use this PATH:
+
+```text
+/nix/runtime/bin:/usr/local/bin:/usr/bin:/bin
+```
+
+That is how CLI wrappers can call tools by name:
+
+```python
+await asyncio.create_subprocess_exec("git", "status")
+await asyncio.create_subprocess_exec("claude", "-p", instruction)
+```
+
+## Bundles Compose Integrations
+
+Agent wrappers, dataset scorers, sandbox primitives, and application code
+are all normal Python packages. A rollout bundle chooses which packages
+coexist in one sandbox.
+
+| Package type | Example | Why include it |
+| --- | --- | --- |
+| Framework | `agentixx` | Runtime client/server protocol and worker invocation |
+| Primitive | `agentix-runtime-basic` | Shell and file operations in the sandbox |
+| Agent wrapper | `agentix-claude-code` | CLI execution behind a typed Python function |
+| Scorer wrapper | `agentix-swebench` | Benchmark grading behind a typed Python function |
+| User project | `my-rollout` | Orchestration-specific functions and dependencies |
+
+## Mental Model
+
+```text
+Bundle = what exists in the sandbox
+Remote call = which installed function runs
+Deployment = where the image is started
+```
+
+Keep those concerns separate and the same integration can move from a
+local smoke test to a larger rollout system without changing its Python
+API.

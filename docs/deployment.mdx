@@ -1,87 +1,117 @@
 ---
-title: Deployment
-description: Host-side backend that provisions sandboxes — pick one with `agentix deploy <name>`.
+title: Deployments
+description: Start bundle images as sandboxes and hand RuntimeClient a runtime URL.
 ---
 
-A **deployment** is a host-side backend that provisions sandboxes. The
-user picks one with `agentix deploy <name> --image …`; in code, you
-instantiate the class and pass it to `session(...)`.
-`pip install agentix-deployment-docker` provides `local`; other
-backend packages provide their own names. `pip install
-agentix-deployment-*` adds another.
+A deployment backend answers one question: where should this bundle image
+run?
 
-## Using one
+Remote calls decide which function runs. Bundles decide what code exists
+in the sandbox. Deployments decide where the image is started and how it
+is cleaned up.
 
-<Tabs>
-  <Tab title="CLI">
-    ```bash
-    agentix deploy local --image my-agent:0.1.0
-    agentix deploy fly   --image my-agent:0.1.0    # after `pip install agentix-deployment-fly`
-    ```
-  </Tab>
-  <Tab title="Code">
-    ```python
-    from agentix import RuntimeClient
-    from agentix.deployment.base import SandboxConfig, session
-    from agentix.deployment.docker import DockerDeployment
+## Use a Backend
 
-    deployment = DockerDeployment()
-    config = SandboxConfig(image="my-agent:0.1.0")
-    async with session(deployment, config) as sandbox:
-        async with RuntimeClient(sandbox.runtime_url) as c:
-            ...
-    ```
-  </Tab>
-</Tabs>
+The Docker backend is the local development path:
 
-`session(deployment, config)` creates the sandbox on entry and deletes
-it on exit.
+```bash
+pip install agentix-deployment-docker
+agentix deploy local --image my-rollout:0.1.0
+```
 
-## Writing one
+In code, create a deployment, pass a `SandboxConfig`, and use the
+returned `runtime_url` with `RuntimeClient`.
 
-A deployment backend is a class that implements three methods. No
-inheritance — the framework uses structural typing.
+```python
+from agentix import RuntimeClient
+from agentix.deployment.base import SandboxConfig, session
+from agentix.deployment.docker import DockerDeployment
 
-<Tabs>
-  <Tab title="Plugin source">
-    ```python title="my_deploy/__init__.py"
-    import os
-    from agentix.deployment.base import Sandbox, SandboxConfig, SandboxId, SandboxInfo
+deployment = DockerDeployment()
+config = SandboxConfig(image="my-rollout:0.1.0")
 
-    class FlyDeployment:
-        def __init__(self) -> None:
-            # Backends take NO constructor args — read config from env.
-            self._token = os.environ["FLY_API_TOKEN"]
+async with session(deployment, config) as sandbox:
+    async with RuntimeClient(sandbox.runtime_url) as client:
+        ...
+```
 
-        async def create(self, config: SandboxConfig) -> Sandbox: ...
-        async def delete(self, sandbox_id: SandboxId) -> None: ...
-        async def get(self, sandbox_id: SandboxId) -> SandboxInfo: ...
-    ```
-  </Tab>
-  <Tab title="pyproject.toml">
-    ```toml
-    [project]
-    name = "agentix-deployment-fly"
-    version = "0.1.0"
+`session(...)` creates the sandbox on entry and deletes it on exit.
 
-    [project.entry-points."agentix.deployment"]
-    fly = "my_deploy:FlyDeployment"
-    ```
-  </Tab>
-</Tabs>
+## CLI Shape
 
-After `pip install`, `agentix deploy fly --image my-agent:0.1.0` works
-with no framework changes.
+```bash
+agentix deploy <backend> --image <tag>
+agentix deploy local --image my-rollout:0.1.0
+agentix deploy local --image my-rollout:0.1.0 --detach
+```
+
+Foreground mode prints the runtime URL and tears the sandbox down on
+Ctrl-C. Detached mode creates the sandbox and exits after printing the
+handle.
+
+## Backend Plugins
+
+Deployment packages register classes in the `agentix.deployment` entry
+point group.
+
+```toml title="pyproject.toml"
+[project]
+name = "agentix-deployment-fly"
+version = "0.1.0"
+
+[project.entry-points."agentix.deployment"]
+fly = "my_deploy:FlyDeployment"
+```
+
+After installation, the backend name becomes available to the CLI:
+
+```bash
+pip install agentix-deployment-fly
+agentix deploy fly --image my-rollout:0.1.0
+```
+
+## Backend Protocol
+
+Backends are structural. They do not inherit a base class; they implement
+three async methods.
+
+```python title="my_deploy/__init__.py"
+import os
+
+from agentix.deployment.base import Sandbox, SandboxConfig, SandboxId, SandboxInfo
+
+
+class FlyDeployment:
+    def __init__(self) -> None:
+        self._token = os.environ["FLY_API_TOKEN"]
+
+    async def create(self, config: SandboxConfig) -> Sandbox:
+        ...
+
+    async def delete(self, sandbox_id: SandboxId) -> None:
+        ...
+
+    async def get(self, sandbox_id: SandboxId) -> SandboxInfo:
+        ...
+```
+
+Backend constructors take no arguments. Read API keys, regions, and
+templates from environment variables so CLI and code paths behave the
+same way.
 
 ## Configuration
 
-Backend config reads from environment variables:
+| Variable | Used by | Purpose |
+| --- | --- | --- |
+| `AGENTIX_BIND_PORT` | runtime server | Sandbox-side bind port, default `8000` |
+| `DAYTONA_API_KEY` | `daytona` backend | API authentication |
+| `E2B_API_KEY` / `E2B_TEMPLATE_ID` | `e2b` backend | API authentication and template selection |
 
-| Variable                          | Used by              | Purpose                                  |
-| --------------------------------- | -------------------- | ---------------------------------------- |
-| `DAYTONA_API_KEY`                 | `daytona`            | API auth                                 |
-| `E2B_API_KEY` / `E2B_TEMPLATE_ID` | `e2b`                | API auth + template                      |
-| `AGENTIX_BIND_PORT`               | runtime server       | Bind port (default 8000)                 |
+Fail fast in `__init__` when required configuration is missing. The
+error should surface before the backend starts creating infrastructure.
 
-Read env vars in `__init__` and fail fast if any are missing — the
-error surfaces at CLI time instead of inside the first `create()`.
+## Boundary
+
+Deployment backends should not know about agent wrappers, dataset
+scorers, or remote-call targets. They only start bundle images and return
+the runtime endpoint.

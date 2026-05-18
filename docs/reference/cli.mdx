@@ -1,82 +1,110 @@
 ---
 title: CLI reference
-description: "Every agentix subcommand: build and deploy."
+description: Build bundle images and deploy them as sandboxes.
 ---
+
+The Agentix CLI has two verbs:
+
+- `agentix build` turns a Python project into a deploy-ready runtime
+  image.
+- `agentix deploy` starts that image through a deployment backend.
 
 ```bash
 agentix --help
+agentix build --help
+agentix deploy --help
 ```
 
 ## `agentix build`
 
-Package one project root into a deploy-ready sandbox image. Plugins
-arrive transitively via the project's `[project].dependencies` — the
-CLI never enumerates them.
+Package one project root into a bundle image.
 
 ```bash
-agentix build                                # current directory's pyproject
-agentix build path/to/project                # explicit project root
-agentix build . -o my-agent:0.1.0            # explicit image tag
-agentix build . --dry-run                    # stage Dockerfile, no docker invoke
-agentix build . --runtime-image agentix/runtime:0.2.0   # different base
+agentix build
+agentix build path/to/project
+agentix build . -o my-rollout:0.1.0
+agentix build . --dry-run
+agentix build . --runtime-image agentix/runtime:0.2.0
 ```
 
-The positional arg is a path to a directory containing `pyproject.toml`.
-Whatever that project's `[project].dependencies` resolves to via pip
-ends up in the bundle's `/nix/runtime/` venv; at runtime the framework
-imports target modules by their Python path on first remote call.
-Multi-plugin bundles are expressed by declaring multiple `agentix-*`
-dists as deps:
+The project root must contain `pyproject.toml`. The default image tag is
+derived from `[project].name` and `[project].version`; `-o`, `--output`,
+or `--tag` overrides it.
 
-```toml
-# my-agent/pyproject.toml
+| Option | Meaning |
+| --- | --- |
+| `path` | Project root, default `.` |
+| `-o`, `--output`, `--tag` | Output image tag, must include `:<version>` |
+| `--runtime-image` | Base runtime image to extend |
+| `--dry-run` | Stage the Dockerfile and build context without running Docker |
+
+### Dependency Model
+
+The CLI never enumerates integrations. It installs the project into the
+runtime venv, and pip resolves everything declared by the project.
+
+```toml title="pyproject.toml"
 [project]
-name = "my-agent"
+name = "my-rollout"
 version = "0.1.0"
 dependencies = [
     "agentixx>=0.1.0",
-    "agentix-runtime-basic>=0.1.0",  # bash + files
-    "agentix-claude-code>=0.1.0",    # claude CLI
-    "agentix-swebench>=0.1.0",       # scoring
+    "agentix-runtime-basic>=0.1.0",
+    "agentix-claude-code>=0.1.0",
+    "agentix-swebench>=0.1.0",
 ]
 ```
 
-Then `agentix build` from the project dir builds the multi-plugin image.
+That project builds one image containing the framework, sandbox
+primitives, the agent wrapper, the scorer wrapper, transitive deps, and
+the project itself.
 
-`-o / --output / --tag` overrides the default `<name>:<version>` image
-tag from the pyproject. `--dry-run` stages the Dockerfile to
-`./build/<short>/` and exits without invoking docker.
+### Dry Run
+
+```bash
+agentix build . --dry-run
+```
+
+Dry run stages the generated Dockerfile and copied project tree under
+`./build/<tag>/`, prints what would be built, and exits without invoking
+Docker.
 
 ## `agentix deploy`
 
-Provision a sandbox.
+Provision a sandbox from a bundle image.
 
 ```bash
 agentix deploy <backend> --image <tag>
-agentix deploy local --image my-agent:0.1.0
-agentix deploy local --image my-agent:0.1.0 --detach
-agentix deploy daytona --image docker.io/me/my-agent:0.1.0    # currently NotImplementedError
+agentix deploy local --image my-rollout:0.1.0
+agentix deploy local --image my-rollout:0.1.0 --detach
 ```
 
-`<backend>` is any registered `agentix.deployment` plugin. The local
-Docker backend ships in `agentix-deployment-docker`; Daytona, E2B, and
-third-party backends ship as their own packages.
+`<backend>` is any installed deployment plugin registered in the
+`agentix.deployment` entry point group. The local Docker backend ships in
+`agentix-deployment-docker`.
 
-Foreground by default: prints `runtime_url`, waits for Ctrl-C, tears
-the sandbox down. `--detach` exits after `create()` and prints the
+| Option | Meaning |
+| --- | --- |
+| `backend` | Deployment backend name such as `local` |
+| `--image` | Bundle image tag to start |
+| `--detach` | Exit after `create()`; the sandbox keeps running |
+
+Foreground mode prints the runtime URL, waits for Ctrl-C, and deletes the
+sandbox. Detached mode exits after creation and prints the sandbox
 handle.
 
 ## Configuration
 
-Most config reads from environment variables.
+Most configuration is environment-driven so CLI and code paths stay the
+same.
 
-| Variable                          | Used by                    | Purpose                                |
-| --------------------------------- | -------------------------- | -------------------------------------- |
-| `AGENTIX_BIND_PORT`               | runtime server             | Bind port (default 8000)               |
-| `AGENTIX_UPLOAD_ROOT`             | `agentix.files` module     | Sandbox-side root for file I/O         |
-| `DAYTONA_API_KEY`                 | `daytona` deployment       | API auth                               |
-| `E2B_API_KEY` / `E2B_TEMPLATE_ID` | `e2b` deployment           | API auth + template                    |
+| Variable | Used by | Purpose |
+| --- | --- | --- |
+| `AGENTIX_BIND_PORT` | runtime server | Sandbox-side bind port, default `8000` |
+| `AGENTIX_UPLOAD_ROOT` | file primitive packages | Sandbox-side root for file operations |
+| `DAYTONA_API_KEY` | `daytona` backend | API authentication |
+| `E2B_API_KEY` / `E2B_TEMPLATE_ID` | `e2b` backend | API authentication and template selection |
 
-Third parties that want their own top-level verb should ship a
-separate `console_scripts` binary (`agentix-yourcmd`) rather than
-registering against the central CLI.
+Third-party packages that need their own top-level workflow should ship a
+separate console script such as `agentix-yourcmd` instead of expanding the
+core CLI.

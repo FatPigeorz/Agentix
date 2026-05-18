@@ -1,120 +1,156 @@
 ---
-title: Quick start
-description: Install Agentix, deploy a rollout container, and call sandboxed Python from the host.
+title: Quickstart
+description: Build a tiny Python bundle, deploy it in Docker, and call it with RuntimeClient.remote.
 ---
+
+This quickstart builds the smallest useful Agentix flow:
+
+1. Create a normal Python package with one async function.
+2. Build it into a sandbox image with `agentix build`.
+3. Start a local Docker sandbox.
+4. Call the function from host-side Python with `RuntimeClient.remote`.
 
 ## Prerequisites
 
 - Python 3.11 or newer
-- Docker (for the `local` deployment)
-
-This quickstart proves the smallest Agentix bridge: host-side Python
-calls a sandboxed module as if it were a local typed function.
+- Docker
+- An Agentix runtime base image such as `agentix/runtime:0.1.0` available
+  locally or in your registry
 
 ## Install
+
+Install the host-side framework and the Docker deployment backend:
 
 <Tabs>
   <Tab title="pip">
     ```bash
-    pip install agentixx agentix-runtime-basic agentix-deployment-docker
+    pip install agentixx agentix-deployment-docker
     ```
   </Tab>
   <Tab title="uv">
     ```bash
-    uv add agentixx agentix-runtime-basic agentix-deployment-docker
+    uv add agentixx agentix-deployment-docker
     ```
   </Tab>
   <Tab title="From source">
     ```bash
     git clone https://github.com/Agentiix/Agentix
-    cd Agentix && pip install -e '.[dev]'
-    pip install -e ../Agentix-Runtime-Basic
+    cd Agentix
+    pip install -e '.[dev]'
+    pip install -e ../Agentix-Deployment-Docker
     ```
   </Tab>
 </Tabs>
 
-## Call a module
+If your remote function imports sandbox primitives such as `agentix.bash`,
+also install and declare `agentix-runtime-basic`.
 
-```python title="hello_sandbox.py"
-import asyncio
-from agentix import RuntimeClient
-from agentix.bash import run
-from agentix.deployment.base import SandboxConfig, session
-from agentix.deployment.docker import DockerDeployment
+## Create a Remote Target
 
-async def main():
-    deployment = DockerDeployment()
-    config = SandboxConfig(image="my-bash:0.1.0")   # produced by `agentix build path/to/my-project`
-    async with session(deployment, config) as sandbox:
-        async with RuntimeClient(sandbox.runtime_url) as c:
-            r = await c.remote(run, command="echo hi")
-            print(r.stdout)   # → "hi\n"
-
-asyncio.run(main())
-```
-
-```bash
-python hello_sandbox.py
-# → hi
-```
-
-First run pulls the bundle image (~30 s). Subsequent sandboxes start
-in ~100 ms.
-
-## Write your own target
+Create a package that exposes one function. There is no base class,
+registration hook, or framework marker.
 
 <Tabs>
-  <Tab title="Source">
-    ```python title="src/agentix/myagent/__init__.py"
-    async def run(instruction: str) -> str:
-        return f"did: {instruction}"
+  <Tab title="src/hello_agentix/__init__.py">
+    ```python
+    async def run(input: str) -> str:
+        return f"sandbox saw: {input}"
     ```
   </Tab>
   <Tab title="pyproject.toml">
     ```toml
     [project]
-    name = "agentix-myagent"
+    name = "hello-agentix"
     version = "0.1.0"
+    requires-python = ">=3.11"
+    dependencies = ["agentixx>=0.1.0"]
+
+    [build-system]
+    requires = ["hatchling"]
+    build-backend = "hatchling.build"
 
     [tool.hatch.build.targets.wheel]
-    packages = ["src/agentix"]
+    packages = ["src/hello_agentix"]
     ```
   </Tab>
   <Tab title="Layout">
     ```text
-    my-agent/
+    hello-agentix/
     ├── pyproject.toml
     └── src/
-        └── agentix/
-            └── myagent/
-                └── __init__.py
+        └── hello_agentix/
+            └── __init__.py
     ```
   </Tab>
 </Tabs>
 
+Install the package locally too. The caller imports the same function
+object it will ask the sandbox to run.
+
 ```bash
-agentix build ./my-agent                           # → myagent:0.1.0
-agentix deploy local --image myagent:0.1.0
+pip install -e ./hello-agentix
 ```
 
-Bundling several plugins? Declare them in a project's `pyproject.toml`
-under `[project].dependencies` and `agentix build` that project — pip
-resolves transitively.
+## Build the Bundle
 
-`pip install agentix-myagent` is everything your users need.
-`from agentix.myagent import run` resolves natively in their code.
-`c.remote(run, ...)` sends `agentix.myagent::run` to the runtime.
+`agentix build` installs the project and its dependencies into one image.
+
+```bash
+agentix build ./hello-agentix -o hello-agentix:0.1.0
+```
+
+If your project has a `default.nix`, Agentix adds a Nix builder stage and
+links the derivation's binaries into the final image under
+`/nix/runtime/bin`.
+
+## Call It
+
+Deploy the image with the Docker backend, then call the remote function.
+
+```python title="call_hello.py"
+import asyncio
+
+from agentix import RuntimeClient
+from agentix.deployment.base import SandboxConfig, session
+from agentix.deployment.docker import DockerDeployment
+from hello_agentix import run
+
+
+async def main() -> None:
+    deployment = DockerDeployment()
+    config = SandboxConfig(image="hello-agentix:0.1.0")
+
+    async with session(deployment, config) as sandbox:
+        async with RuntimeClient(sandbox.runtime_url) as client:
+            result = await client.remote(run, input="hello")
+            print(result)
+
+
+asyncio.run(main())
+```
+
+```bash
+python call_hello.py
+# sandbox saw: hello
+```
+
+The client sends the target `hello_agentix::run` to the runtime worker.
+The worker imports `hello_agentix`, validates the kwargs against
+`run`'s signature, calls it, and returns the decoded `str`.
 
 ## Next
 
 <CardGroup cols={2}>
-  <Card title="Integrate an agent" icon="robot" href="/integrate-agent">
-    Wrap an agent CLI as a Python module.
+  <Card title="Integrate an Agent" icon="robot" href="/integrate-agent">
+    Wrap an agent CLI as a typed Python function.
+  </Card>
+  <Card title="Integrate a Dataset" icon="check" href="/integrate-dataset">
+    Expose a benchmark scorer as one narrow remote call.
   </Card>
   <Card title="Architecture" icon="sitemap" href="/reference/architecture">
-    Bundle dependencies, remote calls, worker process.
+    See how bundles, workers, and transports fit together.
   </Card>
-  <Card title="CLI reference" icon="terminal" href="/reference/cli">
-    `agentix build`, `deploy`.
+  <Card title="CLI Reference" icon="terminal" href="/reference/cli">
+    Review every `agentix build` and `agentix deploy` option.
   </Card>
 </CardGroup>

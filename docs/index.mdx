@@ -1,46 +1,89 @@
 ---
 title: Agentix
-description: The execution and integration bridge between agents and evaluation infrastructure.
+description: Sandboxed rollouts you call like typed Python.
 ---
 
-**Agentix is the bridge between agents and the infrastructure around
-them.** It runs agent CLIs and Python frameworks inside isolated
-rollout containers and exposes them as typed Python functions for
-evaluators, trainers, and orchestration code.
+Ship agents like software. Run them like experiments.
 
-Use the same bridge for Claude Code, Codex, Aider, mini-swe-agent,
-OpenHands, your own agent, SWE-bench, internal benchmarks, and RL
-post-training. Each agent, dataset, or tool is a normal Python module;
-Agentix calls it across the host-to-container boundary.
+Agentix turns any importable Python function into a sandboxed rollout
+primitive. Your trainer, evaluator, or orchestration script passes a
+function object. Agentix runs that function inside an isolated runtime
+image and gives the typed result back.
+
+```python
+from agentix import RuntimeClient
+from app import run
+
+async with RuntimeClient(sandbox.runtime_url) as client:
+    result = await client.remote(run, input="hello")
+```
+
+The unit of composition is not a custom runner. It is a function.
+
+## The Core Idea
+
+Agentix keeps the execution layer deliberately small:
+
+- **Remote calls** run an installed function inside a sandbox worker.
+  `client.remote(fn, ...)` derives the target from `fn.__module__` and
+  `fn.__name__`, validates inputs from the signature, and decodes the
+  annotated return type.
+- **Bundles** package one Python project and its declared dependencies
+  into a deploy-ready image. Agents, tools, benchmark scorers, and user
+  code are just packages in the same runtime venv.
 
 <CardGroup cols={2}>
-  <Card title="Run agents" icon="robot" href="/integrate-agent">
-    Wrap a CLI or Python framework as a typed Python module.
+  <Card title="Remote Calls" icon="bolt" href="/concepts/remote-calls">
+    Call sandbox code with ordinary Python functions instead of bespoke RPC clients.
   </Card>
-  <Card title="Score rollouts" icon="check" href="/integrate-dataset">
-    Keep benchmark scorers separate from agents so both sides stay swappable.
+  <Card title="Bundles" icon="box" href="/concepts/bundles">
+    Build a reproducible runtime image from `pyproject.toml` dependencies.
   </Card>
-  <Card title="Feed RL" icon="diagram-project" href="/integrate-agent">
-    Compose rollout execution through one typed remote-call path.
+  <Card title="Deployments" icon="server" href="/deployment">
+    Run the same bundle through local Docker or a deployment backend plugin.
   </Card>
-  <Card title="Deploy anywhere" icon="server" href="/deployment">
-    Start with Docker, then move the same bundle to hosted backends.
+  <Card title="Integrations" icon="puzzle-piece" href="/integrate-agent">
+    Wrap an agent CLI, benchmark harness, or internal tool as a narrow Python API.
   </Card>
 </CardGroup>
 
-## What It Bridges
+## Why This Matters
 
-| From | Through Agentix | To |
+Agent work tends to sprawl: each agent CLI, benchmark harness, sandbox
+provider, and training loop grows its own adapter. Agentix collapses that
+matrix into one rule: if it is installed in the bundle and importable by
+Python, the host can call it.
+
+| You have | You expose | You call |
 | --- | --- | --- |
-| Agent CLIs and Python frameworks | One worker subprocess and typed remote calls | Evaluators, trainers, and orchestration code |
-| Shell, file, and tool operations | Shared rollout container surface | Agents and benchmark harnesses |
-| Rollout metadata | User-provided call IDs and companion trace bridges | Observability, reward, replay, and dataset pipelines |
+| Claude Code, Codex, Aider, OpenHands, or an internal agent | `async def run(...) -> RunResult` | `await client.remote(run, ...)` |
+| Bash, file operations, repo setup, or local tools | `async def run(command: str) -> BashResult` | `await client.remote(bash_run, ...)` |
+| SWE-bench, MLE-Bench, or an internal evaluator | `async def score(...) -> Score` | `await client.remote(score, ...)` |
+| A streaming agent or interactive tool | `async def run_stream(...) -> AsyncIterator[Event]` | `async for event in client.remote(run_stream, ...)` |
 
-## A Rollout Is Just Python
+## Where It Sits
 
-This SWE-bench Verified flow composes three integrations: prepare the
-repo with `bash`, run Claude Code, then score the resulting patch with
-the SWE-bench module.
+```text
+Trainer / evaluator / script
+  imports a function
+  calls RuntimeClient.remote(fn, ...)
+        |
+        v
+Sandbox runtime image
+  imports the same module
+  validates args
+  runs the function in a worker process
+  returns typed values, stream items, or bidi events
+```
+
+The same pattern works for a toy function, a CLI-driven coding agent, a
+benchmark scorer, or a full RL rollout step.
+
+## Example Rollout
+
+This SWE-bench-shaped flow composes three independent packages in one
+sandbox: a shell primitive prepares the repo, an agent wrapper edits it,
+and a scorer wrapper grades the patch.
 
 ```python
 from datasets import load_dataset
@@ -51,80 +94,45 @@ from agentix.swebench import score
 
 inst = dict(load_dataset("princeton-nlp/SWE-bench_Verified", split="test")[0])
 
-async with RuntimeClient(sandbox.runtime_url) as c:
-    await c.remote(
+async with RuntimeClient(sandbox.runtime_url) as client:
+    await client.remote(
         bash_run,
         command=(
             f"git clone https://github.com/{inst['repo']}.git /testbed && "
             f"cd /testbed && git checkout {inst['base_commit']}"
         ),
     )
-    cc = await c.remote(
+
+    await client.remote(
         run_claude,
         instruction=inst["problem_statement"],
         workdir="/testbed",
         env={"ANTHROPIC_API_KEY": api_key},
     )
-    diff = await c.remote(
-        bash_run, command="cd /testbed && git add -A && git diff --cached",
+
+    diff = await client.remote(
+        bash_run,
+        command="cd /testbed && git add -A && git diff --cached --no-color",
     )
-    report = await c.remote(score, instance=inst, patch=diff.stdout)
+    report = await client.remote(score, instance=inst, patch=diff.stdout)
 ```
 
-## Why Teams Use It
-
-- **One bridge, many stacks.** Agents, tools, scorers, and deployment
-  backends plug into the same runtime surface.
-- **Typed remote calls.** `c.remote(fn, ...)` reads the function signature,
-  so kwargs and return types flow into your editor and type checker.
-- **Worker isolation.** Remote functions run in one worker subprocess
-  while sharing the bundle's runtime venv.
-- **Training-ready composition.** Agents, tools, and scorers use the
-  same typed call path, so rollout code can swap pieces without a new
-  runner.
-- **Composable evaluation.** Agent execution and benchmark scoring are
-  separate modules, so you can swap agents, datasets, and backends
-  independently.
-
-## Supported Today
-
-### Agents
-
-- **Claude Code** — [recipe](https://github.com/Agentiix/agentix-cookbook/tree/main/claude-code)
-- CLI binaries (Codex, Aider), Python frameworks
-  ([mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent),
-  [swe-agent](https://github.com/SWE-agent/SWE-agent),
-  [OpenHands](https://github.com/All-Hands-AI/OpenHands)),
-  or your own — wrap with the
-  [agent integration guide](/integrate-agent).
-
-### Benchmarks
-
-- **SWE-bench Verified** — [recipe](https://github.com/Agentiix/agentix-cookbook/tree/main/swebench),
-  built on the official
-  [`swebench`](https://github.com/swe-bench/SWE-bench) package.
-
-### Primitives
-
-- **bash** — shell execution inside the rollout container.
-- **files** — upload, download, and edit files in the rollout container.
-
-### Execution Backends
-
-- `local` (Docker) ships in `agentix-deployment-docker`.
-- `daytona` and `e2b` ship in their deployment packages.
-- Third-party backends — `pip install agentix-deployment-<name>`.
+Agentix does not special-case Claude Code, SWE-bench, or bash. They are
+installed modules with functions the worker can import.
 
 ## Read Next
 
 <CardGroup cols={2}>
-  <Card title="Quick start" icon="rocket" href="/quickstart">
-    Install, deploy a rollout container, call an integration.
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build a tiny bundle, launch it in Docker, and call a remote function.
   </Card>
-  <Card title="Cookbook" icon="book" href="https://github.com/Agentiix/agentix-cookbook">
-    Working integrations for Claude Code and SWE-bench.
+  <Card title="Remote Calls" icon="bolt" href="/concepts/remote-calls">
+    Learn the target string, call shapes, and typing model.
+  </Card>
+  <Card title="Bundles" icon="box" href="/concepts/bundles">
+    See how dependency declarations become runtime images.
   </Card>
   <Card title="Architecture" icon="sitemap" href="/reference/architecture">
-    Runtime server, worker process, bundle dependencies.
+    Follow the request from client to server to worker and back.
   </Card>
 </CardGroup>

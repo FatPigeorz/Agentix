@@ -1,39 +1,60 @@
 ---
 title: Integrate a dataset
-description: Wrap a benchmark or evaluation harness (SWE-bench, MLE-Bench, ...) as a Python module.
+description: Wrap a benchmark harness as a narrow sandboxed scoring function.
 ---
 
-A **dataset** module scores model patches against a benchmark.
-This guide uses SWE-bench Verified as the worked example.
+A dataset integration turns a benchmark harness into a remote scoring
+function. The agent does the work, the scorer judges the result, and the
+caller composes both pieces in one rollout.
 
 ```python
 from agentix.swebench import score
 
-s = await c.remote(score, instance=inst, patch=model_patch)
+report = await client.remote(score, instance=inst, patch=model_patch)
 ```
 
-## 1. Source layout
+This guide uses SWE-bench Verified as the example, but the same shape
+works for internal evals, MLE-Bench-style tasks, or any harness that can
+run inside the sandbox.
+
+## Integration Contract
+
+Keep scorer modules narrow. They should grade an artifact, not own the
+entire rollout.
+
+```python
+async def score(
+    *,
+    instance: dict[str, Any],
+    patch: str,
+    setup_timeout: float = 1800,
+    eval_timeout: float = 1800,
+) -> Score:
+    ...
+```
+
+Dataset enumeration, repo checkout, agent execution, and patch
+extraction stay on the caller side. That separation lets one scorer work
+with many agents.
+
+## 1. Package Layout
 
 ```text
 agentix-swebench/
 ├── pyproject.toml
 └── src/agentix/
     └── swebench/
-        └── __init__.py      # async def score(...), types
+        └── __init__.py
 ```
 
-## 2. Method surface
+## 2. Result Type
 
-Keep the module narrow: one `score` function. Dataset enumeration
-and repo materialisation belong on the caller side
-(`datasets.load_dataset(...)` + `bash.run` to clone).
+Return a type the training or evaluation loop can consume directly.
 
 ```python title="src/agentix/swebench/__init__.py"
 from __future__ import annotations
-import asyncio, os, shutil, subprocess
+
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
 
 
 @dataclass
@@ -45,6 +66,17 @@ class Score:
     pass_to_pass_kept: list[str]
     pass_to_pass_broken: list[str]
     logs: str
+```
+
+The type can be a dataclass or Pydantic model as long as Agentix can
+serialize it through the shared codec.
+
+## 3. Scoring Function
+
+```python title="src/agentix/swebench/__init__.py"
+from __future__ import annotations
+
+from typing import Any
 
 
 async def score(
@@ -55,45 +87,61 @@ async def score(
     eval_timeout: float = 1800,
 ) -> Score:
     """Run the official SWE-bench evaluation against `patch`."""
-    from swebench.harness.test_spec.test_spec import make_test_spec
     from swebench.harness.grading import get_eval_report
-    from swebench.harness.constants import KEY_INSTANCE_ID, KEY_MODEL, KEY_PREDICTION
+    from swebench.harness.test_spec.test_spec import make_test_spec
 
     spec = make_test_spec(instance)
-    # ... set up the per-instance conda env, apply patch + test_patch,
-    # run the eval script, then call get_eval_report(spec, prediction,
-    # log_path, include_tests_status=True) and convert the result to
-    # a Score dataclass.
+
+    # Set up the per-instance environment, apply `patch`, apply the
+    # benchmark's test patch, run the eval script, and parse the logs.
+    # Then convert the official report into the Score dataclass.
+    report = get_eval_report(...)
+    return _to_score(report)
 ```
 
-See [`agentix-cookbook/swebench/swebench.py`](https://github.com/Agentiix/agentix-cookbook/blob/main/swebench/swebench.py)
-for the complete implementation — it leans on the official `swebench`
-package for per-repo test specs, log parsers, and grading.
+The complete implementation is intentionally harness-specific. For
+SWE-bench, lean on the official package for test specs, log parsing, and
+grading instead of reimplementing benchmark rules.
 
-## 3. Packaging
+See
+[`agentix-cookbook/swebench`](https://github.com/Agentiix/agentix-cookbook/tree/main/swebench)
+for a full working scorer.
+
+## 4. Packaging
 
 ```toml title="pyproject.toml"
 [project]
 name = "agentix-swebench"
 version = "0.1.0"
+requires-python = ">=3.11"
 dependencies = ["swebench>=4.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentix"]
 ```
 
-## 4. Sandbox requirements
+When a rollout bundle depends on `agentix-swebench`, the worker can
+import `agentix.swebench` and call `score`.
 
-The official SWE-bench eval scripts assume:
+## 5. Sandbox Requirements
 
-- `bash`, `git`, `curl` on PATH
-- Miniconda at `/opt/miniconda3` (scripts activate per-instance conda
-  envs)
+Benchmark harnesses often assume system tools. SWE-bench commonly needs:
 
-Bake these into the bundle Dockerfile, or point the bundle at
-SWE-bench's per-instance images for full reproducibility.
+- `bash`, `git`, and `curl` on PATH
+- Miniconda or benchmark-specific execution images
+- Enough disk and timeout budget for dependency setup and tests
 
-## Caller flow
+Put those requirements in the bundle's base image, a `default.nix`, or a
+deployment backend that knows how to start benchmark-provided images.
+
+## Caller Flow
+
+The caller owns the rollout choreography. This keeps every part
+swappable: dataset row, repo setup, agent, patch extraction, scorer.
 
 ```python
 from datasets import load_dataset
@@ -104,8 +152,8 @@ from agentix.swebench import score
 
 inst = dict(load_dataset("princeton-nlp/SWE-bench_Verified", split="test")[0])
 
-async with RuntimeClient(sandbox.runtime_url) as c:
-    await c.remote(
+async with RuntimeClient(sandbox.runtime_url) as client:
+    await client.remote(
         bash_run,
         command=(
             f"rm -rf /testbed && "
@@ -113,13 +161,28 @@ async with RuntimeClient(sandbox.runtime_url) as c:
             f"cd /testbed && git checkout {inst['base_commit']}"
         ),
     )
-    cc = await c.remote(
-        run_claude, instruction=inst["problem_statement"],
-        workdir="/testbed", env={"ANTHROPIC_API_KEY": api_key},
+
+    await client.remote(
+        run_claude,
+        instruction=inst["problem_statement"],
+        workdir="/testbed",
+        env={"ANTHROPIC_API_KEY": api_key},
     )
-    diff = await c.remote(
-        bash_run, command="cd /testbed && git add -A && git diff --cached",
+
+    diff = await client.remote(
+        bash_run,
+        command="cd /testbed && git add -A && git diff --cached --no-color",
     )
-    s = await c.remote(score, instance=inst, patch=diff.stdout)
-    print("PASS" if s.resolved else "FAIL", s.fail_to_pass_missing)
+    report = await client.remote(score, instance=inst, patch=diff.stdout)
+
+    print("PASS" if report.resolved else "FAIL")
 ```
+
+## Design Rules
+
+- A scorer grades one artifact and returns structured data.
+- The caller chooses the dataset split and instance.
+- The caller prepares repos and extracts patches with generic primitives.
+- The scorer should reuse official benchmark code whenever possible.
+- Logs should be returned or persisted in a way the rollout system can
+  correlate with the call.

@@ -1,111 +1,115 @@
 ---
 title: Development
-description: Local setup, daily workflow, and how to author a remote function module.
+description: Local setup and workflow for changing Agentix itself.
 ---
+
+This page is for framework development. If you are writing an agent or
+dataset package, start with [integrate an agent](/integrate-agent) or
+[integrate a dataset](/integrate-dataset).
 
 ## Prerequisites
 
-- Python 3.11+
-- [Docker](https://docs.docker.com/get-docker/) — the only host
-  requirement. Nix runs inside the builder stage of
-  [`Agentix-Runtime-Basic/runtime/Dockerfile`](https://github.com/Agentiix/Agentix/tree/master/../Agentix-Runtime-Basic/runtime).
+- Python 3.11 or newer
+- Docker for end-to-end sandbox tests
+- Sibling runtime and deployment repos checked out next to `Agentix/`
+  when testing full rollouts
 
 ## Setup
 
 ```bash
 git clone https://github.com/Agentiix/Agentix.git
 cd Agentix
-pip install -e '.[dev]'                        # fastapi, uvicorn, httpx, pytest, ruff
+pip install -e '.[dev]'
 pip install -e ../Agentix-Runtime-Basic
+pip install -e ../Agentix-Deployment-Docker
 ```
 
-## Daily workflow
+The PyPI distribution is named `agentixx`; the import package is
+`agentix`.
 
-### Run the runtime server locally (no sandbox)
+## Run the Runtime Locally
+
+You can run the runtime server without Docker while iterating on client,
+server, worker, or invoke code.
 
 ```bash
-agentix-server                 # http://localhost:8000
+agentix-server
 agentix-server --port 9000
 ```
 
 The server exposes `/health` and `/_remote`; stream and bidi calls use
-`/socket.io/`. Useful for iterating on the runtime without the Docker
-round-trip; `pip install -e ../Agentix-Runtime-Basic` makes
-`agentix.bash` importable on the next start.
+`/socket.io/`.
 
-### Build the runtime image (once)
+## Build the Runtime Base Image
+
+Bundle images extend a base runtime image. Build it from the sibling
+runtime repo when testing end-to-end locally.
 
 ```bash
 docker build -t agentix/runtime:0.1.0 -f ../Agentix-Runtime-Basic/runtime/Dockerfile .
 ```
 
-This produces the base image every bundle extends. Rebuild
-whenever the framework version bumps.
+Rebuild the base image when runtime code or dependency versions change.
 
-### Build a bundle from a project
+## Build a Bundle
 
 ```bash
-agentix build                                # build the current directory's pyproject
-agentix build path/to/project -o my:dev      # explicit path + tag
+agentix build
+agentix build path/to/project -o my-rollout:dev
+agentix build path/to/project --dry-run
 ```
 
-The bundle image extends the runtime and pip-installs the project +
-every declared `agentix-*` dep into `/nix/runtime/`. If the project
-ships `default.nix`, system binaries from the derivation symlink into
-`/nix/runtime/bin/`. The build CLI never enumerates plugins — they
-arrive transitively via pip from your `[project].dependencies`.
+The build installs the project and its dependency closure into
+`/nix/runtime`. If the project includes `default.nix`, the build also
+splices system binaries into the final image.
 
-### Smoke-test end-to-end in Docker
+## Smoke Test a Sandbox
 
 ```python
 import asyncio
+
 from agentix import RuntimeClient
+from agentix.bash import run
 from agentix.deployment.base import SandboxConfig, session
 from agentix.deployment.docker import DockerDeployment
-from agentix.bash import run
 
-async def main():
+
+async def main() -> None:
     deployment = DockerDeployment()
-    config = SandboxConfig(image="my-sandbox:dev")
-    async with session(deployment, config) as sb:
-        async with RuntimeClient(sb.runtime_url) as c:
-            result = await c.remote(run, command="echo hi")
+    config = SandboxConfig(image="my-rollout:dev")
+
+    async with session(deployment, config) as sandbox:
+        async with RuntimeClient(sandbox.runtime_url) as client:
+            result = await client.remote(run, command="echo hi")
             print(result.stdout)
+
 
 asyncio.run(main())
 ```
 
-### Lint & test
+## Lint and Test
 
 ```bash
 ruff check agentix/ tests/
-pytest                      # unit tests
-pytest -x                   # stop on first failure
+pytest
+pytest -x
 ```
 
-## Adding a remote function module
+## Codebase Map
 
-A remote function module is a normal Python module installed into the
-bundle. The fastest path is to create a small package and expose async
-functions:
+| Path | Purpose |
+| --- | --- |
+| `agentix/invoke` | Function binding, shape detection, validation, invocation |
+| `agentix/runtime/shared` | Wire types, msgpack codec, Socket.IO event names |
+| `agentix/runtime/client` | `RuntimeClient` and transport behavior |
+| `agentix/runtime/server` | FastAPI app, Socket.IO handlers, worker client, worker process |
+| `agentix/deployment` | Deployment protocol and backend discovery |
+| `agentix/cli` | Build and deploy commands |
 
-```bash
-mkdir -p my-agent/src/agentix/myagent
-# edit my-agent/pyproject.toml
-# edit my-agent/src/agentix/myagent/__init__.py
-agentix build my-agent
-```
+## Design Rules
 
-Use it:
-
-```python
-SandboxConfig(image="my-agent:0.1.0")
-```
-
-If your target needs native binaries (claude CLI, git, libffi, ...),
-drop a `default.nix` next to its `pyproject.toml` declaring those deps;
-`agentix build` will splice in a Nix builder stage automatically.
-
-See the [architecture](/reference/architecture) reference for the full
-contract, and [`agentix-runtime-basic`](https://github.com/Agentiix/Agentix-Runtime-Basic)
-for a working in-tree example.
+- Keep the user model centered on `client.remote(fn, ...)`.
+- Keep bundle behavior dependency-driven through `pyproject.toml`.
+- Prefer composition over inheritance outside lifecycle protocols.
+- Do not add compatibility shims for old API shapes unless there is a
+  concrete external constraint.

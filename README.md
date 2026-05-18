@@ -2,206 +2,174 @@
 
 # Agentix
 
-**The bridge between agents, evaluation, RL training, and LLM serving.**
+**Sandboxed rollouts you call like typed Python.**
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+Turn agents, tools, and scorers into importable functions. Package them
+into runtime images. Call them from evaluators, trainers, and orchestration
+code without writing a new runner for every pairing.
+
 [![GitHub Stars](https://img.shields.io/github/stars/Agentiix/Agentix)](https://github.com/Agentiix/Agentix)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Docs](https://img.shields.io/badge/docs-agentiix.github.io-blue)](https://agentiix.github.io/)
 
-[Documentation](https://agentiix.github.io/) | [Supported Integrations](#supported-integrations) | [Cookbook](https://github.com/Agentiix/agentix-cookbook) | [RL Bridge](https://github.com/Agentiix/abridge)
+[Documentation](https://agentiix.github.io/) | [Quickstart](https://agentiix.github.io/quickstart) | [Cookbook](https://github.com/Agentiix/agentix-cookbook) | [Architecture](https://agentiix.github.io/reference/architecture)
 
 </div>
 
-## Overview
+## The 10-Second Model
 
-**Agentix** is the **execution and integration bridge** between agents
-and your RL post-training and evaluation infrastructure. It gives
-trainers, evaluators, and agent builders one typed Python interface for
-running agents, tools, and scorers in isolated rollout containers.
+Agentix has two primitives:
 
-Use it when you need to connect Claude Code, Codex, Aider,
-mini-swe-agent, OpenHands, or an in-house agent to SWE-bench or custom
-evals without writing a bespoke runner for every agent x benchmark x
-training stack.
+- **Remote calls**: `client.remote(fn, *args, **kwargs)` runs an
+  importable Python function inside a sandbox worker. The target is
+  derived from the function object: `fn.__module__ + "::" + fn.__name__`.
+- **Bundles**: `agentix build [path]` packages a Python project and its
+  declared dependencies into a deploy-ready runtime image.
 
-Each agent, dataset, or tool is a regular Python package. Call it from
-your trainer or evaluator with typed remote calls:
-`c.remote(fn, ...)` reads `fn`'s signature, so Pyright can infer return
-types across the host-to-container boundary.
+```python
+from agentix import RuntimeClient
+from app import run
 
-## Why Agentix
+async with RuntimeClient(sandbox.runtime_url) as client:
+    result = await client.remote(run, input="hello")
+```
 
-- **One bridge, many stacks.** Shell commands, agent CLIs, Python
-  frameworks, dataset scorers, and file operations all use the same
-  `RuntimeClient.remote(...)` call path.
-- **Bundle without glue sprawl.** User code and installed integrations
-  are pip-installed into one runtime venv, then remote functions run in
-  one runtime worker subprocess.
-- **Training-friendly calls.** Rollout code can compose agents,
-  shell/file primitives, and scorers through one typed call path; trace
-  capture and LLM proxying live in companion packages and future work.
-- **Benchmarks stay composable.** Agent execution and scoring remain
-  separate Python modules, which makes it easy to swap agents, scorers,
-  and deployment backends independently.
+The unit of composition is not a bespoke benchmark runner or agent
+adapter. It is a Python function.
 
-## What Agentix Bridges
+## Why Agentix Exists
 
-| From | Agentix layer | To |
-|---|---|---|
-| Agent CLIs and Python frameworks | One worker subprocess with typed remote calls | Evaluators, trainers, and orchestration code |
-| Shell, file, and tool operations | Shared rollout container surface | Agents and benchmark harnesses |
-| Rollout metadata | User-provided call IDs and companion trace bridges | Observability, replay, reward, and dataset pipelines |
-| Local and hosted sandboxes | `agentix.deployment` backends | Docker today; Daytona, E2B, and third-party backends as plugins |
+Agent experiments sprawl quickly. One agent needs a CLI wrapper. Another
+needs a Python harness. A benchmark needs repo setup, grading scripts,
+and logs. A training loop needs the same pieces batched across many
+sandboxes.
 
-## Key Features
+Agentix collapses that matrix into one execution contract: if code is
+installed in the bundle and importable by Python, the host can call it.
 
-- **Run any agent in an isolated rollout container.** Bring a CLI
-  binary, a Python framework, or your own package. Cookbook recipe:
-  [Claude Code](https://github.com/Agentiix/agentix-cookbook/tree/main/claude-code).
-- **Score against any benchmark.** Cookbook recipe:
-  [SWE-bench Verified](https://github.com/Agentiix/agentix-cookbook/tree/main/swebench),
-  wrapping the official
-  [`swebench`](https://github.com/swe-bench/SWE-bench) harness's test
-  specs, log parsers, and grading.
-- **Pluggable execution backends.** Install `agentix-deployment-docker`
-  for local Docker, or backend packages for Daytona, E2B, Fly, Modal,
-  Kubernetes via
-  `pip install agentix-deployment-<name>`.
-- **Typed remote calls across the bridge.** Container functions autocomplete
-  like local functions; your editor knows the kwargs and return types.
-  Three call shapes (unary / streaming / bidirectional) are
-  auto-detected from your function signature.
+| You have | You expose | You call |
+| --- | --- | --- |
+| Claude Code, Codex, Aider, OpenHands, or an internal agent | `async def run(...) -> RunResult` | `await client.remote(run, ...)` |
+| Shell, files, repo setup, or local tools | `async def run(command: str) -> BashResult` | `await client.remote(bash_run, ...)` |
+| SWE-bench, MLE-Bench, or an internal evaluator | `async def score(...) -> Score` | `await client.remote(score, ...)` |
+| Streaming or interactive workflows | `async def stream(...) -> AsyncIterator[Event]` | `async for event in client.remote(stream, ...)` |
 
-## Supported Integrations
+## What Ships
 
-### Agents
+- **Typed remote calls** across the host-to-sandbox boundary.
+- **Unary, streaming, and bidirectional call shapes** inferred from
+  function signatures.
+- **One runtime worker process** that imports installed modules on demand.
+- **Bundle builds** from normal Python projects and `pyproject.toml`
+  dependencies.
+- **Optional Nix system dependencies** when a project includes
+  `default.nix`.
+- **Deployment backend plugins** through the `agentix.deployment` entry
+  point group.
 
-- **Claude Code** — [recipe](https://github.com/Agentiix/agentix-cookbook/tree/main/claude-code)
-- CLI binaries (Codex, Aider), Python frameworks
-  ([mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent),
-  [swe-agent](https://github.com/SWE-agent/SWE-agent),
-  [OpenHands](https://github.com/All-Hands-AI/OpenHands)),
-  or your own — wrap with the
-  [agent integration guide](https://agentiix.github.io/integrate-agent).
+## Quickstart
 
-### Benchmarks
+Install the host framework and a deployment backend:
 
-- **SWE-bench Verified** — [recipe](https://github.com/Agentiix/agentix-cookbook/tree/main/swebench),
-  built on the official
-  [`swebench`](https://github.com/swe-bench/SWE-bench) package's
-  `make_test_spec` + `get_eval_report`
+```bash
+pip install agentixx agentix-deployment-docker
+```
 
-### Sandbox Primitives
+Create a remote target:
 
-- **bash** — shell execution inside the rollout container. Ships with
-  [`agentix-runtime-basic`](https://github.com/Agentiix/Agentix-Runtime-Basic).
-- **files** — upload, download, and edit files in the rollout container.
-  Same wheel.
+```python
+# src/hello_agentix/__init__.py
+async def run(input: str) -> str:
+    return f"sandbox saw: {input}"
+```
 
-### Execution Backends
+Build a bundle:
 
-- `local` — Docker-based; ships with
-  [`agentix-deployment-docker`](https://github.com/Agentiix/Agentix-Deployment-Docker).
-- `daytona` — [`agentix-deployment-daytona`](https://github.com/Agentiix/Agentix-Deployment-Daytona).
-- `e2b` — [`agentix-deployment-e2b`](https://github.com/Agentiix/Agentix-Deployment-E2B).
-- Third-party — `pip install agentix-deployment-<name>`.
+```bash
+agentix build ./hello-agentix -o hello-agentix:0.1.0
+```
+
+Deploy it and call the function:
+
+```python
+import asyncio
+
+from agentix import RuntimeClient
+from agentix.deployment.base import SandboxConfig, session
+from agentix.deployment.docker import DockerDeployment
+from hello_agentix import run
+
+
+async def main() -> None:
+    deployment = DockerDeployment()
+    config = SandboxConfig(image="hello-agentix:0.1.0")
+
+    async with session(deployment, config) as sandbox:
+        async with RuntimeClient(sandbox.runtime_url) as client:
+            print(await client.remote(run, input="hello"))
+
+
+asyncio.run(main())
+```
+
+Read the full [quickstart](https://agentiix.github.io/quickstart) for the
+package layout and runtime-image prerequisites.
 
 ## Architecture
 
-```
-Orchestrator ──HTTP /_remote──► Runtime Server ──fork──► Runtime worker
-   (trainer)                       (FastAPI + SIO)          (shared venv, own process)
-                                        ▲
-            Socket.IO /socket.io/ ◄──────┴──── streams, bidi
+```text
+Host process
+  RuntimeClient.remote(fn, ...)
+    builds "module.path::function_name"
+    detects unary / stream / bidi
+    encodes args and kwargs
+        |
+        v
+Sandbox runtime
+  agentix-server
+        |
+        v
+  worker subprocess
+    imports module.path
+    validates args
+    calls function_name(*args, **kwargs)
 ```
 
-- **Runtime server**: one process per rollout container. Routes
-  `POST /_remote` (unary) and Socket.IO events (stream / bidi) to one
-  worker subprocess.
-- **Runtime worker**: one subprocess that imports requested Python
-  modules from the runtime venv and invokes their functions.
-- **Deployment**: host-side backend that creates the rollout container
-  and returns its `runtime_url`.
+Unary calls use HTTP `POST /_remote`. Streaming and bidirectional calls
+use Socket.IO events. Errors stay in-band.
 
-## Install
+## Repository Map
+
+- [`Agentix-Runtime-Basic`](https://github.com/Agentiix/Agentix-Runtime-Basic):
+  sandbox primitives such as `bash` and file operations.
+- [`Agentix-Deployment-Docker`](https://github.com/Agentiix/Agentix-Deployment-Docker):
+  local Docker deployment backend.
+- [`Agentix-Deployment-Daytona`](https://github.com/Agentiix/Agentix-Deployment-Daytona)
+  and [`Agentix-Deployment-E2B`](https://github.com/Agentiix/Agentix-Deployment-E2B):
+  hosted sandbox backend packages.
+- [`agentix-cookbook`](https://github.com/Agentiix/agentix-cookbook):
+  working integration recipes for agents and benchmarks.
+- [`abridge`](https://github.com/Agentiix/abridge): rollout-to-RL-buffer
+  bridge.
+
+## Development
 
 ```bash
-pip install agentixx \
-            agentix-runtime-basic \
-            agentix-deployment-docker
-```
-
-Cookbook integrations:
-
-```bash
-git clone https://github.com/Agentiix/agentix-cookbook
-pip install ./agentix-cookbook/claude-code ./agentix-cookbook/swebench
-```
-
-Framework development:
-
-```bash
-git clone https://github.com/Agentiix/Agentix && cd Agentix
+git clone https://github.com/Agentiix/Agentix
+cd Agentix
 pip install -e '.[dev]'
-# Pair with sibling repos checked out next to Agentix/ for a working
-# rollout end-to-end:
-pip install -e ../Agentix-Runtime-Basic -e ../Agentix-Deployment-Docker
+pytest
+ruff check agentix/ tests/
 ```
 
-## CLI
-
-```bash
-agentix build                                                # build current project
-agentix build path/to/project -o my-agent:0.1.0              # explicit path + tag
-agentix deploy local --image my-agent:0.1.0                  # run a rollout container
-```
-
-Multi-plugin bundles are expressed by declaring the plugins as deps
-in your project's `pyproject.toml`; pip pulls them in transitively.
-
-## Write an integration
-
-```python
-# src/agentix/myagent/__init__.py
-async def run(instruction: str) -> str:
-    return f"did: {instruction}"
-```
-
-```toml
-# pyproject.toml
-[project]
-name = "agentix-myagent"
-version = "0.1.0"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/agentix"]
-```
-
-After `pip install agentix-myagent`:
-
-```python
-from agentix.myagent import run
-
-result = await c.remote(run, instruction="...")
-```
-
-## One extension axis
-
-Deployment backends use the `agentix.deployment` entry-point group so
-`agentix deploy <backend>` finds them by name. Everything else is just
-pip-installable Python — your project depends on `agentix-runtime-basic`
-or whatever else, pip resolves it, and the framework probes any
-importable module on first remote call.
+Pair this repo with sibling backend/runtime repos checked out next to it
+when testing full sandbox rollouts.
 
 ## Links
 
-- **Docs site**: [agentiix.github.io](https://agentiix.github.io/)
-- **Cookbook**: [github.com/Agentiix/agentix-cookbook](https://github.com/Agentiix/agentix-cookbook)
-- **RL bridge (abridge)**: [github.com/Agentiix/abridge](https://github.com/Agentiix/abridge)
-- **Roadmap**: [ROADMAP.md](ROADMAP.md)
-- **Contributing**: [docs/development.mdx](docs/development.mdx); conventions in [CLAUDE.md](CLAUDE.md)
-
-## License
-
-[MIT](LICENSE)
+- [Docs](https://agentiix.github.io/)
+- [Quickstart](https://agentiix.github.io/quickstart)
+- [Remote calls](https://agentiix.github.io/concepts/remote-calls)
+- [Bundles](https://agentiix.github.io/concepts/bundles)
+- [Architecture](https://agentiix.github.io/reference/architecture)
+- [Roadmap](ROADMAP.md)

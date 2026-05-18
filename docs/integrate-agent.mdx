@@ -1,31 +1,59 @@
 ---
 title: Integrate an agent
-description: Wrap an agent CLI (Claude Code, Aider, OpenHands, Codex ...) as a Python module.
+description: Wrap an agent CLI or Python framework as a sandboxed function.
 ---
 
-An **agent** in Agentix is a Python module whose function shells out to
-a CLI binary. The caller imports that function and invokes
-`c.remote(run, ...)`; the
-body, running inside the sandbox, execs the binary and returns a typed
-result.
+An Agentix agent integration is a Python package with a function that
+runs inside the sandbox. For CLI agents, that function usually starts a
+subprocess, waits for it to finish, and returns a typed result.
 
-This guide ports `claude-code` as the worked example.
+There is no base class, registry, or framework-specific adapter layer.
+The integration is useful because callers can import it and write:
 
-## 1. Source layout
+```python
+from agentix.claude_code import run
+
+result = await client.remote(run, instruction="fix the bug", workdir="/testbed")
+```
+
+## Integration Contract
+
+Keep the public surface narrow. A good first integration exposes one
+`run` function and one result type.
+
+```python
+async def run(
+    instruction: str,
+    *,
+    workdir: str = "/testbed",
+    timeout: float = 600,
+    env: dict[str, str] | None = None,
+) -> RunResult:
+    ...
+```
+
+The body runs in the sandbox, so it can call binaries, edit files, read
+the repository under `/testbed`, or invoke a local Python framework.
+
+## 1. Package Layout
 
 ```text
 agentix-claude-code/
 ├── pyproject.toml
-├── default.nix              # Nix derivation — pulls the claude CLI binary
+├── default.nix
 └── src/agentix/
     └── claude_code/
-        └── __init__.py      # async def run(...), types
+        └── __init__.py
 ```
 
-## 2. Method surface
+Use `default.nix` when the agent needs a system binary that should be
+available on the worker PATH. Pure Python integrations can omit it.
+
+## 2. Function Surface
 
 ```python title="src/agentix/claude_code/__init__.py"
 from __future__ import annotations
+
 import asyncio
 import os
 from dataclasses import dataclass
@@ -60,6 +88,7 @@ async def run(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
+
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except TimeoutError:
@@ -74,8 +103,9 @@ async def run(
     )
 ```
 
-The function body runs **inside the sandbox** — anything an
-`asyncio.create_subprocess_exec` call can do is fair game.
+The result type should describe the sandbox-side command, not the whole
+rollout. Patch extraction, scoring, and trace assembly usually belong in
+the caller that composes several remote calls.
 
 ## 3. Packaging
 
@@ -85,35 +115,57 @@ name = "agentix-claude-code"
 version = "0.1.0"
 requires-python = ">=3.11"
 
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentix"]
 ```
 
-`pip install agentix-claude-code` resolves
-`from agentix.claude_code import run` on the caller side.
-`agentix build ./agentix-claude-code` produces the image.
+After installation, callers can import the function normally:
 
-## 4. Extract the patch on the caller
+```python
+from agentix.claude_code import run
+```
 
-Patch extraction is a generic "what changed in this workdir"
-operation; keep it on the caller, not in the agent module:
+When a bundle includes this package, the sandbox worker can import the
+same module and execute `run`.
+
+## 4. System Binary
+
+Many agent CLIs are easiest to ship with Nix. The derivation should copy
+the executable into `bin/`. During `agentix build`, Agentix links those
+binaries under `/nix/runtime/bin` in the final image.
+
+See the
+[`agentix-cookbook/claude-code`](https://github.com/Agentiix/agentix-cookbook/tree/main/claude-code)
+recipe for a complete working package.
+
+## 5. Caller Composition
+
+Keep generic rollout operations outside the agent wrapper. For example,
+extracting a patch is a shell operation that works for any agent that
+edited files:
 
 ```python
 from agentix.bash import run as bash_run
 
-diff = await c.remote(
+diff = await client.remote(
     bash_run,
-    command=f"cd /testbed && git add -A && git diff --cached --no-color",
+    command="cd /testbed && git add -A && git diff --cached --no-color",
 )
 patch = diff.stdout
 ```
 
-The same call works for any agent that edited files.
+The caller decides how to compose repo setup, the agent run, patch
+extraction, scoring, and logging.
 
-## 5. Streaming output
+## Streaming Output
 
-For long-running agents, add a streaming variant. A function annotated
-`-> AsyncIterator[Event]` auto-upgrades to Socket.IO:
+For long-running agents, expose a streaming function next to `run`.
+Annotate it as `AsyncIterator[T]`; Agentix automatically uses the stream
+transport.
 
 ```python
 from collections.abc import AsyncIterator
@@ -135,37 +187,41 @@ class RunDone:
 
 async def run_stream(instruction: str, **kwargs) -> AsyncIterator[TokenChunk | RunDone]:
     proc = await asyncio.create_subprocess_exec(
-        "claude", "-p", instruction, "--output-format", "stream-json",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        "claude",
+        "-p",
+        instruction,
+        "--output-format",
+        "stream-json",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
+
     async for raw in proc.stdout:
         event = json.loads(raw)
-        match event["type"]:
-            case "token":  yield TokenChunk(text=event["text"])
-            case "done":   yield RunDone(result=_build_result(event))
+        if event["type"] == "token":
+            yield TokenChunk(text=event["text"])
+        if event["type"] == "done":
+            yield RunDone(result=_build_result(event))
 ```
 
-Callers iterate without `await`:
+Callers iterate over the remote result:
 
 ```python
 from agentix.claude_code import run_stream
 
-async for ev in c.remote(run_stream, instruction="…"):
-    match ev:
-        case TokenChunk(text=t): print(t, end="")
-        case RunDone(result=r):  return r
+async for event in client.remote(run_stream, instruction="fix the bug"):
+    match event:
+        case TokenChunk(text=text):
+            print(text, end="")
+        case RunDone(result=result):
+            return result
 ```
 
-## 6. The Nix derivation
+## Boundaries
 
-Agent CLIs are usually unpackaged outside Nix. The simplest path:
-fetch the upstream tarball, copy the binary, expose it on `bin/`.
-See [`agentix-cookbook/claude-code/default.nix`](https://github.com/Agentiix/agentix-cookbook/blob/main/claude-code/default.nix)
-for a working reference.
-
-## Secrets and workdir
-
-- Pass API keys per call via `env={"ANTHROPIC_API_KEY": "..."}`. Don't
-  bake them into the image.
-- Default `workdir=/testbed`. Most benchmarks mount the repo there.
-- Bound `timeout` aggressively. Long-running agents can hang.
+- Pass secrets per call with `env`, for example
+  `env={"ANTHROPIC_API_KEY": "..."}`.
+- Use a stable default workdir such as `/testbed` for benchmark repos.
+- Bound `timeout` aggressively. Agent CLIs can hang.
+- Keep scoring in a scorer module. Keep repo setup in a primitive such as
+  `agentix.bash`.
