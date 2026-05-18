@@ -30,8 +30,7 @@ import signal
 import sys
 from collections.abc import Sequence
 
-from agentix.deployment.base import Deployment, load_deployment, session
-from agentix.models import SandboxConfig
+from agentix.deployment.base import Deployment, SandboxConfig, load_deployment, session
 
 logger = logging.getLogger("agentix.cli.deploy")
 

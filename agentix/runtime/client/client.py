@@ -1,21 +1,18 @@
 """Async client for the agentix runtime server.
 
-Wraps:
-  - typed remote-call dispatch: `RuntimeClient.remote(fn, *args, **kwargs)`,
-    where `fn` is a stub function imported from a namespace's Python package.
-    Routing key is `fn.__module__`; result is decoded into `fn`'s return type.
-    Shell exec / file I/O live in the `bash` and `files` primitive namespaces —
-    call them via `c.remote(bash.Bash.run, ...)` and `c.remote(files.Files.upload, ...)`.
-  - `/namespaces` introspection and `/health`.
-  - log subscription: `RuntimeClient.logs()` is an `AsyncIterator[LogRecord]`
-    fed by a Socket.IO `log` event stream; same for `RuntimeClient.traces()`.
+`RuntimeClient.remote(fn, *args, **kwargs)` is the entire surface. `fn`
+is any importable Python function from a Python module installed in the
+sandbox; routing key is `fn.__module__`, result is decoded into `fn`'s
+return type. The framework's three call shapes (unary / stream / bidi)
+are detected from `fn`'s signature.
 
 Two transports underneath:
   - HTTP for unary RPC (`POST /_remote`).
-  - Socket.IO for server-streaming, bidirectional, and log/trace subscription.
+  - Socket.IO for server-streaming + bidirectional dispatch.
 
-The Socket.IO connection is lazy and shared across all stream/bidi/log calls
-on the same client. Per-`call_id` queue routing demultiplexes concurrent calls.
+The Socket.IO connection is lazy and shared across all stream/bidi
+calls on the same client. Per-`call_id` queue routing demultiplexes
+concurrent calls.
 """
 
 from __future__ import annotations
@@ -26,7 +23,7 @@ import contextvars
 import functools
 import inspect
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Iterator, Mapping
+from collections.abc import AsyncGenerator, Callable, Coroutine, Iterator, Mapping
 from contextlib import contextmanager
 from typing import (
     Any,
@@ -51,24 +48,15 @@ from agentix.runtime.shared.events import (
     BIDI_OUT,
     BIDI_START,
     CANCEL,
-    LOG,
-    LOGS_SUBSCRIBE,
-    LOGS_UNSUBSCRIBE,
     STREAM,
     STREAM_END,
     STREAM_ERROR,
     STREAM_ITEM,
-    TRACE,
-    TRACES_SUBSCRIBE,
-    TRACES_UNSUBSCRIBE,
 )
 from agentix.runtime.shared.models import (
     HealthResponse,
-    LogRecord,
-    NamespaceInfo,
     RemoteError,
     RemoteResponse,
-    TraceEvent,
 )
 
 P = ParamSpec("P")
@@ -133,9 +121,6 @@ class RuntimeClient:
         self._sio_lock = asyncio.Lock()
         # call_id -> event queue. Stream and bidi share the same machinery.
         self._pending: dict[str, asyncio.Queue] = {}
-        # log + trace subscribers — each subscriber has its own queue.
-        self._log_subscribers: set[asyncio.Queue] = set()
-        self._trace_subscribers: set[asyncio.Queue] = set()
 
     # ── lifecycle ────────────────────────────────────────────────
 
@@ -153,12 +138,9 @@ class RuntimeClient:
 
     @contextmanager
     def call_context(self, *, call_id: str | None = None) -> Iterator[None]:
-        """Temporarily attach call metadata to typed remote calls.
-
-        `call_id` is forwarded into `RemoteRequest.call_id`, so trace events
-        emitted by namespace code inherit it. The value is stored in a
-        contextvar, making it safe for concurrent asyncio tasks.
-        """
+        """Temporarily attach a `call_id` to remote calls. Forwarded to
+        `RemoteRequest.call_id` for correlation; stored in a contextvar
+        so concurrent asyncio tasks can each carry their own."""
         token = _CLIENT_CALL_ID.set(call_id)
         try:
             yield
@@ -171,11 +153,6 @@ class RuntimeClient:
         r = await self._client.get("/health")
         r.raise_for_status()
         return HealthResponse.model_validate(r.json())
-
-    async def namespaces(self) -> list[NamespaceInfo]:
-        r = await self._client.get("/namespaces")
-        r.raise_for_status()
-        return [NamespaceInfo.model_validate(x) for x in r.json()]
 
     # ── typed remote call ────────────────────────────────────────
 
@@ -279,7 +256,7 @@ class RuntimeClient:
         method = fn.__name__
         sio = await self._ensure_sio()
         call_id = uuid.uuid4().hex
-        trace_call_id = _CLIENT_CALL_ID.get()
+        outer_call_id = _CLIENT_CALL_ID.get()
         q: asyncio.Queue = asyncio.Queue()
         self._pending[call_id] = q
 
@@ -287,14 +264,12 @@ class RuntimeClient:
         item_adapter = _adapter_for(ret_args[0] if ret_args else Any)
         try:
             payload = {
-                "call_id": call_id,
+                "call_id": outer_call_id or call_id,
                 "package": package,
                 "method": method,
                 "args": _encode_args(sig, args),
                 "kwargs": _encode_kwargs(sig, kwargs),
             }
-            if trace_call_id is not None:
-                payload["trace_call_id"] = trace_call_id
             await sio.emit(STREAM, pack(payload))
             while True:
                 kind, data = await q.get()
@@ -334,16 +309,15 @@ class RuntimeClient:
 
         sio = await self._ensure_sio()
         call_id = uuid.uuid4().hex
-        trace_call_id = _CLIENT_CALL_ID.get()
+        outer_call_id = _CLIENT_CALL_ID.get()
         q: asyncio.Queue = asyncio.Queue()
         self._pending[call_id] = q
 
         payload = {
-            "call_id": call_id, "package": package, "method": method,
+            "call_id": outer_call_id or call_id,
+            "package": package, "method": method,
             "args": [], "kwargs": non_channel_kwargs,
         }
-        if trace_call_id is not None:
-            payload["trace_call_id"] = trace_call_id
         await sio.emit(BIDI_START, pack(payload))
 
         async def _sender() -> None:
@@ -375,65 +349,6 @@ class RuntimeClient:
             with contextlib.suppress(BaseException):
                 await sio.emit(CANCEL, pack({"call_id": call_id}))
 
-    # ── log subscription ────────────────────────────────────────
-
-    async def logs(self, *, filter: str | None = None) -> AsyncIterator[LogRecord]:
-        """Subscribe to the runtime's log stream.
-
-        Yields a `LogRecord` for every `logging` record emitted under
-        the `agentix.*` logger tree (or the `filter` prefix if given).
-        Iteration ends when the connection closes or the caller breaks.
-        """
-        sio = await self._ensure_sio()
-        sub_q: asyncio.Queue = asyncio.Queue()
-        self._log_subscribers.add(sub_q)
-        first_sub = len(self._log_subscribers) == 1
-        try:
-            if first_sub:
-                payload = {"filter": filter} if filter else {}
-                await sio.emit(LOGS_SUBSCRIBE, pack(payload))
-            while True:
-                data = await sub_q.get()
-                yield LogRecord.model_validate(data)
-        finally:
-            self._log_subscribers.discard(sub_q)
-            if not self._log_subscribers:
-                with contextlib.suppress(BaseException):
-                    await sio.emit(LOGS_UNSUBSCRIBE, pack({}))
-
-    async def traces(
-        self,
-        *,
-        kind: str | None = None,
-        call_id: str | None = None,
-    ) -> AsyncIterator[TraceEvent]:
-        """Subscribe to the runtime's trace stream.
-
-        Yields a `TraceEvent` for every `agentix.trace.emit(...)` from any
-        namespace. Optional `kind` and `call_id` filters are applied
-        client-side; the server broadcasts all events to subscribers.
-        Iteration ends when the connection closes or the caller breaks.
-        """
-        sio = await self._ensure_sio()
-        sub_q: asyncio.Queue = asyncio.Queue()
-        self._trace_subscribers.add(sub_q)
-        first_sub = len(self._trace_subscribers) == 1
-        try:
-            if first_sub:
-                await sio.emit(TRACES_SUBSCRIBE, pack({}))
-            while True:
-                data = await sub_q.get()
-                if kind is not None and data.get("kind") != kind:
-                    continue
-                if call_id is not None and data.get("call_id") != call_id:
-                    continue
-                yield TraceEvent.model_validate(data)
-        finally:
-            self._trace_subscribers.discard(sub_q)
-            if not self._trace_subscribers:
-                with contextlib.suppress(BaseException):
-                    await sio.emit(TRACES_UNSUBSCRIBE, pack({}))
-
     # ── Socket.IO connection management ─────────────────────────
 
     async def _ensure_sio(self) -> socketio.AsyncClient:
@@ -457,8 +372,6 @@ class RuntimeClient:
             sio.on(BIDI_OUT, _on_bidi_out)
             sio.on(BIDI_END, _on_bidi_end)
             sio.on(BIDI_ERROR, _on_bidi_error)
-            sio.on(LOG, self._on_log)
-            sio.on(TRACE, self._on_trace)
 
             await sio.connect(self._base_url)
             self._sio = sio
@@ -470,19 +383,6 @@ class RuntimeClient:
         q = self._pending.get(call_id) if isinstance(call_id, str) else None
         if q is not None:
             await q.put((kind, data))
-
-    async def _on_log(self, raw: Any) -> None:
-        data = _decode_payload(raw)
-        for q in list(self._log_subscribers):
-            q.put_nowait(data)
-
-    async def _on_trace(self, raw: Any) -> None:
-        data = _decode_payload(raw)
-        for q in list(self._trace_subscribers):
-            q.put_nowait(data)
-
-    # Shell exec / file I/O are not in the runtime core. Mount the `bash`
-    # and `files` primitive namespaces and dispatch through `c.remote(...)`.
 
 
 def _encode_args(sig: inspect.Signature, args: tuple) -> list[Any]:

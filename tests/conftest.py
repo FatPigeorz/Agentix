@@ -1,13 +1,10 @@
 """Shared fixtures for agentix tests.
 
-Namespaces are discovered via the entry-point mechanism in production
-(walked at multiplexer.discover_entry_points()). For tests we bypass
-`importlib.metadata.entry_points` and inject classes directly via
-`multiplexer._register_inprocess()`, which builds an in-process
-Dispatcher binding. The same multiplexer dispatches in-process classes
-and subprocess workers uniformly, so test coverage exercises the full
-transport (Socket.IO + /_remote) without forcing each test class into
-its own venv.
+Production dispatch auto-registers any importable module on first
+call. Tests bypass that and inject classes directly via
+`multiplexer._register_inprocess()` so the in-process Dispatcher path
+exercises the wire protocol (Socket.IO + /_remote) without needing
+real subprocess workers.
 """
 
 from __future__ import annotations
@@ -40,13 +37,11 @@ def runtime_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     upload_root.mkdir()
     monkeypatch.setenv("AGENTIX_UPLOAD_ROOT", str(upload_root))
 
-    # Reload server modules so each test gets a fresh Registry (no cross-test
-    # namespace registration leakage). Order matters: leaves first, package
-    # __init__ last, so dependent modules see fresh internals on import.
+    # Reload server modules so each test gets a fresh multiplexer (no
+    # cross-test registration leakage). Order matters: leaves first,
+    # package __init__ last.
     for mod in (
         "agentix.runtime.server.sio",
-        "agentix.runtime.server.trace_bridge",
-        "agentix.runtime.server.llm_proxy",
         "agentix.runtime.server.app",
         "agentix.runtime.server",
     ):
@@ -54,8 +49,6 @@ def runtime_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             try:
                 importlib.reload(sys.modules[mod])
             except ImportError:
-                # Module was popped from sys.modules mid-test or never fully
-                # loaded — re-import on demand below.
                 sys.modules.pop(mod, None)
 
     from agentix.runtime import server

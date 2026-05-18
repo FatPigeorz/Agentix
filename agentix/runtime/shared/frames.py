@@ -22,7 +22,6 @@ RESULT = "result"
 ERROR = "error"
 STREAM_ITEM = "stream_item"
 STREAM_END = "stream_end"
-TRACE = "trace"
 
 # ─── call kinds (the `kind` field of a `call` frame) ──────────────────
 KIND_UNARY = "unary"

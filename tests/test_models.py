@@ -1,32 +1,11 @@
-"""Tests for agentix.models — pydantic validation and serialization."""
+"""Tests for the framework's pydantic wire types."""
 
 from __future__ import annotations
 
 import pytest
 
-from agentix.models import NamespaceManifest, SandboxConfig
+from agentix.deployment.base import SandboxConfig
 from agentix.runtime.shared.models import RemoteError, RemoteRequest, RemoteResponse
-
-
-def test_namespace_manifest_minimal():
-    m = NamespaceManifest(name="core", version="0.1.0", package="agentix.core")
-    assert m.package == "agentix.core"
-    assert m.description is None
-
-
-def test_namespace_manifest_extra_allow():
-    m = NamespaceManifest.model_validate({
-        "name": "agentix-mock-agent",
-        "version": "0.1.0",
-        "package": "agentix.mock_agent",
-        "extra_field": "ignored-but-preserved",
-    })
-    assert m.name == "agentix-mock-agent"
-
-
-def test_namespace_manifest_requires_name_version_package():
-    with pytest.raises(Exception):
-        NamespaceManifest(name="x", version="0.0.0")  # type: ignore[call-arg]
 
 
 def test_remote_request_defaults():

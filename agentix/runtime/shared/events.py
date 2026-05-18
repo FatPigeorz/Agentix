@@ -28,16 +28,3 @@ BIDI_ERROR = "bidi:error"
 
 # Cancel an in-flight stream / bidi call by call_id.
 CANCEL = "cancel"
-
-# Log subscription (Python logging records broadcast to subscribers).
-LOG = "log"
-LOGS_SUBSCRIBE = "logs:subscribe"
-LOGS_UNSUBSCRIBE = "logs:unsubscribe"
-
-# Trace subscription (RL / observability events).
-TRACE = "trace"
-TRACES_SUBSCRIBE = "traces:subscribe"
-TRACES_UNSUBSCRIBE = "traces:unsubscribe"
-
-# Socket.IO room name for trace subscribers.
-TRACES_ROOM = "traces"

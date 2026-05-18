@@ -7,25 +7,19 @@ clients send bytes, server receives bytes, vice versa.
 Wire (Socket.IO event names + payload dicts):
 
   client → server:
-    "stream"           {call_id, package, method, args, kwargs}
-    "bidi:start"       {call_id, package, method, args, kwargs}
-    "bidi:in"          {call_id, item}
-    "bidi:end_in"      {call_id}
-    "cancel"           {call_id}
-    "logs:subscribe"   {filter?: str}   # logger-name prefix (default: "agentix")
-    "logs:unsubscribe" {}
-    "traces:subscribe" {}
-    "traces:unsubscribe" {}
+    "stream"       {call_id, package, method, args, kwargs}
+    "bidi:start"   {call_id, package, method, args, kwargs}
+    "bidi:in"      {call_id, item}
+    "bidi:end_in"  {call_id}
+    "cancel"       {call_id}
 
   server → client:
-    STREAM_ITEM     {call_id, value}
-    STREAM_END      {call_id}
-    STREAM_ERROR    {call_id, error}
-    BIDI_OUT        {call_id, value}
-    BIDI_END        {call_id}
-    BIDI_ERROR      {call_id, error}
-    LOG             {level, name, message, timestamp}
-    TRACE           {kind, payload, call_id, source, timestamp}
+    STREAM_ITEM    {call_id, value}
+    STREAM_END     {call_id}
+    STREAM_ERROR   {call_id, error}
+    BIDI_OUT       {call_id, value}
+    BIDI_END       {call_id}
+    BIDI_ERROR     {call_id, error}
 """
 
 from __future__ import annotations
@@ -52,22 +46,14 @@ from agentix.runtime.shared.events import (
     BIDI_OUT,
     BIDI_START,
     CANCEL,
-    LOG,
-    LOGS_SUBSCRIBE,
-    LOGS_UNSUBSCRIBE,
     STREAM,
     STREAM_END,
     STREAM_ERROR,
     STREAM_ITEM,
-    TRACES_ROOM,
-    TRACES_SUBSCRIBE,
-    TRACES_UNSUBSCRIBE,
 )
 from agentix.runtime.shared.models import RemoteError, RemoteRequest
 
 logger = logging.getLogger("agentix.runtime.sio")
-
-_ROOT_LOG_NAME = "agentix"  # forwarded log records start at this logger and below
 
 
 def _u(data: Any) -> dict:
@@ -82,11 +68,12 @@ class _CallState:
     """Per-(session, call_id) state for an in-flight stream/bidi call.
 
     Bidi inbound path is two-tier (mirroring the worker's pump pattern
-    in `agentix.runtime.server.worker`): `intake` is unbounded so `on_bidi_in` is a sync
-    `put_nowait` — no await, no reordering even under `async_handlers=True`.
-    A per-call `pump` task drains intake into the bounded `in_queue`
-    that the dispatcher's `_input_iter` reads from; the pump's
-    `await put` is what gives backpressure through the wire."""
+    in `agentix.runtime.server.worker`): `intake` is unbounded so
+    `on_bidi_in` is a sync `put_nowait` — no await, no reordering even
+    under `async_handlers=True`. A per-call `pump` task drains intake
+    into the bounded `in_queue` that the dispatcher's `_input_iter`
+    reads from; the pump's `await put` is what gives backpressure
+    through the wire."""
 
     task: asyncio.Task
     intake: asyncio.Queue | None = None
@@ -101,7 +88,6 @@ class _SessionState:
     """Per-Socket.IO-session bookkeeping."""
 
     calls: dict[str, _CallState] = field(default_factory=dict)
-    log_handler: logging.Handler | None = None
 
 
 def make_sio(
@@ -140,8 +126,6 @@ def make_sio(
             [c.task for c in sess.calls.values()]
             + [c.pump for c in sess.calls.values() if c.pump is not None],
         )
-        if sess.log_handler is not None:
-            logging.getLogger(_ROOT_LOG_NAME).removeHandler(sess.log_handler)
         logger.debug("sio disconnect %s", sid)
 
     # ── server-streaming ─────────────────────────────────────────
@@ -165,7 +149,7 @@ def make_sio(
                     package=payload["package"], method=payload["method"],
                     args=payload.get("args") or [],
                     kwargs=payload.get("kwargs") or {},
-                    call_id=CallId(payload.get("trace_call_id") or call_id),
+                    call_id=CallId(call_id),
                 )
             except (KeyError, ValidationError) as exc:
                 await sio.emit(STREAM_ERROR, pack({
@@ -204,7 +188,7 @@ def make_sio(
                 package=payload["package"], method=payload["method"],
                 args=payload.get("args") or [],
                 kwargs=payload.get("kwargs") or {},
-                call_id=CallId(payload.get("trace_call_id") or call_id),
+                call_id=CallId(call_id),
             )
         except (KeyError, ValidationError) as exc:
             await sio.emit(BIDI_ERROR, pack({
@@ -287,39 +271,6 @@ def make_sio(
             call.task.cancel()
             _pump.cancel_if_running(call.pump)
 
-    # ── logs ─────────────────────────────────────────────────────
-
-    @_event(LOGS_SUBSCRIBE)
-    async def on_logs_subscribe(sid: str, data: Any = None) -> None:
-        sess = sessions.get(sid)
-        if sess is None:
-            return
-        if sess.log_handler is not None:
-            return  # idempotent
-        prefix = _u(data).get("filter") or _ROOT_LOG_NAME
-        handler = _make_log_forwarder(sio, sid, prefix)
-        logging.getLogger(_ROOT_LOG_NAME).addHandler(handler)
-        sess.log_handler = handler
-
-    @_event(LOGS_UNSUBSCRIBE)
-    async def on_logs_unsubscribe(sid: str, _data: Any = None) -> None:
-        sess = sessions.get(sid)
-        if sess is None:
-            return
-        if sess.log_handler is not None:
-            logging.getLogger(_ROOT_LOG_NAME).removeHandler(sess.log_handler)
-            sess.log_handler = None
-
-    # ── traces ──────────────────────────────────────────────────
-
-    @_event(TRACES_SUBSCRIBE)
-    async def on_traces_subscribe(sid: str, _data: Any = None) -> None:
-        await sio.enter_room(sid, TRACES_ROOM)
-
-    @_event(TRACES_UNSUBSCRIBE)
-    async def on_traces_unsubscribe(sid: str, _data: Any = None) -> None:
-        await sio.leave_room(sid, TRACES_ROOM)
-
     # ── helpers (closure over sio + sessions) ────────────────────
 
     async def _spawn_call(
@@ -344,38 +295,6 @@ def make_sio(
 
     asgi_app = socketio.ASGIApp(sio, socketio_path="/socket.io")
     return sio, asgi_app
-
-
-# ── log forwarding ───────────────────────────────────────────────
-
-
-def _make_log_forwarder(sio: socketio.AsyncServer, sid: str, prefix: str) -> logging.Handler:
-    """A logging.Handler that schedules `sio.emit("log", msgpack(...))` for each record
-    whose logger name starts with `prefix`."""
-
-    class _Forwarder(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            if not record.name.startswith(prefix):
-                return
-            try:
-                msg = self.format(record)
-            except Exception:
-                msg = record.getMessage()
-            payload = pack({
-                "level": record.levelname,
-                "name": record.name,
-                "message": msg,
-                "timestamp": record.created,
-            })
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                return  # no loop on this thread → drop
-            loop.create_task(sio.emit(LOG, payload, to=sid))
-
-    h = _Forwarder()
-    h.setLevel(logging.DEBUG)
-    return h
 
 
 async def _drain_tasks(tasks: list[asyncio.Task]) -> None:

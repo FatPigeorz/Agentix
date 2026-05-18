@@ -36,9 +36,9 @@ async def test_dispatch_to_module_without_entry_point(monkeypatch):
     monkeypatch.syspath_prepend(str(TESTS_DIR))
 
     mp = NamespaceMultiplexer()
-    # discover_entry_points populates `_venv_pythons` with sys.executable
+    # discover_venvs populates `_venv_pythons` with sys.executable
     # so the slow-path probe has somewhere to land if the fast path misses.
-    mp.discover_entry_points()
+    mp.discover_venvs()
     assert _USER_PACKAGE not in mp._entries  # not yet registered
 
     try:
@@ -66,7 +66,7 @@ async def test_unimportable_module_returns_package_not_loaded():
     """If a dispatch arrives for a module no venv can import, the
     multiplexer must return PackageNotLoaded — not hang, not crash."""
     mp = NamespaceMultiplexer()
-    mp.discover_entry_points()
+    mp.discover_venvs()
 
     try:
         resp = await mp.dispatch_unary(RemoteRequest(

@@ -1,6 +1,6 @@
 ---
 title: Architecture
-description: How entry-point discovery, dispatch, and the runtime server fit together.
+description: How RPC dispatch and the runtime server fit together.
 ---
 
 ## Components
@@ -8,52 +8,44 @@ description: How entry-point discovery, dispatch, and the runtime server fit tog
 ```text
 ┌─ Host (orchestrator) ─────────────────────────────────────────┐
 │  RuntimeClient                                                 │
-│    • run / upload / download           (runtime built-ins)     │
-│    • namespaces                        (introspection)         │
-│    • remote(fn, *args, **kwargs)       (typed dispatch)        │
+│    • remote(fn, *args, **kwargs)        (typed dispatch)       │
+│    • health()                                                  │
 └──────────────────────────────┬─────────────────────────────────┘
                                │ HTTP (POST /_remote)
+                               │ Socket.IO (stream + bidi)
 ┌─ Sandbox ────────────────────▼─────────────────────────────────┐
 │                                                                 │
-│  agentix-server (multiplexer process)                           │
-│    built-in I/O:                                                │
-│      GET  /health                                               │
-│      POST /exec     (SSE or JSON)                               │
-│      POST /upload                                               │
-│      GET  /download                                             │
-│      GET  /namespaces                                           │
-│    typed dispatch:                                              │
+│  agentix-server (FastAPI + Socket.IO + multiplexer)            │
 │      POST /_remote   { package, method, args, kwargs }          │
-│      /socket.io/     streams, bidi, log fan-out                 │
+│      /socket.io/     stream + bidi multiplexed by call_id       │
+│      GET  /health                                               │
 │                                                                 │
-│  Workers: one subprocess per namespace, spawned lazily on       │
-│  first dispatch using the namespace's venv interpreter.         │
+│  Workers: one subprocess per dispatched package, spawned        │
+│  lazily on first call using `/nix/runtime/bin/python`.          │
 │                                                                 │
-│  /nix/store — only present if a namespace shipped default.nix.  │
+│  /nix/store — only present if the project shipped default.nix.  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-The runtime walks `importlib.metadata.entry_points(group="agentix.namespace")`
-at startup. First dispatch triggers worker spawn for the target
-namespace. Namespaces are fixed for the sandbox's lifetime — change
-the set by rebuilding the bundle and recreating the sandbox.
+Routing is by `fn.__module__`. On first call to a package not seen
+before, the multiplexer probes the runtime's Python for whether the
+module imports there; on match it spawns a worker. There is no
+entry-point declaration required — any importable Python module is a
+valid dispatch target.
 
-## Namespace convention
+## Dispatch target
 
 ```text
-my-namespace/
-├── pyproject.toml            # name = "agentix-<short>", entry-point block
-├── src/agentix/<short>/      # PEP 420 namespace package
-│   └── __init__.py           # public async functions
-└── default.nix               # OPTIONAL — system deps only
+my-project/
+├── pyproject.toml                 # any name, any layout
+└── src/my_project/
+    └── tasks.py                   # async def run(...): ...
+└── default.nix                    # OPTIONAL — system deps only
 ```
 
-Routing is by Python module path: `c.remote(bash.run, ...)` reads
-`bash.run.__module__` as the routing key. Two distributions
-registering the same entry-point name raise `PluginConflictError`.
-
-See [Namespace protocol](/reference/namespace-protocol) for the full
-ABI.
+Routing is by module path: `c.remote(tasks.run, ...)` reads
+`tasks.run.__module__` as the routing key. `pip install -e .`
+followed by `agentix build .` puts everything in the bundle.
 
 ## Build pipeline
 

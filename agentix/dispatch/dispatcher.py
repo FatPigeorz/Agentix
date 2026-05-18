@@ -1,12 +1,15 @@
-"""`Dispatcher` — a namespace's collection of bound (stub, impl) pairs.
+"""`Dispatcher` — lazy-binding RPC dispatch for a Python module / class.
 
-Namespaces construct one of these implicitly via `bind_namespace(target)`;
-explicit `bind(stub, impl)` is for namespaces using the composition-impl
-shape (separate stub class + impl class, see CLAUDE.md R1).
+Construct with a target (any object holding async functions as
+attributes). `dispatch` / `dispatch_stream` / `dispatch_bidi` look up
+`request.method` on the target, lazily build a `_BoundMethod` for it
+(TypeAdapter compile happens once per method, cached), coerce wire args
+through the adapters, await the impl, serialize the result, and trap
+exceptions into a `RemoteError` so the wire stays 200.
 
-`dispatch` / `dispatch_stream` / `dispatch_bidi` coerce wire-decoded args
-back into the declared types, invoke the impl, and trap exceptions into
-RemoteError so the wire stays 200.
+No upfront namespace walk, no "is it a namespace" check — any
+importable target works. The worker subprocess constructs one
+Dispatcher per spawned package and feeds it incoming frames.
 """
 
 from __future__ import annotations
@@ -14,16 +17,14 @@ from __future__ import annotations
 import inspect
 import logging
 import traceback
-from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any, ParamSpec, TypeVar, get_args
+from collections.abc import AsyncIterator
+from typing import Any, get_args
 
 from pydantic import TypeAdapter, ValidationError
 
-import agentix.trace as trace
-from agentix.dispatch.bound import _BoundMethod, coerce_args, source_for
+from agentix.dispatch.bound import _BoundMethod, coerce_args
 from agentix.dispatch.shape import detect_shape
 from agentix.idents import MethodName
-from agentix.namespace import discover_methods
 from agentix.rpc import is_channel_annotation
 from agentix.runtime.shared.models import (
     RemoteError,
@@ -33,49 +34,58 @@ from agentix.runtime.shared.models import (
 
 logger = logging.getLogger("agentix.dispatch")
 
-P = ParamSpec("P")
-R = TypeVar("R")
-
 
 class Dispatcher:
-    """A namespace's collection of bound (stub, impl) pairs.
+    """RPC dispatch into a Python target's public async functions.
 
-    Namespaces construct one of these in their `_register.register()`:
-
-        from agentix.dispatch import Dispatcher
-        from . import run               # the stub (Ellipsis body)
-        from ._impl import run as _run  # the real impl
-
-        def register() -> Dispatcher:
-            d = Dispatcher()
-            d.bind(run, _run)
-            return d
+    `target` is any object exposing async functions / async generators
+    as attributes — a module (recommended), a class, a regular object.
+    Methods are resolved + bound on first call by name; results cached.
     """
 
-    def __init__(self) -> None:
-        self._methods: dict[MethodName, _BoundMethod[Any, Any]] = {}
+    def __init__(self, target: Any) -> None:
+        self._target = target
+        self._methods: dict[MethodName, _BoundMethod[Any, Any]] = {}  # lazy cache
 
-    def bind(
-        self,
-        stub: Callable[P, R],
-        impl: Callable[..., R | Awaitable[R]],
-    ) -> None:
-        """Register `impl` as the implementation of `stub`.
+    # ── lazy resolution ────────────────────────────────────────────
 
-        Both must share the same signature (the stub is just the typed
-        contract; impl carries the body). The wire request's `method`
-        field is `stub.__name__`. The call shape is detected from the
-        signature at bind time and cached.
+    def _resolve(self, method: MethodName) -> _BoundMethod[Any, Any] | None:
+        """Look up + lazy-bind. Returns None for missing attributes or
+        Python dunders; the dispatch path turns that into MethodNotFound.
+
+        Any callable attribute is dispatchable. Sync functions work for
+        unary; the dispatcher checks `isawaitable(result)` at runtime.
+        Streams / bidi structurally need async generators (`async for`
+        is the only way to iterate them) — `detect_shape` enforces that
+        via `isasyncgenfunction`.
         """
-        # eval_str=True resolves PEP 563 stringified annotations (`from
-        # __future__ import annotations` in the stub module) — without it,
-        # `param.annotation` would be the string "AsyncIterator[Foo]" and
-        # `get_origin` would return None, mis-classifying streams as unary.
-        sig = inspect.signature(stub, eval_str=True)
-        name = MethodName(stub.__name__)
-        if name in self._methods:
-            raise ValueError(f"method '{name}' already bound on this dispatcher")
-        shape = detect_shape(stub, sig)
+        cached = self._methods.get(method)
+        if cached is not None:
+            return cached
+        if not isinstance(method, str):
+            return None
+        # Block Python dunders — they're framework machinery, never user methods.
+        if method.startswith("__") and method.endswith("__"):
+            return None
+        fn = getattr(self._target, method, None)
+        if fn is None:
+            return None
+        # @staticmethod wrappers — unwrap to the underlying function so
+        # `detect_shape`'s checks see the real function.
+        actual = fn.__func__ if isinstance(fn, staticmethod) else fn
+        if not callable(actual):
+            return None
+        bound = self._build(method, actual)
+        self._methods[method] = bound
+        return bound
+
+    def _build(self, name: MethodName, fn: Any) -> _BoundMethod[Any, Any]:
+        # eval_str=True resolves PEP 563 stringified annotations
+        # (`from __future__ import annotations` in the module) — without
+        # it, `param.annotation` would be a string and `get_origin` would
+        # return None, mis-classifying streams as unary.
+        sig = inspect.signature(fn, eval_str=True)
+        shape = detect_shape(fn, sig)
 
         param_adapters: dict[str, TypeAdapter[Any]] = {}
         channel_params: list[tuple[str, Any]] = []
@@ -106,10 +116,10 @@ class Dispatcher:
                 input_channel_param, input_item_type = channel_params[0]
                 input_item_adapter = TypeAdapter(input_item_type)
 
-        self._methods[name] = _BoundMethod(
+        return _BoundMethod(
             name=name,
-            stub=stub,
-            impl=impl,
+            stub=fn,
+            impl=fn,
             signature=sig,
             shape=shape,
             param_adapters=param_adapters,
@@ -119,51 +129,31 @@ class Dispatcher:
             input_item_adapter=input_item_adapter,
         )
 
-    def bind_namespace(self, target: Any) -> Dispatcher:
-        """Bind every public async function on `target`.
-
-        `target` is whatever the namespace's entry point points at —
-        typically a Python module (the package itself), or a class for
-        legacy class-style namespaces, or any object with discoverable
-        async attributes. The dispatcher binds each function to itself
-        (stub and impl are the same callable).
-
-        Returns `self` for fluent use in entry-point loaders.
-        """
-        for _name, fn in discover_methods(target):
-            self.bind(fn, fn)
-        return self
-
-    def methods(self) -> list[MethodName]:
-        return list(self._methods)
+    # ── introspection (used by the in-process worker) ─────────────
 
     def is_streaming(self, method: MethodName) -> bool:
-        m = self._methods.get(method)
+        m = self._resolve(method)
         return m is not None and m.is_stream
 
     def is_bidi(self, method: MethodName) -> bool:
-        m = self._methods.get(method)
+        m = self._resolve(method)
         return m is not None and m.is_bidi
 
     def input_adapter_for(self, method: MethodName) -> TypeAdapter[Any] | None:
-        m = self._methods.get(method)
+        m = self._resolve(method)
         return m.input_item_adapter if m else None
 
-    async def dispatch(self, request: RemoteRequest) -> RemoteResponse:
-        """Route a RemoteRequest to its bound impl, returning the wire response.
+    # ── dispatch entry points ─────────────────────────────────────
 
-        Validates kwargs against the stub's signature, awaits async impls,
-        serializes the return via the stub's return-type adapter, and
-        traps exceptions into a RemoteError so the wire stays 200.
-        """
-        m = self._methods.get(request.method)
+    async def dispatch(self, request: RemoteRequest) -> RemoteResponse:
+        """Unary dispatch. Resolves + invokes; serializes return value."""
+        m = self._resolve(request.method)
         if m is None:
             return RemoteResponse(
                 ok=False,
                 error=RemoteError(
                     type="MethodNotFound",
-                    message=f"method '{request.method}' is not bound on this dispatcher; "
-                    f"available: {sorted(self._methods)}",
+                    message=f"no public async method {request.method!r} on {self._target!r}",
                 ),
             )
         try:
@@ -173,24 +163,20 @@ class Dispatcher:
                 ok=False,
                 error=RemoteError(type="ValidationError", message=str(exc)),
             )
-        tokens = trace.set_call_context(request.call_id, source_for(m.impl))
         try:
-            try:
-                result = m.impl(*args, **kwargs)
-                if inspect.isawaitable(result):
-                    result = await result
-            except Exception as exc:
-                logger.exception("namespace impl '%s' raised", m.name)
-                return RemoteResponse(
-                    ok=False,
-                    error=RemoteError(
-                        type=type(exc).__name__,
-                        message=str(exc),
-                        traceback=traceback.format_exc(),
-                    ),
-                )
-        finally:
-            trace.reset_call_context(tokens)
+            result = m.impl(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as exc:
+            logger.exception("namespace impl '%s' raised", m.name)
+            return RemoteResponse(
+                ok=False,
+                error=RemoteError(
+                    type=type(exc).__name__,
+                    message=str(exc),
+                    traceback=traceback.format_exc(),
+                ),
+            )
         try:
             value = m.return_adapter.dump_python(result, mode="python")
         except Exception as exc:
@@ -204,28 +190,18 @@ class Dispatcher:
         return RemoteResponse(ok=True, value=value)
 
     async def dispatch_stream(self, request: RemoteRequest) -> AsyncIterator[dict[str, Any]]:
-        """Run a server-streaming impl, yielding event dicts to the transport.
-
-        Event shapes:
-            {"item": <serialized>}      — per yielded value
-            {"error": {...}}            — impl raised, validation failed, etc.
-            {"end": true}               — normal completion sentinel
-
-        The transport (Socket.IO server / HTTP NDJSON) encodes the dicts to
-        the wire. The dispatcher only deals with semantic events.
-        """
-        m = self._methods.get(request.method)
+        """Server-streaming dispatch. Yields {item|end|error} event dicts."""
+        m = self._resolve(request.method)
         if m is None:
             yield {"type": "error", "error": RemoteError(
                 type="MethodNotFound",
-                message=f"method '{request.method}' is not bound on this dispatcher; "
-                f"available: {sorted(self._methods)}",
+                message=f"no public async method {request.method!r} on {self._target!r}",
             ).model_dump()}
             return
         if not m.is_stream or m.is_bidi:
             yield {"type": "error", "error": RemoteError(
                 type="NotAStreamingMethod",
-                message=f"method '{request.method}' is not a (non-bidi) streaming method",
+                message=f"method {request.method!r} is not a (non-bidi) streaming method",
             ).model_dump()}
             return
         try:
@@ -233,33 +209,29 @@ class Dispatcher:
         except ValidationError as exc:
             yield {"type": "error", "error": RemoteError(type="ValidationError", message=str(exc)).model_dump()}
             return
-        tokens = trace.set_call_context(request.call_id, source_for(m.impl))
         try:
-            try:
-                result = m.impl(*args, **kwargs)
-                if inspect.isawaitable(result):
-                    result = await result
-                assert m.item_adapter is not None
-                async for item in result:
-                    try:
-                        value = m.item_adapter.dump_python(item, mode="python")
-                    except Exception as exc:
-                        yield {"type": "error", "error": RemoteError(
-                            type="SerializationError",
-                            message=f"failed to serialize item: {exc}",
-                        ).model_dump()}
-                        return
-                    yield {"type": "item", "value": value}
-            except Exception as exc:
-                logger.exception("namespace stream impl '%s' raised mid-stream", m.name)
-                yield {"type": "error", "error": RemoteError(
-                    type=type(exc).__name__,
-                    message=str(exc),
-                    traceback=traceback.format_exc(),
-                ).model_dump()}
-                return
-        finally:
-            trace.reset_call_context(tokens)
+            result = m.impl(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = await result
+            assert m.item_adapter is not None
+            async for item in result:
+                try:
+                    value = m.item_adapter.dump_python(item, mode="python")
+                except Exception as exc:
+                    yield {"type": "error", "error": RemoteError(
+                        type="SerializationError",
+                        message=f"failed to serialize item: {exc}",
+                    ).model_dump()}
+                    return
+                yield {"type": "item", "value": value}
+        except Exception as exc:
+            logger.exception("namespace stream impl '%s' raised mid-stream", m.name)
+            yield {"type": "error", "error": RemoteError(
+                type=type(exc).__name__,
+                message=str(exc),
+                traceback=traceback.format_exc(),
+            ).model_dump()}
+            return
         yield {"type": "end"}
 
     async def dispatch_bidi(
@@ -267,24 +239,19 @@ class Dispatcher:
         request: RemoteRequest,
         input_iter: AsyncIterator[Any],
     ) -> AsyncIterator[dict[str, Any]]:
-        """Run a bidi impl. `input_iter` yields items already coerced to the
-        stub's input item type (transport pre-validates via `input_item_adapter`).
-
-        Event shapes match `dispatch_stream` — same vocab of `item` / `end`
-        / `error` — so the transport handles them uniformly.
-        """
-        m = self._methods.get(request.method)
+        """Bidi dispatch. `input_iter` is the caller-pushed inbound stream;
+        items must already match the impl's `Channel[T]` item type."""
+        m = self._resolve(request.method)
         if m is None:
             yield {"type": "error", "error": RemoteError(
                 type="MethodNotFound",
-                message=f"method '{request.method}' is not bound on this dispatcher; "
-                f"available: {sorted(self._methods)}",
+                message=f"no public async method {request.method!r} on {self._target!r}",
             ).model_dump()}
             return
         if not m.is_bidi:
             yield {"type": "error", "error": RemoteError(
                 type="NotABidiMethod",
-                message=f"method '{request.method}' is not bidirectional",
+                message=f"method {request.method!r} is not bidirectional",
             ).model_dump()}
             return
         assert m.input_channel_param is not None
@@ -304,33 +271,29 @@ class Dispatcher:
         except (TypeError, ValidationError) as exc:
             yield {"type": "error", "error": RemoteError(type=type(exc).__name__, message=str(exc)).model_dump()}
             return
-        tokens = trace.set_call_context(request.call_id, source_for(m.impl))
         try:
-            try:
-                result = m.impl(**coerced)
-                if inspect.isawaitable(result):
-                    result = await result
-                assert m.item_adapter is not None
-                async for item in result:
-                    try:
-                        value = m.item_adapter.dump_python(item, mode="python")
-                    except Exception as exc:
-                        yield {"type": "error", "error": RemoteError(
-                            type="SerializationError",
-                            message=f"failed to serialize item: {exc}",
-                        ).model_dump()}
-                        return
-                    yield {"type": "item", "value": value}
-            except Exception as exc:
-                logger.exception("namespace bidi impl '%s' raised mid-stream", m.name)
-                yield {"type": "error", "error": RemoteError(
-                    type=type(exc).__name__,
-                    message=str(exc),
-                    traceback=traceback.format_exc(),
-                ).model_dump()}
-                return
-        finally:
-            trace.reset_call_context(tokens)
+            result = m.impl(**coerced)
+            if inspect.isawaitable(result):
+                result = await result
+            assert m.item_adapter is not None
+            async for item in result:
+                try:
+                    value = m.item_adapter.dump_python(item, mode="python")
+                except Exception as exc:
+                    yield {"type": "error", "error": RemoteError(
+                        type="SerializationError",
+                        message=f"failed to serialize item: {exc}",
+                    ).model_dump()}
+                    return
+                yield {"type": "item", "value": value}
+        except Exception as exc:
+            logger.exception("namespace bidi impl '%s' raised mid-stream", m.name)
+            yield {"type": "error", "error": RemoteError(
+                type=type(exc).__name__,
+                message=str(exc),
+                traceback=traceback.format_exc(),
+            ).model_dump()}
+            return
         yield {"type": "end"}
 
 

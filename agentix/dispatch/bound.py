@@ -13,7 +13,6 @@ from typing import Any, Generic, ParamSpec, TypeVar
 from pydantic import TypeAdapter
 
 from agentix.dispatch.shape import Shape
-from agentix.idents import PackageName
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -76,15 +75,6 @@ def coerce_args(
         else:  # KEYWORD_ONLY
             out_kwargs[pname] = v
     return out_args, out_kwargs
-
-
-def source_for(impl: Callable[..., Any]) -> PackageName | None:
-    """Derive a namespace package path from an impl function for trace events."""
-    mod = getattr(impl, "__module__", None)
-    if mod is None:
-        return None
-    return PackageName(mod)
-
 
 # Internal — nothing here is part of the public dispatch API.
 # `Dispatcher` (in dispatcher.py) is the only consumer.

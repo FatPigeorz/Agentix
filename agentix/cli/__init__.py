@@ -1,10 +1,9 @@
 """`agentix` command-line interface — hardcoded subcommand dispatch.
 
-The four built-in subcommands (`build`, `install`, `deploy`, `check`)
-ship as modules under `agentix/cli/`. Third parties that want to add a
-new `agentix <name>` verb should expose their own `console_scripts`
-entry instead (e.g. `agentix-myextension` runnable from the same shell);
-the central CLI is not a plugin surface.
+Two built-in subcommands (`build`, `deploy`) ship as modules under
+`agentix/cli/`. Third parties that want to add a new `agentix <name>`
+verb should expose their own `console_scripts` entry instead — the
+central CLI is not a plugin surface.
 
 The dispatcher deliberately doesn't use argparse subparsers — argparse
 intercepts `--help` greedily at the root level, so `agentix build --help`
@@ -24,7 +23,6 @@ from collections.abc import Callable, Sequence
 _COMMANDS: tuple[tuple[str, str], ...] = (
     ("build", "agentix.cli.build"),
     ("deploy", "agentix.cli.deploy"),
-    ("check", "agentix.cli.check"),
 )
 
 

@@ -109,7 +109,7 @@ class SlowEcho:
 async def test_register_namespace_makes_it_dispatchable(
     runtime_module, register_namespace,
 ):
-    """A registered namespace surfaces in `/namespaces` and dispatches via /_remote."""
+    """A registered target dispatches via /_remote."""
     server, _, _ = runtime_module
     register_namespace(Echo)
     pkg = Echo.__module__
@@ -119,11 +119,6 @@ async def test_register_namespace_makes_it_dispatchable(
     from agentix.runtime.shared.codec import pack, unpack
     transport = httpx.ASGITransport(app=server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
-        r = await http.get("/namespaces")
-        assert r.status_code == 200
-        pkgs = [c["manifest"]["package"] for c in r.json()]
-        assert pkg in pkgs
-
         body = pack(RemoteRequest(
             package=pkg, method="echo", kwargs={"msg": "hi"},
         ).model_dump())

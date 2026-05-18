@@ -16,17 +16,16 @@
       },
       {
         "group": "Concepts",
-        "pages": ["namespace", "deployment"]
+        "pages": ["deployment"]
       },
       {
         "group": "Guides",
-        "pages": ["integrate-agent", "integrate-dataset", "extend-runtime"]
+        "pages": ["integrate-agent", "integrate-dataset"]
       },
       {
         "group": "Reference",
         "pages": [
           "reference/architecture",
-          "reference/namespace-protocol",
           "reference/cli"
         ]
       },

@@ -2,8 +2,8 @@
 
 In-process tests (test_namespace_protocol.py) exercise the multiplexer
 through its InProcessWorker backend — same protocol, no subprocess.
-These tests use the real SubprocessWorker so the stdio framing, RPC
-correlation, and trace-frame forwarding all run for real.
+These tests use the real SubprocessWorker so the stdio framing + RPC
+correlation run for real.
 
 The target class lives in `tests/_worker_target.py` — a real importable
 module so the worker subprocess can `import _worker_target` after we
@@ -38,9 +38,9 @@ def worker_env(monkeypatch):
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(parts))
 
 
-def _make_multiplexer(trace_forwarder=None) -> NamespaceMultiplexer:
-    mp = NamespaceMultiplexer(trace_forwarder=trace_forwarder)
-    mp._register_subprocess(_PACKAGE, _TARGET, sys.executable, dist_name="test-worker")
+def _make_multiplexer() -> NamespaceMultiplexer:
+    mp = NamespaceMultiplexer()
+    mp._register_subprocess(_PACKAGE, _TARGET, sys.executable)
     return mp
 
 
@@ -64,7 +64,6 @@ async def test_subprocess_worker_bad_target_fails_without_hanging(worker_env):
         "agentix.missing",
         "agentix.definitely_missing:Nope",
         sys.executable,
-        dist_name="missing-worker",
     )
     try:
         # Worker subprocess pays pydantic_core's one-time init cost
@@ -92,27 +91,6 @@ async def test_subprocess_worker_streaming(worker_env):
         items = [e["value"] for e in events if e.get("type") == "item"]
         assert items == [0, 1, 2]
         assert events[-1] == {"type": "end"}
-    finally:
-        await mp.shutdown()
-
-
-async def test_subprocess_worker_trace_forwarding(worker_env):
-    """trace.emit() in the worker reaches the runtime's trace_forwarder."""
-    received: list[tuple[str, dict]] = []
-
-    def forwarder(kind, payload, call_id, source):
-        received.append((kind, payload))
-
-    mp = _make_multiplexer(trace_forwarder=forwarder)
-    try:
-        resp = await mp.dispatch_unary(RemoteRequest(
-            package=_PACKAGE, method="trace_then_echo", kwargs={"msg": "x"},
-        ))
-        assert resp.ok, resp.error
-        # Trace frame is fire-and-forget on the worker side; let the
-        # multiplexer read loop pick it up.
-        await asyncio.sleep(0.2)
-        assert ("test_event", {"msg": "x"}) in received
     finally:
         await mp.shutdown()
 

@@ -81,9 +81,6 @@ types across the host-to-container boundary.
   like local functions; your editor knows the kwargs and return types.
   Three call shapes (unary / streaming / bidirectional) are
   auto-detected from your function signature.
-- **Trace fan-out and observability.** Every integration's
-  `trace.emit(...)` events can ship to OpenTelemetry, Sentry, or your
-  own bus with one `agentix.trace.subscribe(fn)` call.
 
 ## Supported Integrations
 
@@ -118,15 +115,6 @@ types across the host-to-container boundary.
 - `daytona` — [`agentix-deployment-daytona`](https://github.com/Agentiix/Agentix-Deployment-Daytona).
 - `e2b` — [`agentix-deployment-e2b`](https://github.com/Agentiix/Agentix-Deployment-E2B).
 - Third-party — `pip install agentix-deployment-<name>`.
-
-### RL Frameworks / Serving Providers
-
-- **abridge** — Agentix's host-side rollout bridge; correlates runtime
-  trace events into per-rollout records and pushes them to sinks.
-- **slime / verl** — RL post-training adapters can consume abridge
-  rollouts and append them to framework-specific buffers.
-- **Custom serving or evaluation stacks** — implement `abridge.Sink`
-  or subscribe directly with `agentix.trace.subscribe(fn)`.
 
 ## Architecture
 
@@ -217,20 +205,13 @@ from agentix import myagent
 result = await c.remote(myagent.run, instruction="...")
 ```
 
-## Two extension axes
+## One extension axis
 
-Only things that cross the host↔container boundary need framework-level
-discovery:
-
-| Axis | Entry-point group | What it ships | Built-ins |
-|---|---|---|---|
-| Namespaces | `agentix.namespace` | code that runs **inside the rollout container** | (third-party only) |
-| Deployments | `agentix.deployment` | backend that **provisions** the container | `local`, `daytona`, `e2b` |
-
-Host-side hooks (trace pub/sub, spec resolvers, CLI verbs) are plain
-Python — `agentix.trace.subscribe(fn)` is the single line that ships
-every integration's `trace.emit(...)` events into OpenTelemetry,
-Sentry, or your own bus.
+Deployment backends use the `agentix.deployment` entry-point group so
+`agentix deploy <backend>` finds them by name. Everything else is just
+pip-installable Python — your project depends on `agentix-runtime-basic`
+or whatever else, pip resolves it, the framework auto-discovers any
+importable module at first dispatch.
 
 ## Links
 

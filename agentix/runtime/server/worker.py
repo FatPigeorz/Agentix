@@ -1,21 +1,19 @@
-"""Namespace worker — `python -m agentix.runtime.server.worker --target <pkg>`.
+"""Per-package worker — `python -m agentix.runtime.server.worker --target <pkg>`.
 
-A worker is a single-namespace dispatch process that the runtime
-multiplexer spawns lazily on first call. It loads ONE namespace target
-(typically a Python package, but a `module:attr` form is also accepted
-for class-style or partial targets), binds it via `Dispatcher`, and
-serves dispatch over stdin/stdout using the RPC frame protocol in
+A worker is a single-package dispatch process the multiplexer spawns
+lazily on first call. It loads ONE Python target (module or
+`module:attr`), wraps it in a `Dispatcher`, and serves dispatch over
+stdin/stdout using the RPC frame protocol in
 `agentix.runtime.shared.rpc`.
 
 The worker holds:
 
-  - one `Dispatcher` (the loaded namespace's bound methods)
+  - one `Dispatcher` (lazily binds methods on first call)
   - one asyncio task per in-flight call, keyed by `call_id`
   - one input queue per in-flight bidi call (for `bidi_in` chunks)
 
-It forwards trace events via a subscriber that wraps each
-`trace.emit()` into a frame on stdout. Logs go through Python's
-logging to stderr, which the multiplexer captures separately.
+Logs go through Python's `logging` to stderr; the multiplexer's
+subprocess pipe captures them.
 """
 
 from __future__ import annotations
@@ -29,7 +27,6 @@ import sys
 import traceback
 from typing import Any
 
-from agentix import trace
 from agentix.dispatch import Dispatcher
 from agentix.idents import CallId, PackageName
 from agentix.runtime.shared import frames as F
@@ -46,9 +43,6 @@ def _load_target(target: str) -> Any:
     Two forms (setuptools entry-point grammar):
       * `module.path`        → the module itself
       * `module.path:attr`   → `getattr(module, attr)` — a class or any obj
-
-    The dispatcher duck-types whatever comes back; the bare-module form
-    is the recommended namespace shape.
     """
     if ":" in target:
         mod_name, attr_name = target.split(":", 1)
@@ -66,15 +60,11 @@ def _err(exc: BaseException) -> dict[str, Any]:
 
 
 class Worker:
-    """One worker, one namespace. Owns stdio + a Dispatcher.
+    """One worker, one target. Owns stdio + a Dispatcher.
 
-    All outbound frames (result, stream item/end, trace, error, ready)
-    funnel through `_outbound_q` and are serialized by a single drainer
-    task. This gives us:
-      - **FIFO ordering** across trace + result frames (observers see
-        traces in the order the impl emitted them)
-      - **No GC of fire-and-forget tasks** for sync `trace.emit` paths
-      - **No send lock** — one writer, no contention
+    All outbound frames (result, stream item/end, error, ready) funnel
+    through `_outbound_q` and are serialized by a single drainer task.
+    Result: FIFO ordering, no send-lock contention.
     """
 
     def __init__(self, dispatcher: Dispatcher, package: str) -> None:
@@ -97,9 +87,6 @@ class Worker:
         self._writer: asyncio.StreamWriter | None = None
         self._reader: asyncio.StreamReader | None = None
         self._shutdown = asyncio.Event()
-        # Single FIFO that every outbound frame passes through. Unbounded
-        # by default — back-pressure on the writer is sufficient; we
-        # don't want sync trace.emit() to block on a full queue.
         self._outbound_q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._drainer: asyncio.Task | None = None
 
@@ -115,11 +102,7 @@ class Worker:
         writer = asyncio.StreamWriter(transport, protocol, None, loop)
         self._reader, self._writer = reader, writer
 
-        # Spin up the single outbound drainer + subscribe trace forwarder
-        # before saying "ready" — any boot-time trace events get captured.
         self._drainer = loop.create_task(self._drain_outbound())
-        trace.subscribe(self._trace_handler)
-
         await self._send({"type": F.READY, "package": self._package})
 
         while not self._shutdown.is_set():
@@ -131,12 +114,10 @@ class Worker:
                 break
             await self._handle(frame)
 
-        # Drain in-flight calls on shutdown.
         for task in list(self._calls.values()):
             task.cancel()
         if self._calls:
             await asyncio.gather(*self._calls.values(), return_exceptions=True)
-        # Flush any remaining outbound frames, then stop the drainer.
         await self._outbound_q.join()
         if self._drainer is not None:
             self._drainer.cancel()
@@ -156,23 +137,7 @@ class Worker:
             pass
 
     async def _send(self, payload: dict[str, Any]) -> None:
-        """Enqueue a frame for the drainer. Effectively non-blocking
-        on an unbounded queue."""
         await self._outbound_q.put(payload)
-
-    def _trace_handler(self, kind: str, payload: dict, call_id, source) -> None:
-        # Sync handler — enqueue via put_nowait (queue is unbounded,
-        # so this never raises in practice). The drainer preserves
-        # FIFO order between traces and the result frame that follows.
-        frame: dict[str, Any] = {"type": F.TRACE, "kind": kind, "payload": payload}
-        if call_id is not None:
-            frame["call_id"] = call_id
-        if source is not None:
-            frame["source"] = source
-        try:
-            self._outbound_q.put_nowait(frame)
-        except asyncio.QueueFull:
-            pass  # impossible on an unbounded queue, but defensive
 
     _RUNTIME_FRAME_HANDLERS: dict[str, str] = {
         F.CALL: "_on_call",
@@ -298,11 +263,7 @@ class Worker:
         call_id = frame.get("call_id", "")
         intake = self._bidi_intakes.get(call_id)
         if intake is None:
-            # Late frame after terminal — invariant #2 (terminal-then-quiet).
             return
-        # Intake is unbounded; `put_nowait` never raises. Backpressure
-        # happens at `_bidi_pump`'s `await user_q.put(...)` which blocks
-        # on the bounded user queue. The main read loop is never stalled.
         intake.put_nowait(frame.get("item"))
 
     async def _on_bidi_end_in(self, frame: dict[str, Any]) -> None:
@@ -332,7 +293,7 @@ _END_SENTINEL: Any = object()
 
 def _make_dispatcher(target: str) -> tuple[Dispatcher, str]:
     obj = _load_target(target)
-    dispatcher = Dispatcher().bind_namespace(obj)
+    dispatcher = Dispatcher(obj)
     # Routing key: the module the target lives in. For a bare-module
     # target the module IS the object; for `module:attr` we take the
     # module path so caller-side `fn.__module__` matches.
@@ -363,8 +324,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="agentix.runtime.server.worker")
     parser.add_argument(
         "--target", required=True,
-        help="namespace to load — `module.path` (recommended, package-as-namespace) "
-             "or `module.path:attr` (class-style or partial target)",
+        help="module to load — `module.path` (recommended) or `module.path:attr`",
     )
     args = parser.parse_args()
     try:

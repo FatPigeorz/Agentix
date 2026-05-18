@@ -1,32 +1,25 @@
-"""Namespace dispatch — binds public functions for RPC, routes wire requests to impls.
+"""Server-side RPC dispatch.
 
-The runtime's multiplexer instantiates one `Dispatcher` per namespace
-inside a worker subprocess. Tests bypass the subprocess path via
-`Multiplexer._register_inprocess(target)`.
+`Dispatcher(target).dispatch(req)` looks up `req.method` on `target` and
+invokes it; methods bind lazily on first call (TypeAdapter compile is
+cached per method).
 
 Split into:
 
-  - `shape`         — call-shape detection (`unary` / `stream` / `bidi`)
-  - `bound`         — `_BoundMethod` record + arg coercion helper
-  - `dispatcher`    — the `Dispatcher` class itself
-  - `entry_points`  — `agentix.namespace` entry-point discovery
+  - `shape`       — call-shape detection (`unary` / `stream` / `bidi`)
+  - `bound`       — `_BoundMethod` record + arg coercion helper
+  - `dispatcher`  — the `Dispatcher` class itself
 
-Public surface (re-exported here) is `Dispatcher`, `Shape`, `detect_shape`,
-`NAMESPACE_ENTRY_POINT_GROUP`, and `discover_entry_points`. The split is
-internal — `from agentix.dispatch import Dispatcher` keeps working.
+Public surface: `Dispatcher`. The shape module is also exported for
+clients that want to probe a callable's wire shape host-side without
+binding.
 """
 
 from agentix.dispatch.dispatcher import Dispatcher
-from agentix.dispatch.entry_points import (
-    NAMESPACE_ENTRY_POINT_GROUP,
-    discover_entry_points,
-)
 from agentix.dispatch.shape import Shape, detect_shape
 
 __all__ = [
     "Dispatcher",
-    "NAMESPACE_ENTRY_POINT_GROUP",
     "Shape",
     "detect_shape",
-    "discover_entry_points",
 ]

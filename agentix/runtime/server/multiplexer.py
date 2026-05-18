@@ -1,53 +1,46 @@
-"""Multiplexer — manages one worker subprocess per namespace.
+"""Multiplexer — manages one worker subprocess per dispatched package.
 
-Sits between the FastAPI/Socket.IO transports and the namespace workers.
-A worker is a child Python process (typically running in its own venv,
-for dep isolation) that dispatches one namespace's methods. The
-multiplexer's job is to:
+Sits between the FastAPI/Socket.IO transports and per-package workers.
+A worker is a child Python process that loads one Python module + runs
+its async functions through a `Dispatcher`. The multiplexer:
 
-  1. **Discover** what namespaces exist in the bundle. In production
-     this walks each `/venvs/<short>/` for entry points; in tests it
-     accepts in-process registrations via `_register_inprocess(...)`.
-  2. **Spawn workers lazily.** First dispatch for a namespace forks
-     `python -m agentix.runtime.server.worker --target <pkg>:<class>` using
-     that namespace's venv interpreter, plumbs stdin/stdout for frames.
-  3. **Route frames** between transports (POST /_remote, Socket.IO) and
-     workers, correlated by `call_id`.
-  4. **Forward trace events** from workers up to the runtime's
-     Socket.IO trace bridge.
-  5. **Tear down** workers on shutdown.
+  1. **Spawns workers lazily.** First dispatch for a package forks
+     `python -m agentix.runtime.server.worker --target <pkg>` with the
+     bundle's Python interpreter, plumbs stdin/stdout for frames.
+  2. **Routes frames** between transports (POST /_remote, Socket.IO)
+     and workers, correlated by `call_id`.
+  3. **Tears down** workers on shutdown.
 
-Two backends share one routing layer:
+There's no "namespace" concept here — any importable Python module is
+a valid worker target. On first dispatch to an unseen package, the
+multiplexer auto-probes the runtime venv for whether the module
+imports, and spawns a worker if so.
 
-  - `SubprocessEntry` — `target_module:Class` + python interpreter path;
-    real isolated process per namespace. Production path.
-  - `InProcessEntry` — already-bound Dispatcher held in this process.
-    Test fixture path; lets pytest exercise the multiplexer's wire
-    protocol without forcing every test class to live in an importable
-    module + venv.
+Two worker variants share one routing layer:
 
-Both look identical to the transports — the multiplexer dispatches
-through a thin `_WorkerLike` protocol that either ships frames to a
-subprocess or feeds them to an in-process Dispatcher directly.
+  - `_SubprocessWorker` — `target_module` + python interpreter path;
+    real isolated process per package. Production path.
+  - `_InProcessWorker` — already-bound Dispatcher held in this
+    process. Test fixture path; lets pytest exercise the multiplexer's
+    wire protocol without forcing every test class into a real
+    subprocess.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import importlib.metadata
 import importlib.util
+import inspect
 import logging
 import os
 import sys
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from agentix.dispatch import NAMESPACE_ENTRY_POINT_GROUP, Dispatcher
-from agentix.idents import PackageName
-from agentix.models import NamespaceManifest
+from agentix.dispatch import Dispatcher
 from agentix.runtime.shared import frames as F
 from agentix.runtime.shared.models import RemoteError, RemoteRequest, RemoteResponse
 from agentix.runtime.shared.rpc import read_frame, write_frame
@@ -55,15 +48,6 @@ from agentix.runtime.shared.rpc import read_frame, write_frame
 logger = logging.getLogger("agentix.runtime.server.multiplexer")
 
 _WORKER_START_TIMEOUT = 15.0
-
-# ── trace forwarder ─────────────────────────────────────────────────
-
-
-TraceForwarder = Callable[[str, dict[str, Any], str | None, str | None], None]
-"""Callback the multiplexer invokes for every trace event from any worker.
-The runtime plugs in a function that publishes to the Socket.IO `traces`
-room."""
-
 
 class _WorkerLike(Protocol):
     """Both _InProcessWorker and _SubprocessWorker satisfy this surface;
@@ -81,18 +65,16 @@ class _WorkerLike(Protocol):
 
 
 @dataclass
-class _NamespaceEntry:
-    """Common fields. Either `target`+`python` (subprocess) or
-    `dispatcher` (in-process) is set, never both."""
+class _PackageEntry:
+    """One known dispatch target. Either `target`+`python` (subprocess
+    path) or `dispatcher` (in-process path) is set, never both."""
 
     package: str                     # python import path, e.g. "agentix.bash"
-    dist_name: str                   # pyproject [project].name
-    dist_version: str
 
     # Subprocess fields
     target: str | None = None         # "module" or "module:attr"
     python: str | None = None         # path to interpreter for this venv
-    bin_dir: Path | None = None       # /nix/<short>/bin — prepended to worker PATH
+    bin_dir: Path | None = None       # bin/ prepended to worker PATH
 
     # In-process fields (tests)
     dispatcher: Dispatcher | None = None
@@ -147,13 +129,11 @@ class _SubprocessWorker:
         package: str,
         target: str,
         python: str,
-        trace_forwarder: TraceForwarder | None,
         ns_bin_dir: Path | None = None,
     ) -> None:
         self._package = package
         self._target = target
         self._python = python
-        self._trace_forwarder = trace_forwarder
         # If provided, prepended to the worker's PATH so user code can call
         # Nix-provided binaries (`git`, `claude`, …) by bare name without
         # knowing the absolute /nix/<short>/bin path.
@@ -276,14 +256,6 @@ class _SubprocessWorker:
             q = self._streams.get(frame.get("call_id", ""))
             if q is not None:
                 q.put_nowait({"type": "end"})
-        elif kind == F.TRACE:
-            if self._trace_forwarder is not None:
-                self._trace_forwarder(
-                    frame.get("kind", ""),
-                    frame.get("payload") or {},
-                    frame.get("call_id"),
-                    frame.get("source"),
-                )
         else:
             logger.warning("worker %r: unknown frame %r", self._package, kind)
 
@@ -411,118 +383,54 @@ def _new_id() -> str:
 class NamespaceMultiplexer:
     """Owns the package → worker mapping; routes dispatches.
 
-    Two dispatch paths:
-
-    1. **Plugins**: discovered via the `agentix.namespace` entry-point
-       group at startup. Every plugin gets a pre-registered entry —
-       `c.remote(bash.run, …)` immediately knows which venv to spawn
-       the worker in.
-    2. **Arbitrary user modules**: any importable Python module is a
-       valid dispatch target. On first call to a package not in
-       `_entries`, the multiplexer probes each known venv interpreter
-       to see if the module imports there; first match wins and gets
-       cached as a new `_NamespaceEntry`. No entry point, no
-       `agentix.*` prefix, no boilerplate — `c.remote(my_app.tasks.run, …)`
-       works as long as `my_app.tasks` is `pip install`-ed somewhere
-       the runtime can see.
+    On first dispatch to a package not in `_entries`, the multiplexer
+    auto-registers it: probe the runtime's Python (and any aux venvs)
+    for whether `<package>` is importable; if so, spawn a worker. No
+    entry-point declaration is required for any dispatch target — any
+    importable Python module works.
     """
 
-    def __init__(self, trace_forwarder: TraceForwarder | None = None) -> None:
-        self._entries: dict[str, _NamespaceEntry] = {}    # package → entry
-        # Every venv interpreter we know about (from entry-point discovery
-        # or test registrations). On unknown-package dispatch, we try each
-        # one in turn — first that can import the module gets registered.
+    def __init__(self) -> None:
+        self._entries: dict[str, _PackageEntry] = {}    # package → entry
+        # Discovered venv interpreters. On unknown-package dispatch we
+        # try each one in turn — first that can import the module wins.
         self._venv_pythons: list[tuple[str, Path | None]] = []  # (python, bin_dir)
-        self._trace_forwarder = trace_forwarder
 
     # ── discovery ───────────────────────────────────────────────────
 
-    def discover_entry_points(self) -> None:
-        """Walk installed `agentix.namespace` entry points and pre-register.
-
-        Two layouts:
-
-          * **Bundle.** A `/nix/runtime/` directory exists with the
-            framework + every pip-installed plugin in its
-            site-packages. Discovery walks that venv's entry points.
-          * **Dev / test.** No bundle layout; fall back to walking the
-            current Python's installed entry points.
+    def discover_venvs(self) -> None:
+        """Record the venv interpreter(s) we'll probe for unknown
+        packages. In a bundle image that's `/nix/runtime/bin/python`;
+        in dev / test it's `sys.executable`.
 
         Tests using `_register_inprocess()` skip this entirely.
         """
         nix_runtime = Path("/nix/runtime")
         if nix_runtime.is_dir():
-            self._discover_from_nix(nix_runtime)
+            self._record_nix_runtime(nix_runtime)
         else:
-            self._discover_from_current_env()
+            self._venv_pythons.append((sys.executable, None))
 
-    def _discover_from_nix(self, venv: Path) -> None:
-        """Walk the bundle's single venv (/nix/runtime/) for entry points."""
+    def _record_nix_runtime(self, venv: Path) -> None:
         python = venv / "bin" / "python"
         bin_dir = venv / "bin"
-        site_pkgs_candidates = list(venv.glob("lib/python*/site-packages"))
-        if not python.exists() or not site_pkgs_candidates:
-            return
-        site_pkgs = site_pkgs_candidates[0]
-        # Record the venv even if it carries no entry points — on-demand
-        # registration will probe it for arbitrary user modules.
-        self._venv_pythons.append((str(python), bin_dir))
-        for dist in importlib.metadata.distributions(path=[str(site_pkgs)]):
-            for ep in dist.entry_points:
-                if ep.group != NAMESPACE_ENTRY_POINT_GROUP:
-                    continue
-                # See _discover_from_current_env: package routing key is
-                # the left-of-colon portion (the module path).
-                package = ep.value.split(":", 1)[0]
-                self._entries[package] = _NamespaceEntry(
-                    package=package,
-                    dist_name=dist.metadata["Name"] or "",
-                    dist_version=dist.version or "",
-                    target=ep.value, python=str(python),
-                    bin_dir=bin_dir,
-                )
-
-    def _discover_from_current_env(self) -> None:
-        # Always make sys.executable available for on-demand registration,
-        # even if no plugin entry points are installed.
-        self._venv_pythons.append((sys.executable, None))
-        eps = importlib.metadata.entry_points()
-        selected = (
-            eps.select(group=NAMESPACE_ENTRY_POINT_GROUP)
-            if hasattr(eps, "select") else
-            eps.get(NAMESPACE_ENTRY_POINT_GROUP, [])  # type: ignore[attr-defined]
-        )
-        for ep in selected:
-            dist = ep.dist
-            dist_name = getattr(dist, "name", "") if dist else ""
-            dist_version = getattr(dist, "version", "") if dist else ""
-            # Entry-point value is either `module` (package-as-namespace,
-            # recommended) or `module:attr` (legacy class-style). Either
-            # way the package routing key is the module path on the left.
-            package = ep.value.split(":", 1)[0]
-            self._entries[package] = _NamespaceEntry(
-                package=package, dist_name=dist_name, dist_version=dist_version,
-                target=ep.value, python=sys.executable,
-            )
+        if python.exists():
+            self._venv_pythons.append((str(python), bin_dir))
 
     # ── test-only registration paths ────────────────────────────────
-    # Underscore-prefixed because production code never reaches these:
-    # entry-point discovery (`discover_entry_points`) and on-demand
-    # registration (`_auto_register`) are the only production paths.
-    # Tests use these to bypass venv discovery for fixtures.
+    # Underscore-prefixed: production code uses `discover_venvs()` +
+    # `_auto_register` (lazy). Tests use these to bypass discovery.
 
-    def _register_inprocess(self, cls: type) -> None:
-        """Bind a class in-process — bypasses subprocess + venv discovery.
+    def _register_inprocess(self, target: Any) -> None:
+        """Bind `target` (a module or class) in-process via a Dispatcher
+        held in this process. Bypasses subprocess + venv discovery.
 
-        Used in pytest fixtures (see tests/conftest.py) to make a
-        regular Python class a dispatchable namespace inside the same
-        process the runtime runs in.
+        Used in pytest fixtures so test classes can act as dispatchable
+        targets without needing an importable module + real subprocess.
         """
-        package = cls.__module__
-        dispatcher = Dispatcher().bind_namespace(cls)
-        self._entries[package] = _NamespaceEntry(
-            package=package, dist_name=package.replace(".", "-"), dist_version="0.0.0",
-            dispatcher=dispatcher,
+        package = target.__name__ if inspect.ismodule(target) else target.__module__
+        self._entries[package] = _PackageEntry(
+            package=package, dispatcher=Dispatcher(target),
         )
 
     def _register_subprocess(
@@ -531,62 +439,40 @@ class NamespaceMultiplexer:
         target: str,
         python: str,
         *,
-        dist_name: str = "",
-        dist_version: str = "0.0.0",
         bin_dir: Path | None = None,
     ) -> None:
-        """Register a subprocess-backed namespace explicitly.
-
-        Used by tests that need to exercise the real subprocess path
-        rather than `_InProcessWorker`. Production code never calls
-        this — entries are built from installed entry points.
-        """
-        self._entries[package] = _NamespaceEntry(
-            package=package, dist_name=dist_name, dist_version=dist_version,
-            target=target, python=python, bin_dir=bin_dir,
+        """Register a subprocess-backed entry explicitly. Tests use this
+        to exercise the real subprocess path; production code auto-
+        registers on first dispatch."""
+        self._entries[package] = _PackageEntry(
+            package=package, target=target, python=python, bin_dir=bin_dir,
         )
 
     def has(self, package: str) -> bool:
         return package in self._entries
-
-    def manifests(self) -> list[NamespaceManifest]:
-        out: list[NamespaceManifest] = []
-        for entry in self._entries.values():
-            out.append(NamespaceManifest(
-                name=entry.dist_name or entry.package.rsplit(".", 1)[-1],
-                version=entry.dist_version or "0.0.0",
-                package=PackageName(entry.package),
-            ))
-        return out
 
     # ── on-demand registration for arbitrary modules ────────────────
 
     def _auto_register(self, package: str) -> bool:
         """Try to register `package` against any known venv.
 
-        For dispatch to an unknown package, we check each discovered
-        interpreter for whether the module is importable. The bundle
-        carries one venv at `/nix/runtime/`; dev/test mode uses
-        `sys.executable`. First match wins.
-
-        Fast path: the runtime's own Python tries `importlib.util.find_spec`
-        in-process (no subprocess). Slow path: any auxiliary venv we
-        know about gets a `python -c 'import <pkg>'` probe.
+        Fast path: this Python tries `importlib.util.find_spec` in-process
+        (no subprocess). Slow path: any aux venv gets a `python -c
+        'import <pkg>'` probe.
 
         Returns True iff the module was registered.
         """
         # Fast path: this Python.
         try:
             if importlib.util.find_spec(package) is not None:
-                self._entries[package] = _NamespaceEntry(
-                    package=package, dist_name="", dist_version="",
-                    target=package, python=sys.executable,
+                self._entries[package] = _PackageEntry(
+                    package=package, target=package, python=sys.executable,
                 )
                 return True
         except (ImportError, ValueError):
             pass
 
-        # Slow path: other venvs we know about.
+        # Slow path: aux venvs.
         import subprocess  # local: not used elsewhere in hot path
         for python, bin_dir in self._venv_pythons:
             if python == sys.executable:
@@ -600,9 +486,8 @@ class NamespaceMultiplexer:
             except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
                 continue
             if rc == 0:
-                self._entries[package] = _NamespaceEntry(
-                    package=package, dist_name="", dist_version="",
-                    target=package, python=python, bin_dir=bin_dir,
+                self._entries[package] = _PackageEntry(
+                    package=package, target=package, python=python, bin_dir=bin_dir,
                 )
                 return True
         return False
@@ -625,7 +510,7 @@ class NamespaceMultiplexer:
             else:
                 assert entry.target is not None and entry.python is not None
                 w = _SubprocessWorker(
-                    package, entry.target, entry.python, self._trace_forwarder,
+                    package, entry.target, entry.python,
                     ns_bin_dir=entry.bin_dir,
                 )
                 await w.start()

@@ -33,11 +33,39 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import NewType, Protocol, runtime_checkable
+
+from pydantic import BaseModel, Field
 
 from agentix.deployment._plugin import Registry
-from agentix.idents import SandboxId
-from agentix.models import SandboxConfig, SandboxInfo
+
+SandboxId = NewType("SandboxId", str)
+"""Deployment-side handle for a running sandbox container. Returned by
+`Deployment.create(...)` and threaded back through `delete(...)` /
+`get(...)`."""
+
+
+class SandboxConfig(BaseModel):
+    """Configuration a deployment uses to provision a sandbox.
+
+    The image is a deploy-ready bundle produced by `agentix build` —
+    it carries the runtime + every pip-installed plugin in one venv,
+    plus any system deps under `/nix`. The deployment just runs it.
+    """
+
+    image: str = Field(
+        description="Deploy-ready bundle image ref, e.g. `my-agent:0.1.0`.",
+    )
+    env: dict[str, str] | None = Field(
+        default=None,
+        description="Optional env vars passed to the sandbox container.",
+    )
+
+
+class SandboxInfo(BaseModel):
+    sandbox_id: SandboxId
+    runtime_url: str
+    status: str = "running"
 
 
 @dataclass
