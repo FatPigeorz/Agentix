@@ -1,14 +1,9 @@
-"""`FunctionInvoker` — lazy-binding calls into a Python module or class.
+"""`FunctionInvoker` — validates and invokes remote callables.
 
-Construct with a target (any object holding async functions as
-attributes). `call_unary` / `call_stream` / `call_bidi` look up
-`request.function` on the target, lazily build a `_BoundMethod` for it
-(TypeAdapter compile happens once per method, cached), coerce wire args
-through the adapters, await the impl, serialize the result, and trap
-exceptions into a `RemoteError` so the wire stays 200.
-
-The worker subprocess constructs one `FunctionInvoker` per imported
-module and reuses it for later calls to the same module.
+The runtime receives a pickle-serialized callable, resolves its
+signature, builds pydantic adapters, coerces wire args, calls the
+callable, serializes outputs, and traps exceptions into `RemoteError` so
+the wire stays in-band.
 """
 
 from __future__ import annotations
@@ -23,7 +18,6 @@ from pydantic import TypeAdapter, ValidationError
 
 from agentix.invoke.bound import _BoundMethod, coerce_args
 from agentix.invoke.shape import detect_shape
-from agentix.runtime.shared.idents import FunctionName
 from agentix.runtime.shared.models import (
     RemoteError,
     RemoteRequest,
@@ -35,50 +29,9 @@ logger = logging.getLogger("agentix.invoke")
 
 
 class FunctionInvoker:
-    """Call public functions exposed by a Python target.
+    """Call one pickle-resolved Python callable."""
 
-    `target` is any object exposing async functions / async generators
-    as attributes — a module (recommended), a class, a regular object.
-    Functions are resolved and bound on first call by name; results cached.
-    """
-
-    def __init__(self, target: Any) -> None:
-        self._target = target
-        self._methods: dict[FunctionName, _BoundMethod[Any, Any]] = {}  # lazy cache
-
-    # ── lazy resolution ────────────────────────────────────────────
-
-    def _resolve(self, function: FunctionName) -> _BoundMethod[Any, Any] | None:
-        """Look up + lazy-bind. Returns None for missing attributes or
-        Python dunders.
-
-        Any callable attribute is remote-callable. Sync functions work for
-        unary; the invoker checks `isawaitable(result)` at runtime.
-        Streams / bidi structurally need async generators (`async for`
-        is the only way to iterate them) — `detect_shape` enforces that
-        via `isasyncgenfunction`.
-        """
-        cached = self._methods.get(function)
-        if cached is not None:
-            return cached
-        if not isinstance(function, str):
-            return None
-        # Block Python dunders — they're framework machinery, never user methods.
-        if function.startswith("__") and function.endswith("__"):
-            return None
-        fn = getattr(self._target, function, None)
-        if fn is None:
-            return None
-        # @staticmethod wrappers — unwrap to the underlying function so
-        # `detect_shape`'s checks see the real function.
-        actual = fn.__func__ if isinstance(fn, staticmethod) else fn
-        if not callable(actual):
-            return None
-        bound = self._build(function, actual)
-        self._methods[function] = bound
-        return bound
-
-    def _build(self, name: FunctionName, fn: Any) -> _BoundMethod[Any, Any]:
+    def _build(self, name: str, fn: Any) -> _BoundMethod[Any, Any]:
         # eval_str=True resolves PEP 563 stringified annotations
         # (`from __future__ import annotations` in the module) — without
         # it, `param.annotation` would be a string and `get_origin` would
@@ -128,33 +81,18 @@ class FunctionInvoker:
             input_item_adapter=input_item_adapter,
         )
 
-    # ── introspection (used by the in-process worker) ─────────────
-
-    def is_streaming(self, function: FunctionName) -> bool:
-        m = self._resolve(function)
-        return m is not None and m.is_stream
-
-    def is_bidi(self, function: FunctionName) -> bool:
-        m = self._resolve(function)
-        return m is not None and m.is_bidi
-
-    def input_adapter_for(self, function: FunctionName) -> TypeAdapter[Any] | None:
-        m = self._resolve(function)
-        return m.input_item_adapter if m else None
-
     # ── call entry points ─────────────────────────────────────────
 
-    async def call_unary(self, request: RemoteRequest) -> RemoteResponse:
-        """Resolve and invoke a unary function; serialize its return value."""
-        m = self._resolve(request.function)
-        if m is None:
-            return RemoteResponse(
-                ok=False,
-                error=RemoteError(
-                    type="FunctionNotFound",
-                    message=f"no public remote function {request.function!r} on {self._target!r}",
-                ),
-            )
+    async def call_unary(self, fn: Any, request: RemoteRequest) -> RemoteResponse:
+        """Invoke a unary callable and serialize its return value."""
+        m = self._build(request.display_name, fn)
+        if m.shape != request.shape:
+            return RemoteResponse(ok=False, error=_shape_error(request.display_name, request.shape, m.shape))
+        if m.shape != "unary":
+            return RemoteResponse(ok=False, error=RemoteError(
+                type="NotAUnaryCallable",
+                message=f"callable {request.display_name!r} is {m.shape}, not unary",
+            ))
         try:
             args, kwargs = coerce_args(m, request.args, request.kwargs)
         except ValidationError as exc:
@@ -167,7 +105,7 @@ class FunctionInvoker:
             if inspect.isawaitable(result):
                 result = await result
         except Exception as exc:
-            logger.exception("remote function '%s' raised", m.name)
+            logger.exception("remote callable '%s' raised", m.name)
             return RemoteResponse(
                 ok=False,
                 error=RemoteError(
@@ -188,19 +126,16 @@ class FunctionInvoker:
             )
         return RemoteResponse(ok=True, value=value)
 
-    async def call_stream(self, request: RemoteRequest) -> AsyncIterator[dict[str, Any]]:
+    async def call_stream(self, fn: Any, request: RemoteRequest) -> AsyncIterator[dict[str, Any]]:
         """Server-streaming call. Yields {item|end|error} event dicts."""
-        m = self._resolve(request.function)
-        if m is None:
-            yield {"type": "error", "error": RemoteError(
-                type="FunctionNotFound",
-                message=f"no public remote function {request.function!r} on {self._target!r}",
-            ).model_dump()}
+        m = self._build(request.display_name, fn)
+        if m.shape != request.shape:
+            yield {"type": "error", "error": _shape_error(request.display_name, request.shape, m.shape).model_dump()}
             return
         if not m.is_stream or m.is_bidi:
             yield {"type": "error", "error": RemoteError(
                 type="NotAStreamFunction",
-                message=f"function {request.function!r} is not a non-bidi streaming function",
+                message=f"callable {request.display_name!r} is not a non-bidi streaming callable",
             ).model_dump()}
             return
         try:
@@ -224,7 +159,7 @@ class FunctionInvoker:
                     return
                 yield {"type": "item", "value": value}
         except Exception as exc:
-            logger.exception("remote stream function '%s' raised mid-stream", m.name)
+            logger.exception("remote stream callable '%s' raised mid-stream", m.name)
             yield {"type": "error", "error": RemoteError(
                 type=type(exc).__name__,
                 message=str(exc),
@@ -235,22 +170,20 @@ class FunctionInvoker:
 
     async def call_bidi(
         self,
+        fn: Any,
         request: RemoteRequest,
         input_iter: AsyncIterator[Any],
     ) -> AsyncIterator[dict[str, Any]]:
         """Bidirectional call. `input_iter` is the caller-pushed inbound stream;
         items must already match the impl's `Channel[T]` item type."""
-        m = self._resolve(request.function)
-        if m is None:
-            yield {"type": "error", "error": RemoteError(
-                type="FunctionNotFound",
-                message=f"no public remote function {request.function!r} on {self._target!r}",
-            ).model_dump()}
+        m = self._build(request.display_name, fn)
+        if m.shape != request.shape:
+            yield {"type": "error", "error": _shape_error(request.display_name, request.shape, m.shape).model_dump()}
             return
         if not m.is_bidi:
             yield {"type": "error", "error": RemoteError(
                 type="NotABidiFunction",
-                message=f"function {request.function!r} is not bidirectional",
+                message=f"callable {request.display_name!r} is not bidirectional",
             ).model_dump()}
             return
         assert m.input_channel_param is not None
@@ -286,7 +219,7 @@ class FunctionInvoker:
                     return
                 yield {"type": "item", "value": value}
         except Exception as exc:
-            logger.exception("remote bidi function '%s' raised mid-stream", m.name)
+            logger.exception("remote bidi callable '%s' raised mid-stream", m.name)
             yield {"type": "error", "error": RemoteError(
                 type=type(exc).__name__,
                 message=str(exc),
@@ -294,6 +227,17 @@ class FunctionInvoker:
             ).model_dump()}
             return
         yield {"type": "end"}
+
+    def input_adapter_for(self, fn: Any, request: RemoteRequest) -> TypeAdapter[Any] | None:
+        m = self._build(request.display_name, fn)
+        return m.input_item_adapter
+
+
+def _shape_error(display_name: str, expected: str, actual: str) -> RemoteError:
+    return RemoteError(
+        type="ShapeMismatch",
+        message=f"callable {display_name!r} was sent as {expected!r} but resolved as {actual!r}",
+    )
 
 
 __all__ = ["FunctionInvoker"]

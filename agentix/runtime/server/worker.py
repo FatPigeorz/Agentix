@@ -1,14 +1,12 @@
 """Runtime worker subprocess.
 
-The worker imports requested modules dynamically and runs remote calls
-over stdin/stdout using length-prefixed msgpack frames.
+The worker receives pickle-serialized callables and runs remote
+calls over stdin/stdout using length-prefixed msgpack frames.
 """
 
 from __future__ import annotations
 
 import asyncio
-import importlib
-import importlib.util
 import logging
 import sys
 import traceback
@@ -17,8 +15,9 @@ from typing import Any
 from agentix.invoke import FunctionInvoker
 from agentix.runtime.shared import frames as F
 from agentix.runtime.shared import pump as _pump
+from agentix.runtime.shared.callables import load_callable
 from agentix.runtime.shared.framing import read_frame, write_frame
-from agentix.runtime.shared.idents import CallId, TargetName
+from agentix.runtime.shared.idents import CallId
 from agentix.runtime.shared.models import RemoteError, RemoteRequest
 
 logger = logging.getLogger("agentix.runtime.server.worker")
@@ -32,18 +31,11 @@ def _err(exc: BaseException) -> dict[str, Any]:
     ).model_dump()
 
 
-def _module_not_loaded(module: str) -> dict[str, Any]:
-    return RemoteError(
-        type="ModuleNotLoaded",
-        message=f"module not importable in the runtime venv: {module!r}",
-    ).model_dump()
-
-
 class Worker:
-    """One process serving all importable modules in the runtime venv."""
+    """One process serving remote callable invocations."""
 
     def __init__(self) -> None:
-        self._invokers: dict[str, FunctionInvoker] = {}
+        self._invoker = FunctionInvoker()
         self._calls: dict[str, asyncio.Task] = {}
         self._bidi_queues: dict[str, asyncio.Queue] = {}
         self._bidi_intakes: dict[str, asyncio.Queue] = {}
@@ -103,17 +95,6 @@ class Worker:
     async def _send(self, payload: dict[str, Any]) -> None:
         await self._outbound_q.put(payload)
 
-    def _invoker_for(self, module_name: str) -> FunctionInvoker:
-        cached = self._invokers.get(module_name)
-        if cached is not None:
-            return cached
-        if importlib.util.find_spec(module_name) is None:
-            raise ModuleNotFoundError(module_name)
-        module = importlib.import_module(module_name)
-        invoker = FunctionInvoker(module)
-        self._invokers[module_name] = invoker
-        return invoker
-
     _RUNTIME_FRAME_HANDLERS: dict[str, str] = {
         F.CALL: "_on_call",
         F.BIDI_IN: "_on_bidi_in",
@@ -139,7 +120,9 @@ class Worker:
         call_id = frame.get("call_id", "")
         kind = frame.get("kind", F.KIND_UNARY)
         request = RemoteRequest(
-            target=TargetName(frame["target"]),
+            callable_payload=frame["callable_payload"],
+            display_name=frame["display_name"],
+            shape=frame["shape"],
             args=frame.get("args") or [],
             kwargs=frame.get("kwargs") or {},
             call_id=CallId(call_id) if call_id else None,
@@ -184,22 +167,20 @@ class Worker:
             return True
         return False
 
-    def _invoker_or_error(self, request: RemoteRequest) -> tuple[FunctionInvoker | None, dict[str, Any] | None]:
+    def _callable_or_error(self, request: RemoteRequest) -> tuple[Any | None, dict[str, Any] | None]:
         try:
-            return self._invoker_for(request.module), None
-        except ModuleNotFoundError:
-            return None, _module_not_loaded(request.module)
+            return load_callable(request.callable_payload), None
         except Exception as exc:
             return None, _err(exc)
 
     async def _run_unary(self, call_id: str, request: RemoteRequest) -> None:
-        invoker, err = self._invoker_or_error(request)
+        fn, err = self._callable_or_error(request)
         if err is not None:
             await self._send({"type": F.ERROR, "call_id": call_id, "error": err})
             return
-        assert invoker is not None
+        assert fn is not None
         try:
-            resp = await invoker.call_unary(request)
+            resp = await self._invoker.call_unary(fn, request)
         except Exception as exc:
             await self._send({"type": F.ERROR, "call_id": call_id, "error": _err(exc)})
             return
@@ -210,13 +191,13 @@ class Worker:
                               "error": (resp.error or RemoteError(type="Unknown", message="")).model_dump()})
 
     async def _run_stream(self, call_id: str, request: RemoteRequest) -> None:
-        invoker, err = self._invoker_or_error(request)
+        fn, err = self._callable_or_error(request)
         if err is not None:
             await self._send({"type": F.ERROR, "call_id": call_id, "error": err})
             return
-        assert invoker is not None
+        assert fn is not None
         try:
-            async for event in invoker.call_stream(request):
+            async for event in self._invoker.call_stream(fn, request):
                 if await self._forward_stream_event(call_id, event):
                     return
             await self._send({"type": F.STREAM_END, "call_id": call_id})
@@ -224,12 +205,12 @@ class Worker:
             await self._send({"type": F.ERROR, "call_id": call_id, "error": _err(exc)})
 
     async def _run_bidi(self, call_id: str, request: RemoteRequest, in_q: asyncio.Queue) -> None:
-        invoker, err = self._invoker_or_error(request)
+        fn, err = self._callable_or_error(request)
         if err is not None:
             await self._send({"type": F.ERROR, "call_id": call_id, "error": err})
             return
-        assert invoker is not None
-        adapter = invoker.input_adapter_for(request.function)
+        assert fn is not None
+        adapter = self._invoker.input_adapter_for(fn, request)
 
         async def _input_iter():
             while True:
@@ -245,7 +226,7 @@ class Worker:
                 yield item
 
         try:
-            async for event in invoker.call_bidi(request, _input_iter()):
+            async for event in self._invoker.call_bidi(fn, request, _input_iter()):
                 if await self._forward_stream_event(call_id, event):
                     return
             await self._send({"type": F.STREAM_END, "call_id": call_id})

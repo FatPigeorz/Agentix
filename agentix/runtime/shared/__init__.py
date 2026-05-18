@@ -11,7 +11,7 @@ The runtime is split three ways:
 
 Submodules in this package:
 
-  - `idents`   — branded NewType ids on the wire (CallId, TargetName)
+  - `idents`   — branded NewType ids on the wire (CallId)
   - `rpc`      — caller-side variants (`Channel`, `Unary`, `Stream`, `Bidi`)
   - `codec`    — msgpack pack/unpack + ext types (numpy, pydantic)
   - `events`   — Socket.IO event-name constants

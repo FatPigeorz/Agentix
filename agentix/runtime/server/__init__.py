@@ -17,8 +17,7 @@ from agentix.runtime.server.app import (
     main,
 )
 
-# `worker` alias for tests that want to register in-process targets against
-# the live runtime.
+# `worker` alias for tests that want to select the in-process backend.
 worker = _worker
 
 __all__ = [

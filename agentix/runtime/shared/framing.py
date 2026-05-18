@@ -12,7 +12,7 @@ handles encode/decode, including ext types for ndarray + pydantic models.
 Frame schemas (`{"type": "...", ...}` — extra fields per type):
 
   ─── runtime → worker ─────────────────────────────────────
-    call         {call_id, target, args, kwargs, kind: "unary"|"stream"|"bidi"}
+    call         {call_id, kind, callable_payload, display_name, shape, args, kwargs}
     bidi_in      {call_id, item}            — push input chunk to a bidi call
     bidi_end_in  {call_id}                   — close input side of a bidi call
     cancel       {call_id}                   — abort an in-flight call
@@ -28,9 +28,10 @@ Frame schemas (`{"type": "...", ...}` — extra fields per type):
 
 `call_id` correlates request frames with their response frames.
 
-Args/kwargs/values are native Python objects (msgpack round-trips them
-via codec's ext types). Pydantic validation happens on the receiving
-end via `TypeAdapter.validate_python` — there's no JSON intermediate.
+Callable payloads are stdlib pickle bytes. Args/kwargs/values are native
+Python objects (msgpack round-trips them via codec's ext types). Pydantic
+validation happens on the receiving end via `TypeAdapter.validate_python`
+— there's no JSON intermediate.
 """
 
 from __future__ import annotations

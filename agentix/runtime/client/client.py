@@ -1,10 +1,12 @@
 """Async client for the agentix runtime server.
 
 `RuntimeClient.remote(fn, *args, **kwargs)` is the entire surface. `fn`
-is any importable Python function from a Python module installed in the
-sandbox. The client sends `fn.__module__ + "::" + fn.__name__`; the
-result is decoded into `fn`'s return type. The framework's three call
-shapes (unary / stream / bidi) are detected from `fn`'s signature.
+is any Python callable that stdlib pickle can serialize. Module-level
+functions/classes and pickleable callable objects are the supported
+boundary; lambdas and local closures are intentionally out of scope. The
+result is decoded into `fn`'s return type.
+The framework's three call shapes (unary / stream / bidi) are detected
+from `fn`'s signature.
 
 Two transports underneath:
   - HTTP for unary RPC (`POST /_remote`).
@@ -20,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
-import functools
 import inspect
 import uuid
 from collections.abc import AsyncGenerator, Callable, Coroutine, Iterator, Mapping
@@ -39,6 +40,7 @@ import socketio
 from pydantic import TypeAdapter
 
 from agentix.invoke import detect_shape
+from agentix.runtime.shared.callables import display_name_for, dump_callable
 from agentix.runtime.shared.codec import pack, unpack
 from agentix.runtime.shared.events import (
     BIDI_END,
@@ -70,18 +72,13 @@ _CLIENT_CALL_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 
 
-# ── Per-call hot-path caches ─────────────────────────────────────────
+# ── Per-call hot-path helpers ────────────────────────────────────────
 #
-# `c.remote(fn, ...)` runs on every remote call. Two repeated costs would
-# otherwise dominate a tight RL loop:
-#   * `inspect.signature(fn, eval_str=True)` — PEP 563 annotation eval
-#     is ~100–500 µs per call.
-#   * `TypeAdapter(annotation)` — pydantic schema compile is ~50–200 µs
-#     per parameter.
-# Both are deterministic in `fn` / `annotation` identity, so a process-
-# wide cache is correct.
+# `c.remote(fn, ...)` runs on every remote call. TypeAdapter compilation
+# is deterministic in annotation identity, so we cache adapters process-
+# wide. Signature lookup is intentionally uncached because arbitrary
+# callable instances may be unhashable or short-lived.
 
-@functools.cache
 def _signature_of(fn: Callable) -> inspect.Signature:
     return inspect.signature(fn, eval_str=True)
 
@@ -91,8 +88,8 @@ _ADAPTER_CACHE: dict[int, TypeAdapter] = {}
 
 def _adapter_for(ann: Any) -> TypeAdapter:
     """Return a cached `TypeAdapter` for the annotation. Keyed by
-    `id(ann)`: identity-stable for annotations stored on a function's
-    `__annotations__`, which live as long as the function does."""
+    `id(ann)`: identity-stable for annotations stored on a callable's
+    `__annotations__`, which live as long as the callable does."""
     key = id(ann)
     a = _ADAPTER_CACHE.get(key)
     if a is None:
@@ -100,30 +97,28 @@ def _adapter_for(ann: Any) -> TypeAdapter:
     return a
 
 
-def _target_for(fn: Callable[..., Any]) -> str:
-    module = getattr(fn, "__module__", None)
-    name = getattr(fn, "__name__", None)
-    if not isinstance(module, str) or not module:
-        raise TypeError("remote function must have a non-empty __module__")
-    if not isinstance(name, str) or not name:
-        raise TypeError("remote function must have a non-empty __name__")
-    return f"{module}::{name}"
+def _request_base(fn: Callable[..., Any], shape: str) -> dict[str, Any]:
+    return {
+        "callable_payload": dump_callable(fn),
+        "display_name": display_name_for(fn),
+        "shape": shape,
+    }
 
 
 class RemoteCallError(RuntimeError):
-    """Raised when a remote target returns a non-ok RemoteResponse, or
+    """Raised when a remote callable returns a non-ok RemoteResponse, or
     when a stream/bidi call surfaces an `error` event from the wire."""
 
-    def __init__(self, target: str, error: RemoteError):
-        super().__init__(f"{target}: {error.type}: {error.message}")
-        self.target = target
+    def __init__(self, display_name: str, error: RemoteError):
+        super().__init__(f"{display_name}: {error.type}: {error.message}")
+        self.target = display_name
         self.error = error
 
 
-def _raise_remote_error(target: str, error: RemoteError) -> NoReturn:
+def _raise_remote_error(display_name: str, error: RemoteError) -> NoReturn:
     if error.cancelled:
         raise asyncio.CancelledError(error.message)
-    raise RemoteCallError(target=target, error=error)
+    raise RemoteCallError(display_name=display_name, error=error)
 
 
 class RuntimeClient:
@@ -221,29 +216,30 @@ class RuntimeClient:
         instance from bound arguments, and recover `T` for item validation.
 
         Returns `(param_name, channel, item_type)`. Raises if the bidi
-        function has no Channel-typed param, or the user didn't pass a
+        callable has no Channel-typed param, or the user didn't pass a
         Channel instance for it."""
+        display_name = display_name_for(fn)
         for pname, param in sig.parameters.items():
             if not is_channel_annotation(param.annotation):
                 continue
             ch = arguments.get(pname)
             if not isinstance(ch, Channel):
                 raise TypeError(
-                    f"{fn.__module__}.{fn.__name__}: bidi parameter "
+                    f"{display_name}: bidi parameter "
                     f"'{pname}' must be an agentix.Channel instance "
                     f"(got {type(ch).__name__})"
                 )
             type_args = get_args(param.annotation)
             return pname, ch, (type_args[0] if type_args else Any)
         raise TypeError(
-            f"{fn.__module__}.{fn.__name__}: bidi function has no "
+            f"{display_name}: bidi callable has no "
             f"Channel[T] parameter"
         )
 
     async def _remote_unary(self, fn, sig, args, kwargs):
-        target = _target_for(fn)
+        display_name = display_name_for(fn)
         payload = {
-            "target": target,
+            **_request_base(fn, "unary"),
             "args": _encode_args(sig, args),
             "kwargs": _encode_kwargs(sig, kwargs),
         }
@@ -259,14 +255,14 @@ class RuntimeClient:
         resp = RemoteResponse.model_validate(unpack(r.content))
         if not resp.ok:
             assert resp.error is not None
-            _raise_remote_error(target, resp.error)
+            _raise_remote_error(display_name, resp.error)
         return_ann = sig.return_annotation
         if return_ann is inspect.Signature.empty:
             return resp.value
         return _adapter_for(return_ann).validate_python(resp.value)
 
     async def _remote_stream(self, fn, sig, args, kwargs):
-        target = _target_for(fn)
+        display_name = display_name_for(fn)
         sio = await self._ensure_sio()
         outer_call_id = _CLIENT_CALL_ID.get()
         call_id = outer_call_id or uuid.uuid4().hex
@@ -278,8 +274,8 @@ class RuntimeClient:
         terminated = False
         try:
             payload = {
+                **_request_base(fn, "stream"),
                 "call_id": call_id,
-                "target": target,
                 "args": _encode_args(sig, args),
                 "kwargs": _encode_kwargs(sig, kwargs),
             }
@@ -292,7 +288,7 @@ class RuntimeClient:
                 if kind == "error":
                     err = RemoteError.model_validate(data["error"])
                     terminated = True
-                    _raise_remote_error(target, err)
+                    _raise_remote_error(display_name, err)
                 if kind == "item":
                     yield item_adapter.validate_python(data["value"])
         finally:
@@ -313,7 +309,7 @@ class RuntimeClient:
         by `_extract_channel` in `remote()`; this method does not
         re-scan the signature.
         """
-        target = _target_for(fn)
+        display_name = display_name_for(fn)
 
         non_channel_kwargs = dict(bound_arguments)
         non_channel_kwargs.pop(chan_name, None)
@@ -329,8 +325,8 @@ class RuntimeClient:
         self._pending[call_id] = q
 
         payload = {
+            **_request_base(fn, "bidi"),
             "call_id": call_id,
-            "target": target,
             "args": [], "kwargs": non_channel_kwargs,
         }
         await sio.emit(BIDI_START, pack(payload))
@@ -356,7 +352,7 @@ class RuntimeClient:
                 if kind == "error":
                     err = RemoteError.model_validate(data["error"])
                     terminated = True
-                    _raise_remote_error(target, err)
+                    _raise_remote_error(display_name, err)
                 if kind == "item":
                     yield out_adapter.validate_python(data["value"])
         finally:

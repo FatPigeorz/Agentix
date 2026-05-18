@@ -4,9 +4,9 @@
 
 **Sandboxed rollouts you call like typed Python.**
 
-Turn agents, tools, and scorers into importable functions. Package them
-into runtime images. Call them from evaluators, trainers, and orchestration
-code without writing a new runner for every pairing.
+Turn agents, tools, and scorers into Python callables. Package their
+dependencies into runtime images. Call them from evaluators, trainers,
+and orchestration code without writing a new runner for every pairing.
 
 [![GitHub Stars](https://img.shields.io/github/stars/Agentiix/Agentix)](https://github.com/Agentiix/Agentix)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
@@ -20,9 +20,9 @@ code without writing a new runner for every pairing.
 
 Agentix has two primitives:
 
-- **Remote calls**: `client.remote(fn, *args, **kwargs)` runs an
-  importable Python function inside a sandbox worker. The target is
-  derived from the function object: `fn.__module__ + "::" + fn.__name__`.
+- **Remote calls**: `client.remote(fn, *args, **kwargs)` runs a Python
+  callable inside a sandbox worker. The callable is serialized with
+  stdlib pickle, Python's native callable reference mechanism.
 - **Bundles**: `agentix build [path]` packages a Python project and its
   declared dependencies into a deploy-ready runtime image.
 
@@ -35,7 +35,7 @@ async with RuntimeClient(sandbox.runtime_url) as client:
 ```
 
 The unit of composition is not a bespoke benchmark runner or agent
-adapter. It is a Python function.
+adapter. It is a Python callable.
 
 ## Why Agentix Exists
 
@@ -44,8 +44,9 @@ needs a Python harness. A benchmark needs repo setup, grading scripts,
 and logs. A training loop needs the same pieces batched across many
 sandboxes.
 
-Agentix collapses that matrix into one execution contract: if code is
-installed in the bundle and importable by Python, the host can call it.
+Agentix collapses that matrix into one execution contract: if Python can
+serialize the callable and the sandbox has its dependencies, the host can
+call it.
 
 | You have | You expose | You call |
 | --- | --- | --- |
@@ -58,8 +59,9 @@ installed in the bundle and importable by Python, the host can call it.
 
 - **Typed remote calls** across the host-to-sandbox boundary.
 - **Unary, streaming, and bidirectional call shapes** inferred from
-  function signatures.
-- **One runtime worker process** that imports installed modules on demand.
+  callable signatures.
+- **One runtime worker process today** behind an internal worker backend
+  boundary, so future pools or per-call isolation can stay API-compatible.
 - **Bundle builds** from normal Python projects and `pyproject.toml`
   dependencies.
 - **Optional Nix system dependencies** when a project includes
@@ -89,7 +91,7 @@ Build a bundle:
 agentix build ./hello-agentix -o hello-agentix:0.1.0
 ```
 
-Deploy it and call the function:
+Deploy it and call the callable:
 
 ```python
 import asyncio
@@ -120,19 +122,19 @@ package layout and runtime-image prerequisites.
 ```text
 Host process
   RuntimeClient.remote(fn, ...)
-    builds "module.path::function_name"
+    serializes callable with pickle
     detects unary / stream / bidi
     encodes args and kwargs
         |
         v
-Sandbox runtime
+Sandbox
   agentix-server
         |
         v
   worker subprocess
-    imports module.path
+    unpickles callable
     validates args
-    calls function_name(*args, **kwargs)
+    calls fn(*args, **kwargs)
 ```
 
 Unary calls use HTTP `POST /_remote`. Streaming and bidirectional calls

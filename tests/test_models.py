@@ -9,11 +9,12 @@ from agentix.runtime.shared.models import RemoteError, RemoteRequest, RemoteResp
 
 
 def test_remote_request_defaults():
-    r = RemoteRequest(target="agentix.echo::echo")
+    r = RemoteRequest(callable_payload=b"payload", display_name="agentix.echo::echo", shape="unary")
     assert r.args == []
     assert r.kwargs == {}
-    assert r.module == "agentix.echo"
-    assert r.function == "echo"
+    assert r.callable_payload == b"payload"
+    assert r.display_name == "agentix.echo::echo"
+    assert r.shape == "unary"
 
 
 def test_remote_response_ok_shape():

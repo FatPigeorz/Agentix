@@ -2,11 +2,9 @@
 
 This module bridges FastAPI/Socket.IO handlers to the worker process. It owns
 one worker subprocess per runtime server process, routes calls by `call_id`,
-and shuts the worker down with the server.
-
-The worker imports the requested target module dynamically for each call,
-so the dependency model stays simple: anything installed into
-`/nix/runtime` can be called through `RuntimeClient.remote(fn, ...)`.
+and shuts the worker down with the server. The current single-worker topology
+is intentionally hidden behind the `WorkerBackend` protocol so future pools or
+per-call isolation do not change `RuntimeClient.remote(fn, ...)`.
 """
 
 from __future__ import annotations
@@ -18,11 +16,11 @@ import os
 import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
-from types import ModuleType
 from typing import Any, Protocol
 
 from agentix.invoke import FunctionInvoker
 from agentix.runtime.shared import frames as F
+from agentix.runtime.shared.callables import load_callable
 from agentix.runtime.shared.framing import read_frame, write_frame
 from agentix.runtime.shared.models import RemoteError, RemoteRequest, RemoteResponse
 
@@ -56,7 +54,9 @@ def _clean_worker_env(runtime_bin_dir: Path | None) -> dict[str, str]:
     return env
 
 
-class _WorkerLike(Protocol):
+class WorkerBackend(Protocol):
+    """Internal execution backend boundary for runtime call handling."""
+
     async def call_unary(self, request: RemoteRequest) -> RemoteResponse: ...
     def iter_stream(self, request: RemoteRequest) -> AsyncIterator[dict[str, Any]]: ...
     def iter_bidi(
@@ -66,42 +66,39 @@ class _WorkerLike(Protocol):
 
 
 class _InProcessWorker:
-    """Test worker that calls explicitly registered targets."""
+    """Test worker that invokes the serialized callable in-process."""
 
     def __init__(self) -> None:
-        self._invokers: dict[str, FunctionInvoker] = {}
+        self._invoker = FunctionInvoker()
 
-    def register(self, module: str, invoker: FunctionInvoker) -> None:
-        self._invokers[module] = invoker
-
-    def has(self, module: str) -> bool:
-        return module in self._invokers
-
-    def _invoker_for(self, request: RemoteRequest) -> FunctionInvoker | None:
-        return self._invokers.get(request.module)
+    def _callable_or_error(self, request: RemoteRequest) -> tuple[Any | None, RemoteError | None]:
+        try:
+            return load_callable(request.callable_payload), None
+        except Exception as exc:
+            return None, RemoteError(type=type(exc).__name__, message=str(exc))
 
     async def call_unary(self, request: RemoteRequest) -> RemoteResponse:
-        invoker = self._invoker_for(request)
-        if invoker is None:
-            return RemoteResponse(ok=False, error=_module_not_loaded(request.module))
-        return await invoker.call_unary(request)
+        fn, err = self._callable_or_error(request)
+        if err is not None:
+            return RemoteResponse(ok=False, error=err)
+        return await self._invoker.call_unary(fn, request)
 
     async def iter_stream(self, request: RemoteRequest) -> AsyncIterator[dict[str, Any]]:
-        invoker = self._invoker_for(request)
-        if invoker is None:
-            yield {"type": "error", "error": _module_not_loaded(request.module).model_dump()}
+        fn, err = self._callable_or_error(request)
+        if err is not None:
+            yield {"type": "error", "error": err.model_dump()}
             return
-        async for ev in invoker.call_stream(request):
+        async for ev in self._invoker.call_stream(fn, request):
             yield ev
 
     async def iter_bidi(
         self, request: RemoteRequest, input_iter: AsyncIterator[Any],
     ) -> AsyncIterator[dict[str, Any]]:
-        invoker = self._invoker_for(request)
-        if invoker is None:
-            yield {"type": "error", "error": _module_not_loaded(request.module).model_dump()}
+        fn, err = self._callable_or_error(request)
+        if err is not None:
+            yield {"type": "error", "error": err.model_dump()}
             return
-        adapter = invoker.input_adapter_for(request.function)  # type: ignore[arg-type]
+        adapter = self._invoker.input_adapter_for(fn, request)
 
         async def _coerced():
             async for raw in input_iter:
@@ -109,7 +106,7 @@ class _InProcessWorker:
                     raw = adapter.validate_python(raw)
                 yield raw
 
-        async for ev in invoker.call_bidi(request, _coerced()):
+        async for ev in self._invoker.call_bidi(fn, request, _coerced()):
             yield ev
 
     async def shutdown(self) -> None:
@@ -246,7 +243,9 @@ class _SubprocessWorker:
             "type": F.CALL,
             "kind": kind,
             "call_id": cid,
-            "target": request.target,
+            "callable_payload": request.callable_payload,
+            "display_name": request.display_name,
+            "shape": request.shape,
             "args": request.args,
             "kwargs": request.kwargs,
         }
@@ -353,32 +352,20 @@ def _new_id() -> str:
     return uuid.uuid4().hex
 
 
-def _module_not_loaded(module: str) -> RemoteError:
-    return RemoteError(
-        type="ModuleNotLoaded",
-        message=f"module not importable in the runtime venv: {module!r}",
-    )
-
-
 class RuntimeWorkerClient:
     """Owns one worker process and routes all runtime calls through it."""
 
     def __init__(self) -> None:
         self._python: str = sys.executable
         self._runtime_bin_dir: Path = Path(sys.executable).parent
-        self._worker: _WorkerLike | None = None
+        self._worker: WorkerBackend | None = None
         self._spawn_lock = asyncio.Lock()
         self._inprocess = _InProcessWorker()
 
-    def _register_inprocess(self, target: Any) -> None:
-        module = target.__name__ if isinstance(target, ModuleType) else target.__module__
-        self._inprocess.register(module, FunctionInvoker(target))
+    def _use_inprocess(self) -> None:
         self._worker = self._inprocess
 
-    def has(self, module: str) -> bool:
-        return self._inprocess.has(module)
-
-    async def _get_worker(self) -> _WorkerLike:
+    async def _get_worker(self) -> WorkerBackend:
         if self._worker is not None:
             return self._worker
         async with self._spawn_lock:

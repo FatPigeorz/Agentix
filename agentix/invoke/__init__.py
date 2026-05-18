@@ -1,8 +1,7 @@
-"""Server-side function invocation helpers.
+"""Server-side callable invocation helpers.
 
-`FunctionInvoker(target).call_unary(req)` looks up `req.function` on
-`target` and invokes it; functions bind lazily on first call
-(TypeAdapter compile is cached per function).
+`FunctionInvoker().call_unary(fn, req)` validates args against `fn`'s
+signature, invokes the callable, and serializes the result.
 
 Split into:
 

@@ -3,16 +3,12 @@
 This file is the runtime wire contract for `RuntimeClient.remote(fn, ...)`.
 Tests in `tests/test_rpc_protocol.py` enforce these rules.
 
-## Target
+## Callable Payload
 
-The client derives the remote target from the function object:
-
-```python
-target = f"{fn.__module__}::{fn.__name__}"
-```
-
-The target is the only function address sent over the wire. Args and
-kwargs are sent separately.
+The client serializes the callable with stdlib pickle. Module-level
+functions/classes and pickleable callable objects are supported. Lambdas
+and local closures are intentionally outside the protocol boundary. Args
+and kwargs are sent separately.
 
 Example:
 
@@ -22,7 +18,7 @@ from my_project.tasks import run
 await client.remote(run, seed=42)
 ```
 
-Wire target:
+Wire request display name:
 
 ```text
 my_project.tasks::run
@@ -37,12 +33,13 @@ my_project.tasks::run
 | worker stdin/stdout | all three | length-prefixed msgpack frames |
 
 HTTP and Socket.IO are the host-to-runtime edge. Stdin/stdout is the
-runtime-to-worker edge inside the sandbox. One worker subprocess serves
-all importable modules for a runtime.
+runtime-to-worker edge inside the sandbox. The current implementation
+uses one worker subprocess per runtime; future worker topologies should
+not change this protocol's user-facing API.
 
 ## Shapes
 
-`RuntimeClient.remote` and the worker use the same shape rules:
+`RuntimeClient.remote` and the worker use the same callable shape rules:
 
 ```text
 async generator + Channel[T] parameter -> bidi
@@ -53,7 +50,7 @@ everything else                        -> unary
 `inspect.isasyncgenfunction` is the source of truth for stream/bidi. A
 regular `async def` returning an iterator value is unary.
 
-| Shape | Function signature | Client-side return |
+| Shape | Callable signature | Client-side return |
 | --- | --- | --- |
 | unary | `async def f(...) -> T` | `Unary[T]` (awaitable) |
 | stream | `async def f(...) -> AsyncIterator[T]: yield ...` | `Stream[T]` |
@@ -65,7 +62,9 @@ Request body:
 
 ```python
 {
-    "target": "my_project.tasks::run",
+    "callable_payload": b"...pickle...",
+    "display_name": "my_project.tasks::run",
+    "shape": "unary",
     "args": [],
     "kwargs": {"seed": 42},
     "call_id": "optional-correlation-key",
@@ -84,15 +83,15 @@ Failures stay in-band:
 {"ok": False, "value": None, "error": {...}}
 ```
 
-The HTTP status remains 200 when the remote function raises or when the
-target cannot be imported.
+The HTTP status remains 200 when the remote callable raises or when the
+callable payload cannot be loaded.
 
 ## Socket.IO Events
 
 Stream:
 
 ```text
-stream       {call_id, target, args, kwargs}
+stream       {call_id, callable_payload, display_name, shape, args, kwargs}
 stream:item  {call_id, value}
 stream:end   {call_id}
 stream:error {call_id, error}
@@ -101,7 +100,7 @@ stream:error {call_id, error}
 Bidi:
 
 ```text
-bidi:start   {call_id, target, args, kwargs}
+bidi:start   {call_id, callable_payload, display_name, shape, args, kwargs}
 bidi:in      {call_id, item}
 bidi:end_in  {call_id}
 bidi:out     {call_id, value}
@@ -118,7 +117,7 @@ dicts.
 
 | Direction | Frame | Payload fields |
 | --- | --- | --- |
-| server -> worker | `CALL` | call_id, kind, target, args, kwargs |
+| server -> worker | `CALL` | call_id, kind, callable_payload, display_name, shape, args, kwargs |
 | server -> worker | `BIDI_IN` | call_id, item |
 | server -> worker | `BIDI_END_IN` | call_id |
 | server -> worker | `CANCEL` | call_id |
@@ -137,8 +136,8 @@ dicts.
 2. **Closed calls are quiet.** After a terminal result, later frames for
    the same `call_id` are dropped.
 3. **Dual-side validation.** The client serializes args/kwargs through
-   pydantic adapters derived from the local function signature. The
-   worker validates received args/kwargs against the imported function
+   pydantic adapters derived from the local callable signature. The
+   worker validates received args/kwargs against the unpickled callable
    signature before calling it. Return values and stream items are
    serialized by the worker and validated by the client.
 4. **Cancellation closes the call.** `CANCEL` causes
@@ -167,8 +166,8 @@ Client mapping:
 
 Common framework errors:
 
-- `ModuleNotLoaded` — target module is not importable in the runtime venv.
-- `FunctionNotFound` — target function name is not present on the module.
+- `ShapeMismatch` — client and worker resolved different call shapes.
+- `UnpicklingError` / `ValueError` — callable payload could not be loaded.
 - `ValidationError` — args/kwargs failed pydantic validation.
 - `SerializationError` — return value or stream item could not be
   serialized.

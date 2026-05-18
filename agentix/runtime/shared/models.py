@@ -7,11 +7,13 @@ side). Both client and server import from here.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from agentix.runtime.shared.idents import CallId, FunctionName, ModulePath, TargetName
+from agentix.runtime.shared.idents import CallId
+
+CallShape = Literal["unary", "stream", "bidi"]
 
 
 class HealthResponse(BaseModel):
@@ -22,32 +24,24 @@ class HealthResponse(BaseModel):
 class RemoteRequest(BaseModel):
     """Remote call request.
 
-    `target` is the function address derived from the caller's function
-    object: `fn.__module__ + "::" + fn.__name__`.
+    The callable itself is serialized with stdlib pickle. Module-level
+    functions/classes and pickleable callable objects are the supported
+    boundary; lambdas and local closures are intentionally out of scope.
     """
 
-    target: TargetName
+    callable_payload: bytes
+    display_name: str
+    shape: CallShape
     args: list[Any] = Field(default_factory=list)
     kwargs: dict[str, Any] = Field(default_factory=dict)
     call_id: CallId | None = None
 
-    @field_validator("target")
+    @field_validator("display_name")
     @classmethod
-    def _validate_target(cls, value: str) -> str:
-        module, sep, function = value.partition("::")
-        if sep != "::" or not module or not function or "::" in function:
-            raise ValueError("target must be in 'module.path::function_name' form")
+    def _validate_display_name(cls, value: str) -> str:
+        if not value:
+            raise ValueError("display_name must be non-empty")
         return value
-
-    @property
-    def module(self) -> ModulePath:
-        module, _, _ = str(self.target).partition("::")
-        return ModulePath(module)
-
-    @property
-    def function(self) -> FunctionName:
-        _, _, function = str(self.target).partition("::")
-        return FunctionName(function)
 
 
 class RemoteError(BaseModel):

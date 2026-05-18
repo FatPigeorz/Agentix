@@ -1,8 +1,8 @@
 """Shared fixtures for agentix tests.
 
-Production remote calls import modules inside a worker process. Protocol
-tests can instead inject classes directly into an in-process worker so
-they exercise Socket.IO and `/_remote` without subprocess stdio.
+Production remote calls execute pickle-serialized callables inside a
+worker process. Protocol tests can switch the runtime to an in-process
+worker so they exercise HTTP/Socket.IO without subprocess stdio.
 """
 
 from __future__ import annotations
@@ -54,22 +54,14 @@ def runtime_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
-def register_target(runtime_module) -> Callable[..., None]:
-    """Inject a test target into the runtime worker in-process.
-
-    Usage:
-        register_target(Echo)
-
-    The class's `__module__` is the routing key. The worker client binds
-    it in-process and calls synchronously, skipping subprocess
-    stdio plumbing for protocol tests.
-    """
+def use_inprocess_worker(runtime_module) -> Callable[[], None]:
+    """Route protocol tests through the in-process worker backend."""
     server, _, _ = runtime_module
 
-    def _register(cls: type) -> None:
-        server.worker._register_inprocess(cls)
+    def _use() -> None:
+        server.worker._use_inprocess()
 
-    return _register
+    return _use
 
 
 @pytest.fixture(autouse=True)
@@ -92,7 +84,7 @@ async def live_server(runtime_module):
     serving the runtime's combined FastAPI+Socket.IO ASGI app.
 
     Test order:
-        1. register_target(...)        # register in-process test targets
+        1. optionally use_inprocess_worker()
         2. base_url = await start()     # uvicorn starts
         3. connect via RuntimeClient(base_url) etc.
 

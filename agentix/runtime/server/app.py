@@ -9,8 +9,9 @@ Endpoints:
   `call_id`
 - `GET /health`
 
-Any importable Python module can expose remote functions. The worker
-imports requested modules on demand.
+Remote requests carry a stdlib pickle-serialized callable. Module-level
+functions/classes and pickleable callable objects are the supported
+boundary.
 """
 
 from __future__ import annotations
@@ -63,7 +64,7 @@ async def health() -> HealthResponse:
 async def remote_call(request: Request) -> Response:
     """Unary remote-call endpoint. Spawns the worker on first call.
 
-    Body: msgpack-encoded `{"target", "args", "kwargs", "call_id"}`.
+    Body: msgpack-encoded `{"callable_payload", "display_name", "shape", "args", "kwargs", "call_id"}`.
     Response: msgpack-encoded `RemoteResponse` dict. Always 200 — error
     info lives in the response body (`{"ok": false, "error": {...}}`).
     Streaming + bidi methods live on the Socket.IO connection instead.
@@ -92,7 +93,7 @@ app.state = _fastapi_app.state  # type: ignore[attr-defined]
 app.sio = _sio  # type: ignore[attr-defined]
 
 
-# ── Entry point (the bundle image's Docker ENTRYPOINT) ─────────
+# ── Entry point (the bundle image's server command) ─────────
 
 
 def main() -> None:

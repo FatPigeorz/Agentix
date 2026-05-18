@@ -23,8 +23,8 @@ class FlyDeployment:                          # no inheritance, structural type
     async def get(self, sid): ...
 ```
 
-`agentix deploy fly --image my-agent:0.1.0` works after the install
-with zero framework changes.
+`agentix deploy fly --image my-agent:0.1.0` works after the install with
+zero framework changes.
 """
 
 from __future__ import annotations
@@ -47,13 +47,13 @@ SandboxId = NewType("SandboxId", str)
 class SandboxConfig(BaseModel):
     """Configuration a deployment uses to provision a sandbox.
 
-    The image is a deploy-ready bundle produced by `agentix build` —
-    it carries the runtime + every pip-installed plugin in one venv,
-    plus any system deps under `/nix`. The deployment just runs it.
+    The image is the Agentix runtime bundle produced by `agentix build`.
+    Local Docker can use that image directly; hosted deployments push or
+    register it with the backend service.
     """
 
     image: str = Field(
-        description="Deploy-ready bundle image ref, e.g. `my-agent:0.1.0`.",
+        description="Agentix runtime bundle image ref, e.g. `my-agent:0.1.0`.",
     )
     env: dict[str, str] | None = Field(
         default=None,

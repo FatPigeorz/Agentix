@@ -1,9 +1,9 @@
 """Plugin registry for the `agentix.deployment` entry-point group.
 
 Lives under `agentix.deployment` because deployments are the only
-framework axis discovered via entry points. Remote functions are plain
-importable Python modules; only sandbox lifecycle backends need a
-name-to-class registry for `agentix deploy <name>`.
+framework axis discovered via entry points. Remote callables do not need
+a framework registry; only sandbox lifecycle backends need a name-to-class
+registry for `agentix deploy <name>`.
 
 Two ways to find plugins:
 

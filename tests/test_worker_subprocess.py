@@ -16,8 +16,8 @@ import pytest
 
 from agentix.runtime.server.worker_client import RuntimeWorkerClient
 from agentix.runtime.shared.models import RemoteRequest
-
-_MODULE = "tests._worker_target"
+from tests import _worker_target as target
+from tests._rpc_helpers import request_for
 
 
 @pytest.fixture
@@ -33,31 +33,28 @@ def _make_worker_client() -> RuntimeWorkerClient:
 
 
 async def test_subprocess_worker_unary_round_trip(worker_env):
-    """A real worker subprocess runs a function and returns the value."""
+    """A real worker subprocess runs a callable and returns the value."""
     mp = _make_worker_client()
     try:
-        resp = await mp.call_unary(RemoteRequest(
-            target=f"{_MODULE}::echo", kwargs={"msg": "hi"},
-        ))
+        resp = await mp.call_unary(request_for(target.echo, kwargs={"msg": "hi"}))
         assert resp.ok, resp.error
         assert resp.value == {"msg": "echo:hi"}
     finally:
         await mp.shutdown()
 
 
-async def test_subprocess_worker_unknown_module_fails_without_hanging(worker_env):
-    """An unimportable module must surface an error, not hang."""
+async def test_subprocess_worker_bad_callable_payload_fails_without_hanging(worker_env):
+    """A bad callable payload must surface an error, not hang."""
     mp = RuntimeWorkerClient()
     mp._python = sys.executable
     try:
         resp = await asyncio.wait_for(mp.call_unary(RemoteRequest(
-            target="agentix.missing::x",
+            callable_payload=b"not-a-pickle", display_name="bad", shape="unary",
         )), timeout=20)
     finally:
         await mp.shutdown()
     assert not resp.ok
     assert resp.error is not None
-    assert resp.error.type == "ModuleNotLoaded"
 
 
 async def test_subprocess_worker_streaming(worker_env):
@@ -65,9 +62,7 @@ async def test_subprocess_worker_streaming(worker_env):
     mp = _make_worker_client()
     try:
         events = []
-        async for ev in mp.call_stream(RemoteRequest(
-            target=f"{_MODULE}::counter", kwargs={"n": 3},
-        )):
+        async for ev in mp.call_stream(request_for(target.counter, kwargs={"n": 3})):
             events.append(ev)
             if ev.get("type") in ("end", "error"):
                 break
@@ -84,15 +79,11 @@ async def test_subprocess_worker_death_fails_in_flight_stream(worker_env):
     mp = _make_worker_client()
     try:
         # Force the worker to spawn by issuing one unary first.
-        resp = await mp.call_unary(RemoteRequest(
-            target=f"{_MODULE}::echo", kwargs={"msg": "warm"},
-        ))
+        resp = await mp.call_unary(request_for(target.echo, kwargs={"msg": "warm"}))
         assert resp.ok
 
         # Start a long stream, kill the worker before it completes.
-        gen = mp.call_stream(RemoteRequest(
-            target=f"{_MODULE}::counter", kwargs={"n": 1_000_000},
-        ))
+        gen = mp.call_stream(request_for(target.counter, kwargs={"n": 1_000_000}))
         events: list[dict] = []
 
         async def _drain() -> None:

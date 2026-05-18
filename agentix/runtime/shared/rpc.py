@@ -51,7 +51,7 @@ _CHANNEL_CLOSED: Any = object()
 class Channel(AsyncIterator[In], Generic[In]):
     """User-pushed async channel for bidi inputs.
 
-    Satisfies `AsyncIterator[I]` — `Channel[T]` as a bidi function's
+    Satisfies `AsyncIterator[I]` — `Channel[T]` as a bidi callable's
     parameter annotation is what marks the call as bidi (see
     `agentix.invoke.detect_shape`). The caller pushes items with
     `await ch.send(item)`; `await ch.close()` signals end-of-input.

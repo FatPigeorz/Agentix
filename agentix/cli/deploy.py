@@ -1,19 +1,16 @@
-"""`agentix deploy` — run a bundle image as a sandbox via a deployment backend.
+"""`agentix deploy` — deploy an Agentix runtime bundle to a backend.
 
 Usage:
 
-    agentix deploy local   --image my-agent:0.1.0
-    agentix deploy local   --image my-agent:0.1.0 --detach
-    agentix deploy daytona --image docker.io/me/my-agent:0.1.0    # stub
-    agentix deploy e2b     --image docker.io/me/my-agent:0.1.0    # stub
+    agentix deploy daytona --image docker.io/me/my-agent:0.1.0
+    agentix deploy e2b     --image docker.io/me/my-agent:0.1.0
 
-`local` is the only backend fully wired today. `daytona` and `e2b` are
-defined so the CLI surface stabilizes; calling them surfaces a clear
-NotImplementedError pointing at the deploy roadmap.
+Local Docker normally does not need `agentix deploy`: the image is
+already available locally after `agentix build`. Hosted backends use this
+command to make the bundle available to the corresponding cluster or
+service.
 
-The `--image` is a deploy-ready bundle produced by `agentix build` —
-it carries the runtime + every installed target + any system deps in one
-image. The deployment just runs it.
+`--image` is the Agentix runtime bundle produced by `agentix build`.
 
 By default the command stays in the foreground, prints the sandbox's
 runtime URL, and tears the sandbox down on Ctrl-C. `--detach` exits
@@ -60,7 +57,7 @@ async def _run_async(backend: str, args: Any) -> int:
         return 0
 
     # Foreground mode: stay alive until SIGINT, then tear down.
-    print(f"creating sandbox from {args.image}…", file=sys.stderr)
+    print(f"deploying runtime bundle {args.image}…", file=sys.stderr)
     async with session(deployment, config) as sandbox:
         print(f"sandbox alive: {sandbox.sandbox_id}")
         print(f"  runtime_url: {sandbox.runtime_url}")
@@ -90,7 +87,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument(
         "--image", required=True,
-        help="deploy-ready bundle image tag (e.g. my-agent:0.1.0)",
+        help="Agentix runtime bundle image tag produced by `agentix build`",
     )
     parser.add_argument(
         "--detach", action="store_true",

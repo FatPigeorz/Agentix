@@ -5,17 +5,17 @@ Agentix has two core pieces:
 1. **Bundle**: build one runtime image containing the framework, user
    code, integration modules, Python dependencies, and optional system
    binaries.
-2. **Remote calls**: call functions inside that runtime image from
+2. **Remote calls**: call Python callables inside that runtime image from
    host-side Python with `RuntimeClient.remote(fn, ...)`.
 
 The important split is simple:
 
 - Bundle decides what code and dependencies exist in the sandbox.
-- `client.remote(fn, ...)` decides which installed function to run.
+- `client.remote(fn, ...)` decides which callable to run.
 
 ## Programming Model
 
-Users pass a normal imported Python function:
+Users pass a normal Python callable:
 
 ```python
 from agentix import RuntimeClient
@@ -33,7 +33,9 @@ import app
 result = await client.remote(app.run, input="hello")
 ```
 
-Both forms give Agentix the same function object.
+Both forms give Agentix the same callable object. Agentix transports
+callables with stdlib pickle, so module-level functions/classes and
+pickleable callable objects are the supported boundary.
 
 ## Bundle
 
@@ -108,12 +110,9 @@ await asyncio.create_subprocess_exec("claude", "-p", instruction)
 
 ## Remote Calls
 
-`RuntimeClient.remote(fn, ...)` reads two attributes from the function
-object:
-
-```python
-target = f"{fn.__module__}::{fn.__name__}"
-```
+`RuntimeClient.remote(fn, ...)` serializes the callable with stdlib
+pickle and sends that callable payload plus args and kwargs to the
+runtime. Pickle is Python's native callable reference mechanism.
 
 For example:
 
@@ -123,39 +122,42 @@ from agentix.swebench import run
 score = await client.remote(run, instance=inst, patch=patch)
 ```
 
-becomes:
+is sent as a callable payload with a display name like:
 
 ```text
 agentix.swebench::run
 ```
 
-The request body contains that target plus serialized args and kwargs:
+The request body contains the callable payload plus serialized args and
+kwargs:
 
 ```python
 {
-    "target": "agentix.swebench::run",
+    "callable_payload": b"...pickle...",
+    "display_name": "agentix.swebench::run",
+    "shape": "unary",
     "args": [],
     "kwargs": {"instance": inst, "patch": patch},
 }
 ```
 
-The runtime worker imports `agentix.swebench` inside the sandbox and
-calls `run(...)`.
+The runtime worker unpickles the callable inside the sandbox and invokes
+it. For importable callables this resolves to the sandbox-installed
+module implementation.
 
 Arguments are passed as msgpack payloads. Before sending, the client
 uses the local function signature and type annotations to serialize
-positional and keyword arguments. Inside the worker, the same signature
-is resolved from the imported function, and pydantic validates/coerces
-the received values before the function is called. Return values and
-stream items are serialized the same way on the way back.
+positional and keyword arguments. Inside the worker, the signature is
+resolved from the unpickled callable, and pydantic validates/coerces the
+received values before the callable is invoked. Return values and stream
+items are serialized the same way on the way back.
 
 ## Flow
 
 ```text
 Host
   RuntimeClient.remote(fn, ...)
-    read fn.__module__ and fn.__name__
-    build "module.path::function_name"
+    pickle callable
     detect unary / stream / bidi
     encode args and kwargs
       |
@@ -165,8 +167,8 @@ Sandbox
       |
       v
 Single runtime worker process
-  import module.path
-  call function_name(*args, **kwargs)
+  unpickle callable
+  call fn(*args, **kwargs)
 ```
 
 ## Call Shapes
@@ -187,17 +189,18 @@ Shape detection is structural:
 
 ## Worker Model
 
-The runtime server owns one worker subprocess. That worker handles all
-remote calls for the runtime.
+The current runtime server owns one worker subprocess. That worker
+handles all remote calls for the runtime. This is an implementation
+detail: future runtimes may use worker pools or per-call isolation
+without changing `RuntimeClient.remote(...)`.
 
 For each call, the worker:
 
-1. splits `target` into module path and function name
-2. imports the module on demand
-3. caches the prepared function metadata
-4. validates args with pydantic
-5. calls the function
-6. serializes the return value or stream items
+1. unpickles the callable payload
+2. detects and verifies the expected call shape
+3. validates args with pydantic
+4. calls the callable
+5. serializes the return value or stream items
 
 The worker uses the same `/nix/runtime` venv as the runtime server, so
 anything installed into the bundle can be imported by the worker.
@@ -224,6 +227,6 @@ runtime environment.
 
 ```text
 Bundle = what code and dependencies exist in the sandbox
-client.remote(fn) = which installed function to call
-Worker = where the function executes
+client.remote(fn) = which callable to call
+Worker = where the callable executes
 ```

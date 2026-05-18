@@ -7,8 +7,8 @@ clients send bytes, server receives bytes, vice versa.
 Wire (Socket.IO event names + payload dicts):
 
   client → server:
-    "stream"       {call_id, target, args, kwargs}
-    "bidi:start"   {call_id, target, args, kwargs}
+    "stream"       {call_id, callable_payload, display_name, shape, args, kwargs}
+    "bidi:start"   {call_id, callable_payload, display_name, shape, args, kwargs}
     "bidi:in"      {call_id, item}
     "bidi:end_in"  {call_id}
     "cancel"       {call_id}
@@ -147,7 +147,9 @@ def make_sio(
         async def _drive() -> None:
             try:
                 request = RemoteRequest(
-                    target=payload["target"],
+                    callable_payload=payload["callable_payload"],
+                    display_name=payload["display_name"],
+                    shape=payload["shape"],
                     args=payload.get("args") or [],
                     kwargs=payload.get("kwargs") or {},
                     call_id=CallId(call_id),
@@ -186,7 +188,9 @@ def make_sio(
 
         try:
             request = RemoteRequest(
-                target=payload["target"],
+                callable_payload=payload["callable_payload"],
+                display_name=payload["display_name"],
+                shape=payload["shape"],
                 args=payload.get("args") or [],
                 kwargs=payload.get("kwargs") or {},
                 call_id=CallId(call_id),

@@ -10,7 +10,7 @@
     (`python -m agentix.runtime.server.worker`).
 
 Importing this top-level package does NOT eagerly import `client` or
-`server` — that would create a circular path through function-shape
+`server` — that would create a circular path through callable-shape
 helpers
 when other modules pull wire types from `agentix.runtime.shared.models`.
 Reach for the leaf you need explicitly, e.g.

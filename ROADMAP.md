@@ -1,54 +1,125 @@
 # Roadmap
 
-## v0.1.0 — RPC + bundle (current)
+Agentix keeps two user-facing concepts:
 
-Two concepts, no more:
+- **Remote calls.** `c.remote(fn, ...)` calls a callable target inside a
+  sandbox. The callable is serialized with stdlib pickle, and the call
+  shape is detected from its signature.
+- **Bundle.** `agentix build [path]` packages one project root and its
+  declared dependencies into a deploy-ready runtime image.
 
-- **RPC.** `c.remote(fn, ...)` calls any importable Python function
-  in a sandboxed worker subprocess. `unary`, server-`stream`, and
-  `bidi` shapes are detected from the function signature; the wire
-  flows over HTTP for unary and Socket.IO for the rest.
-- **Bundle.** `agentix build [path]` packages one project root + its
-  declared deps into a deploy-ready Docker image. Integrations arrive
-  transitively via pip; the runtime imports target modules on demand.
+Everything below should preserve that surface. Internal worker topology,
+transport choice, and deployment backend details should remain opaque to
+downstream users of the library.
 
-What's shipped:
+## v0.1.0 — RPC + Bundle
 
-- [x] Function invocation + worker subprocess (`agentix.invoke`,
-      `agentix.runtime.server.worker`).
-- [x] HTTP + Socket.IO transport (`agentix.runtime.shared.codec` /
-      `events` / `rpc`).
-- [x] `DockerDeployment` (lives in `agentix-deployment-docker`).
-- [x] Single-spec `agentix build` — one project root, integrations via pip.
-- [x] On-demand module import — user projects don't need entry points.
-- [x] Merged-only bundle — one shared `/nix/runtime/` venv. Integrations
-      and user code coexist in one venv.
+Current architecture:
 
-Sibling repos (each independently releasable):
+- [x] `RuntimeClient.remote(fn, ...)` for unary, stream, and bidi calls.
+- [x] One runtime server per sandbox image.
+- [x] One worker subprocess per runtime server.
+- [x] Pickle callable payloads for Python-native callable references.
+- [x] Callable invocation through `agentix.invoke`; targets are not
+      required to be pure functions. If Python can resolve the callable
+      from the requested target, Agentix should be able to invoke it.
+- [x] Single-spec `agentix build`; integrations arrive through normal
+      Python dependencies.
+- [x] One merged `/nix/runtime` venv containing the framework, user
+      project, integrations, and transitive dependencies.
+- [x] Deployment backend plugin axis via `agentix.deployment`.
+
+The single-worker model is intentional for now. It keeps runtime state
+and debugging simple while the public API is still being shaped.
+
+## Architectural Direction
+
+### Worker Model
+
+Keep one worker process as the default near-term runtime model.
+
+Future improvements may add:
+
+- worker pools
+- per-call worker isolation
+- concurrency limits
+- CPU-bound call offloading
+- restart and health policies
+
+These changes must be opaque to downstream users. Code written as:
+
+```python
+result = await client.remote(run, input="hello")
+```
+
+should not change if the runtime later moves from one worker to many
+workers.
+
+### Callable Targets
+
+Agentix should not require targets to be pure functions.
+
+The runtime may call any resolved callable target, including callables
+that close over module state, mutate sandbox-local state, call CLIs,
+read/write files, or interact with benchmark harnesses. Purity is a user
+or integration concern, not a framework constraint.
+
+The framework's responsibility is narrower:
+
+- serialize the callable with stdlib pickle
+- unpickle and invoke it inside the sandbox
+- validate/coerce inputs and outputs through annotations when present
+- surface errors in-band through the runtime protocol
+
+### Transport Strategy
+
+Unary currently uses HTTP and stream/bidi use Socket.IO. This split is
+simple and works, but it is not a core user-facing concept.
+
+Open question: should Agentix drop HTTP and run all call shapes over one
+Socket.IO connection or another unified binary transport?
+
+Reasons to consider a unified transport:
+
+- one protocol path for unary, stream, and bidi
+- simpler cancellation and correlation semantics
+- easier future support for trace events and log streams
+- fewer server/client code paths
+
+Reasons to keep HTTP for unary:
+
+- easy debugging with ordinary HTTP tooling
+- simple load balancer and health-check behavior
+- natural fit for request/response calls
+
+This should be decided before the runtime protocol is treated as stable.
+
+## Sibling Repos
+
+Sibling repos are updated in lockstep with Agentix HEAD while the design
+is still moving quickly.
 
 - [`Agentix-Runtime-Basic`](https://github.com/Agentiix/Agentix-Runtime-Basic)
-  — `bash` + `files` modules. On PyPI as `agentix-runtime-basic`.
+  — `bash` and `files` modules. Published as `agentix-runtime-basic`.
 - [`Agentix-Deployment-Docker`](https://github.com/Agentiix/Agentix-Deployment-Docker)
-  — local Docker backend. On PyPI as `agentix-deployment-docker`.
-- [`Agentix-Deployment-Daytona`](https://github.com/Agentiix/Agentix-Deployment-Daytona),
-  [`Agentix-Deployment-E2B`](https://github.com/Agentiix/Agentix-Deployment-E2B)
-  — stub backends; CLI surface in place, lifecycle wiring pending.
+  — local Docker backend. Published as `agentix-deployment-docker`.
+- [`Agentix-Deployment-Daytona`](https://github.com/Agentiix/Agentix-Deployment-Daytona)
+  and [`Agentix-Deployment-E2B`](https://github.com/Agentiix/Agentix-Deployment-E2B)
+  — hosted deployment backends.
 - [`abridge`](https://github.com/Agentiix/abridge) — host-side
   rollout-to-RL-buffer bridge.
 
-## Unscheduled
+## Later
 
-Future directions, listed so the framework is built with them in mind.
+Future directions, listed so the framework can avoid architectural
+dead-ends without expanding the current API prematurely.
 
-- **Trace pub/sub** — remote functions emit structured events, and
+- **Trace pub/sub** — remote functions emit structured rollout events;
   subscribers receive rollout-scoped fan-out.
 - **RolloutPool** — warm sandbox pool for batched RL rollouts.
-- **LLM proxy** — transparent proxy that intercepts API calls from
-  remote functions for token-level trajectory capture, cost tracking,
-  and replay.
-- **Checkpoint / partial rollout** — snapshot a sandbox (filesystem +
-  loaded worker state), fork to explore alternative continuations.
-  Enables tree search / RL over execution traces.
-- **K8s deployment backend** — parallel `Deployment` implementation
-  using the same bundle-image contract; would ship as
-  `agentix-deployment-k8s`.
+- **LLM proxy** — transparent proxy for API calls from remote functions,
+  enabling token-level trajectory capture, cost tracking, and replay.
+- **Checkpoint / partial rollout** — snapshot a sandbox filesystem and
+  loaded runtime state, then fork to explore alternative continuations.
+- **K8s deployment backend** — `Deployment` implementation using the
+  same bundle-image contract, likely shipping as `agentix-deployment-k8s`.

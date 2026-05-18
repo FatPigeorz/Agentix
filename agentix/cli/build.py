@@ -10,9 +10,9 @@ Usage:
 The single argument is a path to a directory containing `pyproject.toml`.
 That project's `[project].dependencies` are the bundle's plugin set —
 pip resolves them transitively, and the resulting wheels install into
-the framework's venv at `/nix/runtime/`. At runtime, calls use the
-function's real Python module path. **Neither the CLI nor the user enumerates
-plugins on the command line.**
+the framework's venv at `/nix/runtime/`. At runtime, calls execute the
+pickle-serialized callable payload. **Neither the CLI nor the user
+enumerates plugins on the command line.**
 
 Build shape:
 
