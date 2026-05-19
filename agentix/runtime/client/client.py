@@ -1,15 +1,21 @@
 """Async client for the agentix runtime server.
 
-The entire user surface:
+User surface:
 
     async with RuntimeClient(url) as c:
         result = await c.remote(fn, *args, **kwargs)
 
-`fn` is any importable Python callable. The wire identifier is
-`fn.__module__::fn.__qualname__`; args/kwargs travel as a single
-pickle blob. Module-level functions, methods on importable classes,
-and pickleable callable objects all work. Lambdas and local closures
-do not — they can't round-trip through a name.
+For plugin integration, register a `socketio.AsyncClientNamespace`
+subclass (typically `agentix.AsyncClientNamespace`) BEFORE entering
+the async context:
+
+    client = RuntimeClient(url)
+    client.register_namespace(AbridgeHost(openai_client=...))
+    async with client as c:
+        await c.remote(abridge.start_service, ...)
+
+Core auto-registers `/trace` and `/log` namespaces so trace + log
+records flow from the sandbox without setup. `/` carries RPC.
 """
 
 from __future__ import annotations
@@ -25,15 +31,7 @@ import socketio
 
 from agentix.runtime.shared.callables import RemoteCallable, display_name_for
 from agentix.runtime.shared.codec import pack, unpack
-from agentix.runtime.shared.events import (
-    CALL,
-    CALL_ERROR,
-    CALL_RESULT,
-    CANCEL,
-    TRACE_EVENT,
-)
 from agentix.runtime.shared.models import HealthResponse, RemoteError
-from agentix.trace._host_bridge import dispatch_frame as _dispatch_trace_frame
 
 
 class RemoteCallError(RuntimeError):
@@ -72,6 +70,17 @@ class RuntimeClient:
         self._sio_lock = asyncio.Lock()
         # call_id → queue of (kind, data) for in-flight calls.
         self._pending: dict[str, asyncio.Queue] = {}
+        # Namespaces queued for registration on connect.
+        self._namespaces: list[socketio.AsyncClientNamespace] = []
+        self._register_core_namespaces()
+
+    def _register_core_namespaces(self) -> None:
+        """Register agentix-core's built-in `/trace` and `/log` handlers."""
+        from agentix.log._bridge import HostLogNamespace
+        from agentix.trace._bridge import HostTraceNamespace
+
+        self._namespaces.append(HostTraceNamespace())
+        self._namespaces.append(HostLogNamespace())
 
     # ── lifecycle ────────────────────────────────────────────────
 
@@ -95,13 +104,29 @@ class RuntimeClient:
         r.raise_for_status()
         return HealthResponse.model_validate(r.json())
 
-    async def remote(self, fn, *args, **kwargs):
-        """Execute `fn(*args, **kwargs)` in the sandbox and return its result.
+    def register_namespace(self, ns: socketio.AsyncClientNamespace) -> None:
+        """Register a namespace handler. MUST be called before entering
+        the async context (the connection plan is fixed at connect time).
 
-        `fn` must be importable on the worker side — `c.remote` doesn't
-        send the function's code, only its `module::qualname` identifier.
-        The worker resolves it via `import_module + getattr`.
+        Pass an `agentix.AsyncClientNamespace` subclass (or stdlib
+        `socketio.AsyncClientNamespace` if you handle msgpack yourself).
         """
+        if self._sio is not None:
+            raise RuntimeError(
+                "register_namespace must be called before entering the async context",
+            )
+        path = getattr(ns, "namespace", None)
+        if not isinstance(path, str) or not path.startswith("/"):
+            raise ValueError(
+                f"namespace handler must declare a namespace path (got {path!r})",
+            )
+        for existing in self._namespaces:
+            if existing.namespace == path:
+                raise ValueError(f"namespace {path!r} already registered")
+        self._namespaces.append(ns)
+
+    async def remote(self, fn, *args, **kwargs):
+        """Execute `fn(*args, **kwargs)` in the sandbox and return its result."""
         display_name = display_name_for(fn)
         callable_ref = RemoteCallable._resolve(fn)
         arguments = pickle.dumps((args, kwargs))
@@ -117,7 +142,7 @@ class RuntimeClient:
         }
         terminated = False
         try:
-            await sio.emit(CALL, pack(payload))
+            await sio.emit("call", pack(payload))
             while True:
                 kind, data = await q.get()
                 if kind == "result":
@@ -132,7 +157,7 @@ class RuntimeClient:
             self._pending.pop(call_id, None)
             if not terminated:
                 with contextlib.suppress(BaseException):
-                    await sio.emit(CANCEL, pack({"call_id": call_id}))
+                    await sio.emit("cancel", pack({"call_id": call_id}))
 
     # ── Socket.IO connection management ─────────────────────────
 
@@ -150,16 +175,16 @@ class RuntimeClient:
             async def _on_call_error(data):
                 await self._route_event("error", data)
 
-            sio.on(CALL_RESULT, _on_call_result)
-            sio.on(CALL_ERROR, _on_call_error)
+            sio.on("call:result", _on_call_result)
+            sio.on("call:error", _on_call_error)
 
-            async def _on_trace_event(data):
-                # Pure passthrough — decode + dispatch to host's
-                # `agentix.trace` processors. No state here.
-                _dispatch_trace_frame(_decode_payload(data))
-            sio.on(TRACE_EVENT, _on_trace_event)
+            namespaces = ["/"]
+            for ns in self._namespaces:
+                sio.register_namespace(ns)
+                if ns.namespace not in namespaces:
+                    namespaces.append(ns.namespace)
 
-            await sio.connect(self._base_url)
+            await sio.connect(self._base_url, namespaces=namespaces)
             self._sio = sio
             return sio
 

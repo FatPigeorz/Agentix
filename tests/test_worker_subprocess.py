@@ -42,12 +42,18 @@ async def test_subprocess_worker_round_trip():
 async def test_subprocess_worker_bad_callable_fails_fast():
     """A garbage `callable` string yields an error, not a hang."""
     from agentix.runtime.shared.callables import RemoteCallable
+
     mp = _make_worker()
     try:
-        resp = await asyncio.wait_for(mp.call(RemoteRequest(
-            callable=RemoteCallable("not-valid-base64-pickle"),
-            arguments=pickle.dumps(((), {})),
-        )), timeout=20)
+        resp = await asyncio.wait_for(
+            mp.call(
+                RemoteRequest(
+                    callable=RemoteCallable("not-valid-base64-pickle"),
+                    arguments=pickle.dumps(((), {})),
+                )
+            ),
+            timeout=20,
+        )
     finally:
         await mp.shutdown()
     assert not resp.ok
@@ -66,6 +72,7 @@ async def test_subprocess_worker_death_fails_in_flight_call():
         import asyncio as _asyncio
 
         from agentix.runtime.shared.callables import RemoteCallable
+
         slow = RemoteRequest(
             callable=RemoteCallable._resolve(_asyncio.sleep),
             arguments=pickle.dumps(((30.0,), {})),
@@ -75,7 +82,7 @@ async def test_subprocess_worker_death_fails_in_flight_call():
 
         worker = mp._worker
         assert worker is not None
-        proc = worker._proc                                       # type: ignore[attr-defined]
+        proc = worker._proc  # type: ignore[attr-defined]
         assert proc is not None
         proc.kill()
 

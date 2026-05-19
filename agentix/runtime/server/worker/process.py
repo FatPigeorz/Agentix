@@ -1,9 +1,10 @@
 """Runtime worker subprocess.
 
 Receives CALL frames from the parent server over stdin, executes the
-resolved callable, writes RESULT (or ERROR) frames to stdout. Trace
-events emitted from inside the call go out as F.TRACE frames via the
-side-channel forwarder installed at boot.
+resolved callable, writes RESULT (or ERROR) frames to stdout. Also
+hosts the sandbox-side `agentix.sio` channel: extensions inside the
+worker can emit / subscribe / request across the SIO connection via
+generic `sio_*` frames.
 """
 
 from __future__ import annotations
@@ -15,14 +16,14 @@ import sys
 import traceback
 from typing import Any
 
+from agentix import log as _log
+from agentix import sio as _sio
 from agentix.runtime.server.worker.invoker import CallableInvoker
-from agentix.runtime.shared import frames as F
 from agentix.runtime.shared.callables import RemoteCallable
 from agentix.runtime.shared.framing import read_frame, write_frame
 from agentix.runtime.shared.idents import CallId
 from agentix.runtime.shared.models import RemoteError, RemoteRequest
-from agentix.trace._worker_bridge import DISPATCH_CALL_ID
-from agentix.trace._worker_bridge import install as install_trace_bridge
+from agentix.trace._bridge import DISPATCH_CALL_ID, install_worker_bridge
 
 logger = logging.getLogger("agentix.runtime.server.worker.process")
 
@@ -51,19 +52,26 @@ class Worker:
         loop = asyncio.get_running_loop()
         reader = asyncio.StreamReader()
         await loop.connect_read_pipe(
-            lambda: asyncio.StreamReaderProtocol(reader), sys.stdin.buffer,
+            lambda: asyncio.StreamReaderProtocol(reader),
+            sys.stdin.buffer,
         )
         transport, protocol = await loop.connect_write_pipe(
-            asyncio.streams.FlowControlMixin, sys.stdout.buffer,
+            asyncio.streams.FlowControlMixin,
+            sys.stdout.buffer,
         )
         writer = asyncio.StreamWriter(transport, protocol, None, loop)
         self._reader, self._writer = reader, writer
 
         self._drainer = loop.create_task(self._drain_outbound())
-        # Trace bridge: every Trace/Span lifecycle becomes an F.TRACE
-        # frame on the outbound queue.
-        install_trace_bridge(self._enqueue_trace_frame)
-        await self._send({"type": F.READY})
+        # Generic SIO channel: extensions inside the worker use
+        # `agentix.sio.emit/on/request`; the bridge ferries frames over
+        # the pipe to the server, which puts them on the real SIO.
+        _sio._install(self._enqueue_frame)
+        # Built-in /trace and /log namespaces — both are agentix-core
+        # extensions registered on top of agentix.sio.
+        install_worker_bridge()
+        _log.install_worker_bridge()
+        await self._send({"type": "ready"})
 
         while not self._shutdown.is_set():
             try:
@@ -99,25 +107,29 @@ class Worker:
     async def _send(self, payload: dict[str, Any]) -> None:
         await self._outbound_q.put(payload)
 
-    def _enqueue_trace_frame(self, trace_frame: dict[str, Any]) -> None:
-        """Send callback for the trace bridge — sync put_nowait so
-        trace call sites never block."""
+    def _enqueue_frame(self, frame: dict[str, Any]) -> None:
+        """Sync put for the agentix.sio bridge — must never block."""
         try:
-            self._outbound_q.put_nowait({"type": F.TRACE, "frame": trace_frame})
+            self._outbound_q.put_nowait(frame)
         except Exception:
-            logger.debug("failed to enqueue trace frame", exc_info=True)
+            logger.debug("failed to enqueue sio frame", exc_info=True)
 
     async def _handle(self, frame: dict[str, Any]) -> None:
         kind = frame.get("type")
         if not isinstance(kind, str):
             logger.warning("worker: missing frame type")
             return
-        if kind == F.CALL:
+        if kind == "call":
             await self._on_call(frame)
-        elif kind == F.CANCEL:
+        elif kind == "cancel":
             self._cancel(frame.get("call_id", ""))
-        elif kind == F.SHUTDOWN:
+        elif kind == "shutdown":
             self._shutdown.set()
+        elif kind == "sio_inbound":
+            namespace = frame.get("namespace")
+            event = frame.get("event")
+            if isinstance(namespace, str) and isinstance(event, str):
+                _sio._dispatch_inbound(namespace, event, frame.get("data"))
         else:
             logger.warning("worker: unknown frame type %r", kind)
 
@@ -130,7 +142,7 @@ class Worker:
                 call_id=CallId(call_id) if call_id else None,
             )
         except Exception as exc:
-            await self._send({"type": F.ERROR, "call_id": call_id, "error": _err(exc)})
+            await self._send({"type": "error", "call_id": call_id, "error": _err(exc)})
             return
         task = asyncio.create_task(self._run(call_id, request))
         self._calls[call_id] = task
@@ -140,35 +152,39 @@ class Worker:
         try:
             fn = request.callable.resolve()
         except Exception as exc:
-            await self._send({"type": F.ERROR, "call_id": call_id, "error": _err(exc)})
+            await self._send({"type": "error", "call_id": call_id, "error": _err(exc)})
             return
         tok = DISPATCH_CALL_ID.set(call_id or None)
         try:
             resp = await self._invoker.call(fn, request)
         except Exception as exc:
-            await self._send({"type": F.ERROR, "call_id": call_id, "error": _err(exc)})
+            await self._send({"type": "error", "call_id": call_id, "error": _err(exc)})
             return
         finally:
             DISPATCH_CALL_ID.reset(tok)
         if resp.ok:
-            await self._send({"type": F.RESULT, "call_id": call_id, "value": resp.value})
+            await self._send({"type": "result", "call_id": call_id, "value": resp.value})
         else:
             err = (resp.error or RemoteError(type="Unknown", message="")).model_dump()
-            await self._send({"type": F.ERROR, "call_id": call_id, "error": err})
+            await self._send({"type": "error", "call_id": call_id, "error": err})
 
     def _cancel(self, call_id: str) -> None:
         task = self._calls.get(call_id)
         if task is not None:
             task.cancel()
-            asyncio.create_task(self._send({
-                "type": F.ERROR,
-                "call_id": call_id,
-                "error": RemoteError(
-                    type="Cancelled",
-                    message="remote call cancelled",
-                    cancelled=True,
-                ).model_dump(),
-            }))
+            asyncio.create_task(
+                self._send(
+                    {
+                        "type": "error",
+                        "call_id": call_id,
+                        "error": RemoteError(
+                            type="Cancelled",
+                            message="remote call cancelled",
+                            cancelled=True,
+                        ).model_dump(),
+                    }
+                )
+            )
 
 
 async def _amain() -> None:

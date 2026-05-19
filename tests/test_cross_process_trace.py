@@ -48,12 +48,8 @@ async def test_worker_span_tree_arrives_on_host(live_server):
     # (worker.outer + worker.inner).
     starts = {s.name: s for s in collected_starts}
     ends = {s.name: s for s in collected_ends}
-    assert set(starts) == {"worker.outer", "worker.inner"}, (
-        f"missing span_start; got {sorted(starts)}"
-    )
-    assert set(ends) == {"worker.outer", "worker.inner"}, (
-        f"missing span_end; got {sorted(ends)}"
-    )
+    assert set(starts) == {"worker.outer", "worker.inner"}, f"missing span_start; got {sorted(starts)}"
+    assert set(ends) == {"worker.outer", "worker.inner"}, f"missing span_end; got {sorted(ends)}"
 
     outer_end = ends["worker.outer"]
     inner_end = ends["worker.inner"]

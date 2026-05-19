@@ -14,9 +14,9 @@ def test_deployment_register_and_load(monkeypatch):
     )
 
     class FakeDep:
-        async def create(self, config): ...   # noqa: ARG002
-        async def delete(self, sandbox_id): ...   # noqa: ARG002
-        async def get(self, sandbox_id): ...   # noqa: ARG002
+        async def create(self, config): ...  # noqa: ARG002
+        async def delete(self, sandbox_id): ...  # noqa: ARG002
+        async def get(self, sandbox_id): ...  # noqa: ARG002
 
     monkeypatch.setattr(deployments(), "_walk_entry_points", lambda: [])
     deployments().reset()

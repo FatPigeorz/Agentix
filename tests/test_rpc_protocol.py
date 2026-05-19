@@ -16,7 +16,6 @@ import socketio
 
 from agentix import RemoteCallError, RuntimeClient
 from agentix.runtime.shared.codec import pack, unpack
-from agentix.runtime.shared.events import CALL, CALL_ERROR, CALL_RESULT, CANCEL
 from agentix.runtime.shared.models import RemoteRequest
 from tests import _worker_target as target
 from tests._rpc_helpers import request_for
@@ -45,17 +44,18 @@ async def test_socketio_call_serialized_callable(use_inprocess_worker, live_serv
     async def _on_result(data):
         await results.put(unpack(data))
 
-    sio.on(CALL_RESULT, _on_result)
+    sio.on("call:result", _on_result)
     await sio.connect(base_url)
     try:
         req = request_for(target.echo, kwargs={"msg": "hi"}, call_id="call-ok")
-        await sio.emit(CALL, pack(req.model_dump()))
+        await sio.emit("call", pack(req.model_dump()))
         payload = await asyncio.wait_for(results.get(), timeout=5)
     finally:
         await sio.disconnect()
 
     assert payload["call_id"] == "call-ok"
     import pickle
+
     result = pickle.loads(payload["value"])
     assert result.msg == "echo:hi"
 
@@ -69,19 +69,20 @@ async def test_socketio_bad_callable_returns_error(use_inprocess_worker, live_se
     async def _on_error(data):
         await errors.put(unpack(data))
 
-    sio.on(CALL_ERROR, _on_error)
+    sio.on("call:error", _on_error)
     await sio.connect(base_url)
     try:
         import pickle
 
         from agentix.runtime.shared.callables import RemoteCallable
+
         # Garbage base64 that can't be decoded into a callable.
         req = RemoteRequest(
             callable=RemoteCallable("not-valid-base64-pickle"),
             arguments=pickle.dumps(((), {})),
             call_id="call-bad",
         )
-        await sio.emit(CALL, pack(req.model_dump()))
+        await sio.emit("call", pack(req.model_dump()))
         payload = await asyncio.wait_for(errors.get(), timeout=5)
     finally:
         await sio.disconnect()
@@ -157,7 +158,7 @@ async def test_socketio_cancel_returns_cancelled_error(use_inprocess_worker, liv
     async def _on_error(data):
         await errors.put(unpack(data))
 
-    sio.on(CALL_ERROR, _on_error)
+    sio.on("call:error", _on_error)
     await sio.connect(base_url)
     try:
         # Use a slow remote call. asyncio.sleep is convenient — it's
@@ -166,14 +167,15 @@ async def test_socketio_cancel_returns_cancelled_error(use_inprocess_worker, liv
         import pickle
 
         from agentix.runtime.shared.callables import RemoteCallable
+
         req = RemoteRequest(
             callable=RemoteCallable._resolve(_asyncio.sleep),
             arguments=pickle.dumps(((5.0,), {})),
             call_id="cancel-me",
         )
-        await sio.emit(CALL, pack(req.model_dump()))
+        await sio.emit("call", pack(req.model_dump()))
         await asyncio.sleep(0.1)
-        await sio.emit(CANCEL, pack({"call_id": "cancel-me"}))
+        await sio.emit("cancel", pack({"call_id": "cancel-me"}))
         payload = await asyncio.wait_for(errors.get(), timeout=5)
     finally:
         await sio.disconnect()

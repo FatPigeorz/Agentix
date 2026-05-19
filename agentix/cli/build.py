@@ -51,8 +51,14 @@ from tempfile import TemporaryDirectory
 from agentix.cli._resolve import REPO_ROOT, read_pyproject, short_name
 
 _SOURCE_SKIP = {
-    "__pycache__", ".venv", "build", "dist", ".git",
-    ".pytest_cache", ".ruff_cache", ".mypy_cache",
+    "__pycache__",
+    ".venv",
+    "build",
+    "dist",
+    ".git",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
     "result",
 }
 
@@ -77,10 +83,7 @@ def _stage_builder(dest: Path) -> None:
     for fname in ("flake.nix", "builder.nix", "flake.lock"):
         src = nix_dir / fname
         if not src.is_file():
-            raise SystemExit(
-                f"shipped builder missing {fname!r} at {nix_dir}. "
-                f"Reinstall agentixx."
-            )
+            raise SystemExit(f"shipped builder missing {fname!r} at {nix_dir}. Reinstall agentixx.")
         (dest / fname).write_bytes(src.read_bytes())
 
 
@@ -160,8 +163,7 @@ def _render_wrapper(*, name: str, tag: str, python_version: str, plugin_nix_path
     tmpl = (resources.files("agentix") / "nix" / "wrapper.nix.tmpl").read_text()
     plugin_list = " ".join(plugin_nix_paths)
     return (
-        tmpl
-        .replace("@NAME@", name)
+        tmpl.replace("@NAME@", name)
         .replace("@TAG@", tag)
         .replace("@SYSTEM@", "x86_64-linux")
         .replace("@PYTHON_VERSION@", python_version)
@@ -223,7 +225,8 @@ def _tag_latest(loaded: str) -> str | None:
     alias = f"{name}:latest"
     proc = subprocess.run(
         ["docker", "tag", loaded, alias],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
@@ -238,16 +241,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "path", nargs="?", default=".",
+        "path",
+        nargs="?",
+        default=".",
         help="project root with pyproject.toml + uv.lock (default: current dir)",
     )
     parser.add_argument(
-        "-n", "--name", default=None,
+        "-n",
+        "--name",
+        default=None,
         help="image NAME or NAME:TAG. Bare NAME gets ':<pyproject-version>' "
-             "appended; NAME:TAG is used verbatim. Default: derived from pyproject.",
+        "appended; NAME:TAG is used verbatim. Default: derived from pyproject.",
     )
     parser.add_argument(
-        "--dry-run", action="store_true",
+        "--dry-run",
+        action="store_true",
         help="stage build context to ./build/<name>/; do not invoke nix",
     )
     args = parser.parse_args(argv)
@@ -268,19 +276,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         _stage_project(src, stage / "project")
         plugin_paths = _discover_plugin_nix(stage / "plugins")
         wrapper = _render_wrapper(
-            name=name, tag=tag,
+            name=name,
+            tag=tag,
             python_version=python_version,
             plugin_nix_paths=plugin_paths,
         )
         (stage / "flake.nix").write_text(wrapper)
         # Flake needs a git repo to track files; init one with everything staged.
         subprocess.run(
-            ["git", "init", "-q"], cwd=stage,
-            stdout=subprocess.DEVNULL, check=True,
+            ["git", "init", "-q"],
+            cwd=stage,
+            stdout=subprocess.DEVNULL,
+            check=True,
         )
         subprocess.run(
-            ["git", "add", "-A"], cwd=stage,
-            stdout=subprocess.DEVNULL, check=True,
+            ["git", "add", "-A"],
+            cwd=stage,
+            stdout=subprocess.DEVNULL,
+            check=True,
         )
 
     if args.dry_run:

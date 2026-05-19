@@ -9,7 +9,7 @@ import pkgutil
 
 __path__ = pkgutil.extend_path(__path__, __name__)
 
-from agentix import trace
+from agentix import log, trace
 from agentix.deployment.base import (
     Deployment,
     Sandbox,
@@ -21,11 +21,15 @@ from agentix.deployment.base import (
     session,
 )
 from agentix.runtime.client import RemoteCallError, RuntimeClient
+from agentix.runtime.client._sio_facade import AsyncClientNamespace
+from agentix.sio import Namespace, register_namespace
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
+    "AsyncClientNamespace",
     "Deployment",
+    "Namespace",
     "RemoteCallError",
     "RuntimeClient",
     "Sandbox",
@@ -34,7 +38,9 @@ __all__ = [
     "SandboxInfo",
     "__version__",
     "load_deployment",
+    "log",
     "register_deployment",
+    "register_namespace",
     "session",
     "trace",
 ]

@@ -19,9 +19,7 @@ from collections.abc import Callable, Sequence
 
 # Built-in subcommands. Each value names the submodule under
 # `agentix.cli` whose `main(argv)` handles the verb.
-_COMMANDS: tuple[tuple[str, str], ...] = (
-    ("build", "agentix.cli.build"),
-)
+_COMMANDS: tuple[tuple[str, str], ...] = (("build", "agentix.cli.build"),)
 
 
 def _first_doc_line(obj: object) -> str:

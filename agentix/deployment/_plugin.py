@@ -100,9 +100,7 @@ class Registry(Generic[T]):
         # Python 3.10+: SelectableGroups; earlier: dict (we target 3.11+ but
         # mirror the standard library's defensive branch anyway).
         selected = (
-            list(eps.select(group=self._group))
-            if hasattr(eps, "select")
-            else list(eps.get(self._group, []))  # type: ignore[attr-defined]
+            list(eps.select(group=self._group)) if hasattr(eps, "select") else list(eps.get(self._group, []))  # type: ignore[attr-defined]
         )
         out: list[tuple[str, Callable[[], T], PluginSource]] = []
         for ep in selected:
@@ -127,8 +125,7 @@ class Registry(Generic[T]):
         for name, loader, src in self._walk_entry_points():
             if name in sources:
                 raise PluginConflictError(
-                    f"duplicate plugin {name!r} in group {self._group!r}: "
-                    f"{sources[name].label()} vs {src.label()}"
+                    f"duplicate plugin {name!r} in group {self._group!r}: {sources[name].label()} vs {src.label()}"
                 )
             try:
                 items[name] = loader()
@@ -136,7 +133,9 @@ class Registry(Generic[T]):
             except Exception as exc:
                 logger.warning(
                     "plugin %r in group %r failed to load: %s",
-                    name, self._group, exc,
+                    name,
+                    self._group,
+                    exc,
                 )
                 errors[name] = exc
 
@@ -168,10 +167,7 @@ class Registry(Generic[T]):
             return items[name]
         if name in self._errors:
             raise self._errors[name]
-        raise KeyError(
-            f"no plugin {name!r} in group {self._group!r}; "
-            f"available: {sorted(items)}"
-        )
+        raise KeyError(f"no plugin {name!r} in group {self._group!r}; available: {sorted(items)}")
 
     def all(self) -> dict[str, T]:
         """Snapshot of all successfully-loaded plugins, name → value."""

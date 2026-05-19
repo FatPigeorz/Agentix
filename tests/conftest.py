@@ -50,6 +50,7 @@ def runtime_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 sys.modules.pop(mod, None)
 
     from agentix.runtime import server
+
     return server, tmp_path, upload_root
 
 
@@ -106,8 +107,11 @@ async def live_server(runtime_module):
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
         config = uvicorn.Config(
-            server.app, host="127.0.0.1", port=port,
-            log_level="error", lifespan="on",
+            server.app,
+            host="127.0.0.1",
+            port=port,
+            log_level="error",
+            lifespan="on",
         )
         srv = uvicorn.Server(config)
         state["srv"] = srv

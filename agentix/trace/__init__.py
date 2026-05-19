@@ -59,7 +59,6 @@ __all__ = [
     # context managers / helpers
     "trace",
     "span",
-    "log",
     "get_current_span",
     "get_current_trace",
     "current_span_id",
@@ -102,10 +101,12 @@ def _now_iso() -> str:
 # ── scope (contextvars) ────────────────────────────────────────────
 
 _current_trace: contextvars.ContextVar[Trace | None] = contextvars.ContextVar(
-    "agentix_trace_current_trace", default=None,
+    "agentix_trace_current_trace",
+    default=None,
 )
 _current_span: contextvars.ContextVar[Span | None] = contextvars.ContextVar(
-    "agentix_trace_current_span", default=None,
+    "agentix_trace_current_span",
+    default=None,
 )
 
 
@@ -217,9 +218,13 @@ class Span:
             self.status_description = message
 
     def add_event(self, name: str, **attributes: Any) -> None:
-        self.events.append(SpanEvent(
-            name=name, timestamp=_now_iso(), attributes=dict(attributes),
-        ))
+        self.events.append(
+            SpanEvent(
+                name=name,
+                timestamp=_now_iso(),
+                attributes=dict(attributes),
+            )
+        )
 
     def export(self) -> dict[str, Any]:
         return {
@@ -233,15 +238,18 @@ class Span:
             "ended_at": self.ended_at,
             "status": self.status,
             "status_description": self.status_description,
-            "error": (
-                {"message": self.error.message, "data": self.error.data}
-                if self.error is not None else None
-            ),
+            "error": ({"message": self.error.message, "data": self.error.data} if self.error is not None else None),
             "events": (
-                [{"name": e.name, "timestamp": e.timestamp,
-                  "attributes": dict(e.attributes) if e.attributes else None}
-                 for e in self.events]
-                if self.events else None
+                [
+                    {
+                        "name": e.name,
+                        "timestamp": e.timestamp,
+                        "attributes": dict(e.attributes) if e.attributes else None,
+                    }
+                    for e in self.events
+                ]
+                if self.events
+                else None
             ),
         }
 
@@ -454,13 +462,6 @@ def span(name: str, *, span_id: str | None = None, **attrs: Any) -> Iterator[Spa
         s.ended_at = _now_iso()
         _provider.fan_span_end(s)
         _current_span.reset(tok)
-
-
-def log(message: str, *, level: str = "INFO", **extras: Any) -> None:
-    """Record a log line as a zero-duration sub-span. Streamed
-    immediately (unlike `Span.add_event`, which rides with the span)."""
-    with span("log", message=message, level=level, **extras):
-        pass
 
 
 # Built-in Processor implementations live in submodules. Re-exporting

@@ -34,7 +34,7 @@ from pydantic import BaseModel
 # we check for the dist via `find_spec` (no heavy work) and defer the
 # real import to first ndarray encode/decode.
 _HAS_NUMPY = importlib.util.find_spec("numpy") is not None
-_np: Any = None       # populated lazily by `_numpy()`
+_np: Any = None  # populated lazily by `_numpy()`
 
 _EXT_NDARRAY = 1
 _EXT_PYDANTIC = 2
@@ -45,6 +45,7 @@ def _numpy() -> Any:
     global _np
     if _np is None:
         import numpy  # type: ignore[reportMissingImports]  # noqa: PLC0415
+
         _np = numpy
     return _np
 
@@ -58,7 +59,8 @@ def _encode_ext(obj: Any) -> msgpack.ExtType:
     if isinstance(obj, BaseModel):
         payload = msgpack.packb(
             obj.model_dump(mode="python"),
-            default=_encode_ext, use_bin_type=True,
+            default=_encode_ext,
+            use_bin_type=True,
         )
         return msgpack.ExtType(_EXT_PYDANTIC, payload)
     raise TypeError(f"agentix.codec: cannot encode {type(obj).__name__}")

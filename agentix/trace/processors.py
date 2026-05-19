@@ -32,9 +32,7 @@ class ConsoleProcessor(Processor):
 
     def on_trace_start(self, t: Trace) -> None:
         self._depth[t.trace_id] = 0
-        self._write(
-            f"[trace.start] {t.name} ({t.trace_id[:14]}…) {t.metadata or ''}".rstrip()
-        )
+        self._write(f"[trace.start] {t.name} ({t.trace_id[:14]}…) {t.metadata or ''}".rstrip())
 
     def on_trace_end(self, t: Trace) -> None:
         self._write(f"[trace.end]   {t.name} ({t.trace_id[:14]}…)")

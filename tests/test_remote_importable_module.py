@@ -18,6 +18,7 @@ async def test_remote_call_to_importable_module():
 
     try:
         import pickle
+
         resp = await mp.call(request_for(greet, kwargs={"name": "world"}))
         assert resp.ok, resp.error
         assert pickle.loads(resp.value) == "hello world"

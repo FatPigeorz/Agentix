@@ -6,9 +6,8 @@ Agentix has exactly two ideas:
 
 1. **Remote calls** — `c.remote(fn, *args, **kwargs)` calls an
    importable Python function inside a sandbox worker. The target is
-   `fn.__module__ + "::" + fn.__name__`; the call shape (unary /
-   stream / bidi) is detected from the function signature; the return
-   value is decoded into `fn`'s return type.
+   `fn.__module__ + "::" + fn.__qualname__`; args/kwargs travel as a
+   single pickle blob and the return value is unpickled host-side.
 2. **Bundle** — `agentix build [path]` packages a Python project and
    its declared dependencies into a deploy-ready Docker image. The
    project's `[project].dependencies` defines what modules are
@@ -25,16 +24,33 @@ result = await client.remote(run, input="hello")
 `import app; await client.remote(app.run, ...)` also works because it
 passes the same function object.
 
+## Three Built-In Systems
+
+agentix-core ships **three** independent systems, mapped to three
+reserved Socket.IO namespaces:
+
+| Namespace | System  | Public API                                      |
+|-----------|---------|-------------------------------------------------|
+| `/`       | RPC     | `client.remote(fn, ...)`                        |
+| `/trace`  | tracing | `agentix.trace.span(...)` / `trace.Processor`    |
+| `/log`    | logging | stdlib `logging` (auto-bridged sandbox → host) |
+
+Plugins (`abridge`, future LLM tools, ...) MUST live on their own
+namespace `/<package-name>`. Two plugins can never collide because
+PyPI package names are globally unique.
+
 ## Composition Over Inheritance
 
-Use inheritance only for genuine lifecycle interfaces such as a
-deployment backend implementing the `Deployment` Protocol. Everywhere
-else, prefer normal functions, Protocols, composition objects, or
-callbacks.
+Use inheritance only for genuine lifecycle interfaces:
+- `Deployment` Protocol for deployment backends
+- `agentix.Namespace` / `agentix.AsyncClientNamespace` for plugin SIO
+  handlers (mirrors `socketio.AsyncClientNamespace`)
+- `trace.Processor` for trace sinks
 
-A remote target is just a Python callable serialized by stdlib pickle.
-There is no base class for user code to inherit from and no marker
-Protocol for users to import.
+Everywhere else, prefer normal functions, Protocols, composition
+objects, or callbacks. A remote target is just a Python callable
+serialized by stdlib pickle — there is no base class for user code to
+inherit from.
 
 ## No Backward Compatibility Shims
 
@@ -47,43 +63,52 @@ This repo is in active design. Breaking changes are fine.
   behavior.
 
 Sibling repos (`Agentix-Runtime-Basic`, `Agentix-Deployment-*`,
-`agentix-cookbook`) are updated in lockstep with HEAD.
+`abridge`, `agentix-cookbook`) are updated in lockstep with HEAD.
 
 ## Systems Map
 
 ```text
 agentix/
+├── sio.py             — agentix.Namespace + register_namespace (sandbox side)
+├── log/               — stdlib logging Handler bridge (sandbox → host)
+├── trace/             — Trace + Span + SpanEvent + Processor
 ├── runtime/
-│   ├── shared/              — wire types, codec, framing, event names
-│   ├── client/              — RuntimeClient
-│   └── server/              — FastAPI + Socket.IO + worker package
-├── deployment/          — Deployment Protocol + backend plugin loader
-├── cli/                 — agentix build
-└── nix/                 — shipped Nix builder (flake + uv2nix wrapper)
+│   ├── shared/        — wire types, codec, framing
+│   ├── client/        — RuntimeClient (host) + AsyncClientNamespace
+│   └── server/        — FastAPI + Socket.IO + worker subprocess
+├── deployment/        — Deployment Protocol + backend plugin loader
+├── cli/               — `agentix build`
+└── nix/               — shipped Nix builder (flake + uv2nix wrapper)
 ```
 
 One line per system:
 
+- **sio** — generic pipe-bridged Namespace API. Sandbox plugins
+  subclass `agentix.Namespace`; host plugins subclass
+  `agentix.AsyncClientNamespace`. Runtime knows zero plugin event names.
+- **log** — installs a `logging.Handler` on the worker's root logger;
+  every `LogRecord` ships over `/log` and replays on the host's logging
+  tree. Zero new API — users write `logger.info(...)` normally.
+- **trace** — OTel-style `Trace` + `Span` + `SpanEvent` + `Processor`.
+  Worker-side `Processor` ships span lifecycle as events on `/trace`;
+  host-side `RuntimeClient` auto-registers a consumer.
 - **runtime.shared** — msgpack codec, length-prefixed worker frames,
-  Socket.IO event names, pydantic wire models, call-shape helpers, and
-  branded wire ids.
-- **runtime.client** — `RuntimeClient.remote(fn, ...)`; Socket.IO for unary,
-  stream, and bidi; HTTP only for health.
-- **runtime.server** — `agentix-server`; owns one runtime worker process,
-  invokes pickle-resolved callables, forwards Socket.IO calls, and
-  correlates events by `call_id`.
+  pydantic wire models, branded wire ids.
+- **runtime.client** — `RuntimeClient.remote(fn, ...)` over Socket.IO
+  `/`. `register_namespace(ns)` attaches plugin handlers.
+- **runtime.server** — `agentix-server`; owns one worker subprocess,
+  invokes pickle-resolved callables, dynamic namespace forwarding for
+  `/trace`, `/log`, and any plugin `/<package-name>`.
 - **deployment** — host-side `Deployment` Protocol and backend lookup.
 - **cli** — `agentix build [path]`.
 - **nix** — `flake.nix`, `builder.nix`, `wrapper.nix.tmpl` shipped as
-  wheel data; `agentix build` stages them per invocation and drives
-  `nix build` to produce the runtime image.
+  wheel data; `agentix build` stages them per invocation.
 
 ## Remote Call Implementation
 
-`c.remote(fn, ...)` serializes `fn` with stdlib pickle and sends that
-callable payload to the runtime.
-
-Example:
+`c.remote(fn, ...)` serializes `fn` with stdlib pickle (wrapped in a
+base64-encoded `RemoteCallable` str). args + kwargs travel as a single
+pickle blob.
 
 ```python
 # my_project/tasks.py
@@ -96,35 +121,47 @@ from my_project.tasks import run
 result = await client.remote(run, seed=42)
 ```
 
-The Socket.IO payload carries:
+Sync functions work too; the invoker awaits only when the result is
+awaitable. Only the unary call shape is supported — for streaming /
+bidirectional needs, build it on top of the generic `agentix.sio`
+namespace API.
+
+## Plugin Extension via Namespaces
+
+Plugins (e.g. `abridge`) define **two** classes, one per side:
 
 ```python
-{
-    "callable_payload": b"...pickle...",
-    "display_name": "my_project.tasks::run",
-    "shape": "unary",
-    "args": [],
-    "kwargs": {"seed": 42},
-    "call_id": "optional-correlation-key",
-}
+# Sandbox side (runs in the worker subprocess)
+import agentix
+
+class MyService(agentix.Namespace):
+    namespace = "/my-plugin"
+
+    async def on_request(self, payload):
+        # `payload` is whatever the host emitted — auto-unpacked
+        result = await do_work(payload)
+        await self.emit("request:result", result)
+
+agentix.register_namespace(MyService())
+
+# Host side
+class MyHost(agentix.AsyncClientNamespace):
+    def __init__(self):
+        super().__init__("/my-plugin")
+
+    async def on_request_result(self, data):
+        # data is a plain dict — agentix auto-unpacks msgpack
+        ...
+
+client = RuntimeClient(url)
+client.register_namespace(MyHost())
+async with client as c:
+    ...
 ```
 
-The worker unpickles the callable, validates args with pydantic, calls
-the callable, and serializes the result.
-
-## Call Shapes
-
-Three shapes are detected from `fn`'s signature:
-
-- `async def f(...) -> T` -> **unary**
-- `async def f(...) -> AsyncIterator[T]: yield ...` -> **stream**
-- `async def f(..., inbox: Channel[I]) -> AsyncIterator[T]` -> **bidi**
-
-`c.remote(...)` returns `Unary[T]`, `Stream[T]`, or `Bidi[I, T]`.
-Await unary; `async for` over stream and bidi.
-
-Sync functions work for unary too; the invoker awaits only when the
-result is awaitable. Streams and bidi require async generators.
+Round-trip helper: `await self.request("op", body)` from sandbox auto-
+correlates with the host's `op:result` / `op:error` reply event using
+a generated `request_id`.
 
 ## Bundle Implementation
 
@@ -137,7 +174,7 @@ install` inside the build. Everything goes through Nix:
 name = "my-agent"
 version = "0.1.0"
 dependencies = [
-    "agentixx>=0.1.2",
+    "agentixx>=0.2.1",
     "agentix-runtime-basic>=0.1.2",
     "agentix-deployment-docker>=0.1.3",
 ]
@@ -147,8 +184,8 @@ The user must also have a `uv.lock` (run `uv lock`). uv2nix consumes
 that lock and produces Nix derivations for every Python dep — the
 interpreter, agentixx, plugins, the user's project, and transitive
 deps all land in `/nix/store/...` with rpath-resolved closures, so the
-resulting image runs against any Linux task image (Alpine, RHEL, etc.)
-when overlaid via `SandboxConfig.runtime_image`.
+resulting image runs against any Linux task image when overlaid via
+`SandboxConfig.runtime_image`.
 
 Two inputs to the build:
 
@@ -157,58 +194,98 @@ Two inputs to the build:
    `/bin/agentix-server` becomes the entry point.
 
 2. **System side — plugin `default.nix` files.** Each plugin may ship
-   a `default.nix` next to its Python module (e.g.
-   `agentix/bash/default.nix`). `agentix build` discovers them via
-   `importlib.resources.files('agentix.<short>') / 'default.nix'`,
-   imports each with the shared `pkgs`, and `symlinkJoin`s the results
-   into the bundle's `/bin/`. Plugins that need no system binaries can
-   skip the file entirely. The user's project may add a `default.nix`
-   at its root to declare extra system deps (git, ffmpeg, ...).
+   a `default.nix` next to its Python module. `agentix build`
+   discovers them via `importlib.resources.files('agentix.<short>') /
+   'default.nix'` and `symlinkJoin`s the results into the bundle's
+   `/bin/`. Plugins that need no system binaries can skip the file.
 
 Plugin nix expressions follow one convention: `{ pkgs }: drv`. The
 builder hands every plugin the same Nixpkgs revision (pinned in
-`agentix/nix/flake.lock`), so no per-plugin version drift.
-
-Build flow:
-
-1. Stage a temp dir with `_builder/` (shipped flake), `project/` (user
-   source), `plugins/<short>.nix` (discovered plugin nix files), and
-   a generated `flake.nix` wrapper.
-2. `nix build .#bundle` → uv2nix overlay → `mkVirtualEnv` → joined
-   tree → `streamLayeredImage` script.
-3. `<result> | docker load` produces a local docker image tagged
-   `<name>:<tag>`.
+`agentix/nix/flake.lock`).
 
 The two-image runtime: deployments overlay `SandboxConfig.runtime_image`
 (the bundle from `agentix build`) onto `SandboxConfig.image` (a
 task-specific base) via Docker 25's `--mount type=image,source=…,
-target=/nix,subpath=nix,readonly` at sandbox-create time. No rebuild.
+target=/nix,subpath=nix,readonly`. No rebuild needed when the agent
+moves between task images.
 
 ## Wire Protocol
 
-Unary uses Socket.IO:
+RPC on `/`:
 
 ```text
-unary        {call_id, callable_payload, display_name, shape, args, kwargs}
-unary:result {call_id, value}
-unary:error  {call_id, error}
+call         {call_id, callable, arguments}
+call:result  {call_id, value}    # value is pickle bytes
+call:error   {call_id, error}
+cancel       {call_id}
 ```
 
-Stream and bidi use Socket.IO events:
+Plugin namespaces are opaque to the runtime — events and payload
+shapes are extension-chosen. The pipe carries `sio_open` (worker
+declares a namespace), `sio_emit` (worker → server → broadcast), and
+`sio_inbound` (server → worker, forwarded from a host emit).
 
-```text
-stream       {call_id, callable_payload, display_name, shape, args, kwargs}
-stream:item  {call_id, value}
-stream:end   {call_id}
-stream:error {call_id, error}
+Errors stay in-band: Socket.IO emits an error event for RPC; plugin
+namespaces follow whatever convention the plugin picks (typically
+`event:error` with a matching `request_id`).
 
-bidi:start   {call_id, callable_payload, display_name, shape, args, kwargs}
-bidi:in      {call_id, item}
-bidi:end_in  {call_id}
-bidi:out     {call_id, value}
-bidi:end     {call_id}
-bidi:error   {call_id, error}
+## Project Management — uv
+
+This project uses **uv** for everything dependency-related:
+
+- Install / sync: `uv sync` (no `pip install`)
+- Add a dep: `uv add <pkg>` (writes `pyproject.toml` + locks)
+- Add a dev dep: `uv add --dev <pkg>` (goes to `[dependency-groups]`)
+- Ad-hoc install into the venv without touching pyproject: `uv pip install`
+- Run a tool from the venv: `uv run <cmd>` or `.venv/bin/<cmd>`
+- Build wheels/sdists: `uv build`
+- Publish: `uv publish` (only when releasing — see below)
+
+Never invoke `pip` directly; `pip install` bypasses the lockfile and
+mixes dependency management styles. When you need a runtime dep, the
+right answer is `uv add`. When you need a tool just for the current
+venv, `uv pip install`.
+
+## Typing — No Bypass
+
+CI runs `pyright agentix` and **must** stay at zero errors. If pyright
+flags something, **fix the root cause**, do not `# type: ignore`. Common
+patterns that lead to ignore-spam and what to do instead:
+
+- **Stubs lie about a decorator's return.** Call the function
+  non-decorator style: `obj.on(name, handler)` instead of
+  `@obj.on(name)`. The body of `handler` is still type-checked, and the
+  registration side-effect happens just the same.
+- **`getattr(self, name)` returns `object`.** Either don't go through
+  `getattr` (walk the class via `inspect.getmembers` or `__dict__`),
+  or relax the declared type to honestly reflect what could come back.
+  A `Handler = Callable[[Any], Any]` is more accurate than
+  `Callable[[Any], Awaitable[None] | None]` if the function in fact
+  accepts any return type.
+- **`Protocol` mismatch after refactor.** Update the Protocol; do not
+  ignore-suppress at the assignment site.
+
+`type: ignore` is allowed only when the lie is in a *third-party*
+type stub that you cannot fix — and even then, prefer pinning the
+narrowest comment (`# type: ignore[specific-rule]`) and noting why.
+
+## Development Distribution
+
+We do NOT publish to PyPI during active development. Sibling repos
+install each other via `[tool.uv.sources]` git URLs so HEAD changes
+propagate without a release cycle:
+
+```toml
+[project]
+dependencies = [
+    "agentixx",
+    "abridge",
+]
+
+[tool.uv.sources]
+agentixx = { git = "https://github.com/Agentiix/Agentix.git" }
+abridge  = { git = "https://github.com/Agentiix/abridge.git" }
 ```
 
-Errors stay in-band: Socket.IO emits an error event for unary, stream,
-and bidi.
+When (rarely) a real release is cut, drop the matching `tool.uv.sources`
+entry so the resolver picks up the PyPI version.

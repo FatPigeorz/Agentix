@@ -59,12 +59,12 @@ class SandboxConfig(BaseModel):
 
     image: str = Field(
         description="Task base image — the environment the workload runs in "
-                    "(e.g. `swebench/task-django__django-12345:latest`).",
+        "(e.g. `swebench/task-django__django-12345:latest`).",
     )
     runtime_image: str = Field(
         description="Agentix runtime bundle image ref produced by "
-                    "`agentix build`, e.g. `my-agent:0.1.0`. Mounted at "
-                    "`/nix` in the sandbox via `--mount type=image`.",
+        "`agentix build`, e.g. `my-agent:0.1.0`. Mounted at "
+        "`/nix` in the sandbox via `--mount type=image`.",
     )
     env: dict[str, str] | None = Field(
         default=None,
@@ -133,7 +133,8 @@ def deployments() -> Registry[type[Deployment]]:
 
 @asynccontextmanager
 async def session(
-    deployment: Deployment, config: SandboxConfig,
+    deployment: Deployment,
+    config: SandboxConfig,
 ) -> AsyncIterator[Sandbox]:
     """Scoped sandbox: created on entry, deleted on exit.
 

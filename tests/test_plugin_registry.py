@@ -31,14 +31,9 @@ class _FakeEntryPoint:
     dist: _FakeDist | None
 
 
-def _fake_ep(name: str, loader, dist_name: str | None = None,
-             dist_version: str | None = None):
+def _fake_ep(name: str, loader, dist_name: str | None = None, dist_version: str | None = None):
     """Build a stand-in for an importlib.metadata EntryPoint."""
-    dist = (
-        _FakeDist(name=dist_name, version=dist_version)
-        if dist_name is not None
-        else None
-    )
+    dist = _FakeDist(name=dist_name, version=dist_version) if dist_name is not None else None
     return _FakeEntryPoint(name=name, load=loader, value=f"x:{name}", dist=dist)
 
 
@@ -49,16 +44,14 @@ def _patch_eps(registry: Registry, eps: list):
     distributions into the test env's site-packages.
     """
     items = [
-        (ep.name, ep.load,
-         _src(ep.dist.name if ep.dist else None,
-              ep.dist.version if ep.dist else None))
-        for ep in eps
+        (ep.name, ep.load, _src(ep.dist.name if ep.dist else None, ep.dist.version if ep.dist else None)) for ep in eps
     ]
     registry._walk_entry_points = lambda: items  # type: ignore[method-assign]
 
 
 def _src(name, version):
     from agentix.deployment._plugin import PluginSource
+
     return PluginSource(dist_name=name, dist_version=version)
 
 
@@ -90,10 +83,13 @@ def test_entry_point_duplicate_raises_conflict():
     """Two dists registering the same name in the same group must
     surface as an error — silent last-wins would hide a stale install."""
     reg = Registry("test.axis")
-    _patch_eps(reg, [
-        _fake_ep("local", lambda: "a", "dist-a", "1.0"),
-        _fake_ep("local", lambda: "b", "dist-b", "2.0"),
-    ])
+    _patch_eps(
+        reg,
+        [
+            _fake_ep("local", lambda: "a", "dist-a", "1.0"),
+            _fake_ep("local", lambda: "b", "dist-b", "2.0"),
+        ],
+    )
     with pytest.raises(PluginConflictError) as excinfo:
         reg.all()
     msg = str(excinfo.value)
@@ -104,14 +100,18 @@ def test_entry_point_duplicate_raises_conflict():
 def test_loader_failure_does_not_poison_others():
     """A plugin whose loader raises is cached as an error; sibling plugins
     still load."""
+
     def bad_loader():
         raise RuntimeError("kaboom")
 
     reg = Registry("test.axis")
-    _patch_eps(reg, [
-        _fake_ep("good", lambda: "ok"),
-        _fake_ep("bad", bad_loader, "broken-dist", "0.0.1"),
-    ])
+    _patch_eps(
+        reg,
+        [
+            _fake_ep("good", lambda: "ok"),
+            _fake_ep("bad", bad_loader, "broken-dist", "0.0.1"),
+        ],
+    )
     assert reg.get("good") == "ok"
     assert reg.all() == {"good": "ok"}
 

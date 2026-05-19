@@ -55,9 +55,7 @@ class RemoteCallable(str):
     def _resolve(cls, fn: Callable[..., Any]) -> RemoteCallable:
         """Encode a Python callable as a `RemoteCallable` string."""
         if not callable(fn):
-            raise TypeError(
-                f"remote value must be callable (got {type(fn).__name__})"
-            )
+            raise TypeError(f"remote value must be callable (got {type(fn).__name__})")
         encoded = base64.b64encode(pickle.dumps(fn)).decode("ascii")
         return cls(encoded)
 
@@ -65,9 +63,7 @@ class RemoteCallable(str):
         """Decode this string back into a Python callable."""
         fn = pickle.loads(base64.b64decode(self.encode("ascii")))
         if not callable(fn):
-            raise TypeError(
-                f"resolved value is not callable (got {type(fn).__name__})"
-            )
+            raise TypeError(f"resolved value is not callable (got {type(fn).__name__})")
         return fn
 
 
